@@ -68,6 +68,77 @@ class TestContentToBlocks:
         blocks = _content_to_blocks(42)
         assert blocks == [{"type": "text", "text": "42"}]
 
+    def test_image_url_data_uri_png_translated_to_base64_source(self):
+        blocks = _content_to_blocks([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        assert blocks == [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        }]
+
+    def test_image_url_data_uri_jpeg_translated_to_base64_source(self):
+        blocks = _content_to_blocks([
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}},
+        ])
+        assert blocks[0]["source"]["media_type"] == "image/jpeg"
+        assert blocks[0]["source"]["data"] == "BBBB"
+
+    def test_image_url_http_translated_to_url_source(self):
+        blocks = _content_to_blocks([
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ])
+        assert blocks == [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/cat.png"},
+        }]
+
+    def test_image_url_string_form_translated(self):
+        # Some OpenAI-compatible callers pass image_url as a plain string.
+        blocks = _content_to_blocks([
+            {"type": "image_url", "image_url": "https://example.com/cat.png"},
+        ])
+        assert blocks == [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/cat.png"},
+        }]
+
+    def test_image_url_detail_field_ignored(self):
+        blocks = _content_to_blocks([
+            {"type": "image_url",
+             "image_url": {"url": "https://example.com/cat.png", "detail": "high"}},
+        ])
+        assert blocks == [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/cat.png"},
+        }]
+
+    def test_untranslatable_image_url_dropped_others_preserved(self):
+        blocks = _content_to_blocks([
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "/tmp/x.png"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png,notbase64"}},
+            {"type": "image_url", "image_url": {}},
+            {"type": "text", "text": "after"},
+        ])
+        assert blocks == [
+            {"type": "text", "text": "before"},
+            {"type": "text", "text": "after"},
+        ]
+
+    def test_mixed_content_order_preserved(self):
+        blocks = _content_to_blocks([
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            "trailing",
+        ])
+        assert blocks == [
+            {"type": "text", "text": "look"},
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "text", "text": "trailing"},
+        ]
+
 
 # ---------------------------------------------------------------------------
 # A. Pure converters: _convert_message_schemas
@@ -156,6 +227,21 @@ class TestConvertMessageSchemas:
             {"role": "developer", "content": "note"},
         ])
         assert messages[0]["role"] == "user"
+
+    def test_tool_result_image_url_content_translated(self):
+        _, messages = _convert_message_schemas([
+            {"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "text", "text": "screenshot:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]},
+        ])
+        tool_result = messages[0]["content"][0]
+        assert tool_result["type"] == "tool_result"
+        assert tool_result["content"] == [
+            {"type": "text", "text": "screenshot:"},
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        ]
 
     def test_strict_alternation_with_pending_tool_results_flush(self):
         # When a user message lands between tool responses and the next message,

@@ -16,6 +16,7 @@ Promp caching layout:
   3. messages
 """
 
+import re
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import httpx
@@ -62,6 +63,37 @@ if TYPE_CHECKING:
 # Shape converters: openJiuwen BaseMessage list  <->  Anthropic Messages API payload
 # ---------------------------------------------------------------------------
 
+_DATA_URI_RE = re.compile(r"^data:(?P<media_type>[^;,]+)(?:;charset=[^;,]*)?;base64,(?P<data>.*)$", re.DOTALL)
+
+
+def _image_url_to_anthropic_block(item: dict) -> Optional[dict]:
+    """Translate an OpenAI-shaped ``image_url`` block to an Anthropic ``image`` block.
+
+    Returns None when the URL is unusable (not a base64 data URI and not
+    http/https); the caller drops the block instead of sending a payload the
+    API is guaranteed to reject with a 400.
+    """
+    image_url = item.get("image_url")
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        match = _DATA_URI_RE.match(url)
+        if match is None:
+            return None
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": match.group("media_type"),
+                "data": match.group("data"),
+            },
+        }
+    if url.startswith(("http://", "https://")):
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    return None
+
+
 def _content_to_blocks(content: Any) -> List[dict]:
     """Normalize OJ ``content`` (str | list[str|dict]) to Anthropic block list."""
     if content is None:
@@ -72,6 +104,13 @@ def _content_to_blocks(content: Any) -> List[dict]:
         blocks2: List[dict] = []
         for item in content:
             if isinstance(item, dict):
+                if item.get("type") == "image_url":
+                    block = _image_url_to_anthropic_block(item)
+                    if block is not None:
+                        blocks2.append(block)
+                    else:
+                        llm_logger.warning("Anthropic: dropping untranslatable image_url block.")
+                    continue
                 blocks2.append(dict(item))
             elif isinstance(item, str):
                 if item:
