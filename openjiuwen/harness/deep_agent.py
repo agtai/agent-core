@@ -114,6 +114,7 @@ if TYPE_CHECKING:
         EventQueue,
     )
     from openjiuwen.harness.schema.config import SubAgentConfig
+    from openjiuwen.harness.schema.stop_condition import StopConditionEvaluator
 
 from openjiuwen.harness.prompts import (
     PromptSection,
@@ -671,8 +672,21 @@ class DeepAgent(BaseAgent):
         # task loop is enabled.  Users can override it by passing
         # their own TaskCompletionRail via add_rail() or the
         # factory's rails= argument.
+        #
+        # The rail is given bounds because it is the only thing that can stop
+        # this loop: the inner ReAct agent is configured with
+        # max_iterations=sys.maxsize whenever the task loop is on, on the
+        # premise that the outer loop owns termination.  Constructed with no
+        # arguments, TaskCompletionRail.build_evaluators() returns an empty
+        # list, LoopCoordinator.should_continue() then has nothing to consult
+        # and returns True on every round, and the premise does not hold.
         if config.enable_task_loop:
-            self._pending_rails.append(TaskCompletionRail())
+            self._pending_rails.append(
+                TaskCompletionRail(
+                    max_rounds=config.task_loop_max_rounds,
+                    timeout_seconds=config.task_loop_timeout_seconds,
+                )
+            )
 
         if isinstance(config.permissions, dict) and config.permissions.get("enabled"):
             ws_root = None
@@ -2105,6 +2119,35 @@ class DeepAgent(BaseAgent):
             session,
         )
 
+    def _default_task_completion_rail(self) -> TaskCompletionRail:
+        """A ``TaskCompletionRail`` carrying the configured loop bounds.
+
+        ``_deep_config`` is None on a ``DeepAgent`` built directly rather than
+        through ``create_deep_agent``, so fall back to the dataclass defaults.
+        """
+        config = self._deep_config or DeepAgentConfig()
+        return TaskCompletionRail(
+            max_rounds=config.task_loop_max_rounds,
+            timeout_seconds=config.task_loop_timeout_seconds,
+        )
+
+    def _stop_condition_evaluators(self) -> List["StopConditionEvaluator"]:
+        """Stop conditions for a freshly built ``LoopCoordinator``.
+
+        ``start()`` prepares the task loop without going through
+        ``_ensure_initialized()``, so the ``TaskCompletionRail`` queued by
+        ``_queue_pending_rails`` -- or one the caller passed via ``rails=`` --
+        is still only pending when the coordinator is built.  Consulting
+        ``_task_completion_rail`` alone would yield an empty chain there, and
+        ``LoopCoordinator.should_continue()`` answers True on an empty chain.
+        Pending rails are therefore checked too.
+        """
+        rail = self._task_completion_rail
+        if rail is None:
+            pending = self.find_pending_rails_by_type(TaskCompletionRail)
+            rail = pending[0] if pending else None
+        return rail.build_evaluators() if rail is not None else []
+
     async def _setup_task_loop(
         self,
         session: Session,
@@ -2129,12 +2172,7 @@ class DeepAgent(BaseAgent):
         ):
             coordinator = self._loop_coordinator
             if coordinator is None:
-                evaluators = (
-                    self._task_completion_rail.build_evaluators()
-                    if self._task_completion_rail is not None
-                    else []
-                )
-                coordinator = LoopCoordinator(evaluators=evaluators)
+                coordinator = LoopCoordinator(evaluators=self._stop_condition_evaluators())
                 self._loop_coordinator = coordinator
             coordinator.reset()
             return coordinator, self._loop_controller
@@ -2143,12 +2181,7 @@ class DeepAgent(BaseAgent):
         if self._loop_controller is not None:
             await self._force_cleanup_controller()
 
-        evaluators = (
-            self._task_completion_rail.build_evaluators()
-            if self._task_completion_rail is not None
-            else []
-        )
-        coordinator = LoopCoordinator(evaluators=evaluators)
+        coordinator = LoopCoordinator(evaluators=self._stop_condition_evaluators())
         coordinator.reset()
 
         queues = LoopQueues()
@@ -3190,7 +3223,9 @@ class DeepAgent(BaseAgent):
             self._interaction_session = session
             await self.prepare_interaction_task_loop(session)
             if self._task_completion_rail is None:
-                await self.register_rail(TaskCompletionRail())
+                # Same bounds as the auto-injected rail: this one also ends up
+                # as the coordinator's only source of stop conditions.
+                await self.register_rail(self._default_task_completion_rail())
 
             from openjiuwen.harness.goal.store import SessionGoalStore
 

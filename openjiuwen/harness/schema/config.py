@@ -187,6 +187,17 @@ class DeepAgentConfig:
             ``KVCacheAffinityConfig`` when the embedded agent is created.
         enable_task_loop: Whether to enable the outer
             task loop (P1).
+        task_loop_max_rounds: Maximum outer-loop rounds before the task loop is
+            force-stopped. Applies only to the ``TaskCompletionRail`` that is
+            auto-injected when ``enable_task_loop`` is True; a rail supplied
+            explicitly by the caller keeps its own settings. ``None`` removes
+            the bound.
+        task_loop_timeout_seconds: Wall-clock limit for the whole task loop, in
+            seconds. Same scope as ``task_loop_max_rounds``. ``None`` removes
+            the bound.
+
+            Both are evaluated *between* rounds, so neither bounds a single
+            model call that never returns.
         enable_async_subagent: Enable async subagent mode (default False).
             When True, SubagentRail registers session tools for async subagent spawning;
             when False, it registers synchronous task tools.
@@ -234,6 +245,12 @@ class DeepAgentConfig:
     context_engine_config: Optional[Any] = None
     kv_cache_affinity_config: Optional[KVCacheAffinityConfig] = None
     enable_task_loop: bool = False
+    # Bounds for the auto-injected TaskCompletionRail. Finite by default: the
+    # inner ReAct agent runs with max_iterations=sys.maxsize under the task
+    # loop, on the premise that the outer loop owns termination, so the outer
+    # loop has to actually own it.
+    task_loop_max_rounds: int | None = 100
+    task_loop_timeout_seconds: float | None = 3600.0
     enable_async_subagent: bool = False
     enable_subagent_runtime: bool = False
     add_general_purpose_agent: bool = False
