@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/task_loop/`（8 个模块）、`openjiuwen/harness/schema/loop_event.py`、`openjiuwen/harness/schema/stop_condition.py`、`openjiuwen/harness/schema/task.py` |
-| 最近一次修订日期 | 2026-08-23 |
-| 关联 feature | N/A |
+| 最近一次修订日期 | 2026-08-24 |
+| 关联 feature | `F_01_task-loop-default-stop-conditions` |
 
 ## 范围 / 边界
 
@@ -163,6 +163,30 @@ class TaskLoopController(Controller):
 | `CustomPredicateEvaluator` | 自定义谓词 |
 
 `StopConditionEvaluator` 是 ABC，`StopEvaluationContext` 是求值上下文。
+
+### 不变量：外层循环必须自带停止条件
+
+`enable_task_loop` 为真时，内层 `ReActAgent` 的 `max_iterations` 被设为 `sys.maxsize`
+（`deep_agent.py::_create_react_agent` / `_hot_reload_model`）。这是有意的分层——**终止权归外
+层任务循环**，内层不再自行封顶。
+
+该分层成立的前提是外层真的持有停止条件。`LoopCoordinator.should_continue()` 以 OR 语义遍历
+求值器链，**链为空时恒返回 `True`**；而 `TaskCompletionRail()` 在 `max_rounds` /
+`timeout_seconds` / `completion_promise` 全为 `None` 时，`build_evaluators()` 返回空列表。
+两者相遇即得到一个两层都不封顶的循环。
+
+因此自动注入（`deep_agent.py::_queue_pending_rails`）必须带上有限默认值，取自
+`DeepAgentConfig.task_loop_max_rounds`（默认 100 轮）与 `task_loop_timeout_seconds`
+（默认 3600 秒）。显式传 `None` 仍可解除限制，那是调用方的选择而非默认形态。
+
+求值器链由 `DeepAgent._stop_condition_evaluators()` 解析，`_setup_task_loop` 的两处
+`LoopCoordinator(...)` 构造点都必须经它。该方法在 `_task_completion_rail` 为空时回退查
+pending rails：交互入口 `start()` 不走 `_ensure_initialized()`，rail 此刻仍在排队，只读
+`_task_completion_rail` 会得到空链——协调器只构造一次，那条空链是永久的。同理，`start()` 在
+`_task_completion_rail` 为空时注册的兜底 rail 也带上同一组边界。
+
+**这两个求值器在轮次之间求值**，因此都不约束单次模型调用内部：一次不返回的生成不会让循环
+获得求值机会。单次生成的封顶属于模型侧输出 token 上限，不在本 spec 范围。
 
 ## 与其它 spec 的关系
 
