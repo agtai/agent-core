@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlyWay Travel — Flight order</title>
+  <link rel="stylesheet" href="shared.css" />
+  <link rel="stylesheet" href="platforms.css" />
+</head>
+<body class="plat">
+  <header class="plat-top flight">
+    <div class="plat-top-row">
+      <div class="plat-logo"><span class="mark">F</span> FlyWay Travel</div>
+      <nav class="plat-nav"><a href="index.html">Hub</a><a href="email.html">Email receipt</a><span>Alex Chen</span></nav>
+    </div>
+    <div class="plat-search"><input value="PEK → CDG · round-trip · economy" readonly /><button type="button">Search flights</button></div>
+  </header>
+  <main class="plat-wrap">
+    <div class="hero-banner">
+      <h1>Flight order · Ticketed</h1>
+      <p>Fare 612.40 EUR · arrive early for your flights</p>
+    </div>
+    <div class="plat-tabs"><span class="on">Flights</span><span>Hotels</span><span>Trains</span><span>Transfers</span><span>Visa</span></div>
+    <article class="order-card">
+      <div class="shop"><strong>Air France</strong><span class="badge ok">Ticketed</span></div>
+      <div class="goods">
+        <div class="thumb flight" data-emoji="✈️"></div>
+        <div>
+          <p class="title">Beijing PEK ⇄ Paris CDG · round-trip</p>
+          <p class="sub">E-ticket AF_eticket_1001.pdf · passenger Alex Chen</p>
+          <div class="kv">
+            <span>Outbound</span><span>2026-03-10 AF128 · PEK 09:20 → CDG 14:55</span>
+            <span>Return</span><span>2026-03-13 AF127 · CDG 16:40 → PEK 09:55+1</span>
+            <span>Cabin</span><span>Economy Y · 1 checked bag</span>
+            <span>Platform #</span><span>FT-AF-1001 · mail-1001</span>
+          </div>
+          <div class="chip-row"><span class="chip">transport</span><span class="chip">changeable (rules apply)</span></div>
+        </div>
+        <div class="price"><div class="now">612.40</div><div class="unit">EUR</div><div class="old">tax incl.</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Ticketed 2026-03-01 16:44</span>
+        <div class="actions"><span class="btn">Check-in</span><span class="btn primary">Download itinerary</span></div>
+      </div>
+    </article>
+    <article class="order-card">
+      <div class="shop"><strong>Add-ons</strong><span class="badge gray">Not purchased</span></div>
+      <div class="goods">
+        <div class="thumb flight" data-emoji="🛡️"></div>
+        <div>
+          <p class="title">Flight insurance / delay cover</p>
+          <p class="sub">Optional protection per segment</p>
+        </div>
+        <div class="price"><div class="now">¥68</div><div class="unit">from</div></div>
+      </div>
+    </article>
+    <p class="plat-note">Boarding passes appear after check-in opens; contact the airline or support for changes.</p>
+  </main>
+</body>
+</html>
