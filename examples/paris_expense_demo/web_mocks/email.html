@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Email — receipt orders</title>
+  <link rel="stylesheet" href="shared.css" />
+  <link rel="stylesheet" href="platforms.css" />
+</head>
+<body class="plat">
+  <header class="plat-top" style="background:linear-gradient(90deg,#1e4d8c,#3b82f6)">
+    <div class="plat-top-row">
+      <div class="plat-logo"><span class="mark">✉</span> Parcel Mail · Orders</div>
+      <nav class="plat-nav">
+        <a href="index.html">Hub</a>
+        <a href="travel.html">FlyWay</a>
+      </nav>
+    </div>
+  </header>
+  <main class="plat-wrap">
+    <div class="plat-tabs">
+      <span class="on">All receipts</span>
+      <span>Unread</span>
+      <span>Attachments</span>
+    </div>
+    <article class="order-card">
+      <div class="shop"><strong>Air France</strong><span class="badge ok">Ticketed</span></div>
+      <div class="goods">
+        <div class="thumb flight" data-emoji="✈️"></div>
+        <div>
+          <p class="title">E-ticket — PEK ⇄ CDG</p>
+          <p class="sub">From noreply@airfrance.com · AF_eticket_1001.pdf</p>
+          <div class="kv">
+            <span>Order</span><span>mail-1001</span>
+            <span>Date</span><span>2026-03-10</span>
+            <span>Traveler</span><span>Alex Chen</span>
+          </div>
+        </div>
+        <div class="price"><div class="now">612.40</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Category: transport</span>
+        <div class="actions"><span class="btn">Open mail</span><span class="btn primary-blue">Download itinerary</span></div>
+      </div>
+    </article>
+    <article class="order-card">
+      <div class="shop"><strong>Le Comptoir du Relais</strong><span class="badge ok">Paid</span></div>
+      <div class="goods">
+        <div class="thumb" data-emoji="🍽️"></div>
+        <div>
+          <p class="title">Client dinner receipt</p>
+          <p class="sub">From receipts@lecomptoir.fr · comptoir_receipt.jpg</p>
+          <div class="kv">
+            <span>Order</span><span>mail-1002</span>
+            <span>Date</span><span>2026-03-12</span>
+          </div>
+        </div>
+        <div class="price"><div class="now">86.50</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Category: meal</span>
+        <div class="actions"><span class="btn">Open mail</span><span class="btn primary">Request invoice</span></div>
+      </div>
+    </article>
+    <p class="plat-note">Need an e-invoice? Request it from the order details.</p>
+  </main>
+</body>
+</html>

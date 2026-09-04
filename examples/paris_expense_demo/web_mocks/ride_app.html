@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OrangeRide — Trips</title>
+  <link rel="stylesheet" href="shared.css" />
+  <link rel="stylesheet" href="platforms.css" />
+</head>
+<body class="plat">
+  <header class="plat-top ride">
+    <div class="plat-top-row">
+      <div class="plat-logo"><span class="mark">O</span> OrangeRide</div>
+      <nav class="plat-nav"><a href="index.html">Hub</a><a href="rides.html">Simple view</a><span>Paris</span></nav>
+    </div>
+    <div class="plat-search"><input value="Trips · 2026-03" readonly /><button type="button">Search</button></div>
+  </header>
+  <main class="plat-wrap">
+    <div class="hero-banner" style="background:linear-gradient(120deg,#ff7e33,#ffb347)">
+      <h1>My trips</h1>
+      <p>Paris airport round trip</p>
+    </div>
+    <div class="plat-tabs"><span class="on">All</span><span>Express</span><span>Premium</span><span>Uninvoiced</span></div>
+    <article class="order-card">
+      <div class="shop"><strong>Express · Completed</strong><span class="badge ok">ride-9001</span></div>
+      <div class="goods">
+        <div class="thumb ride" data-emoji="🚕"></div>
+        <div>
+          <p class="title">CDG airport → hotel</p>
+          <p class="sub">2026-03-10 15:40 pickup · ~42 min</p>
+          <div class="chip-row"><span class="chip">transport</span><span class="chip">invoiceable</span></div>
+        </div>
+        <div class="price"><div class="now">52.30</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Driver: M. Dupont · DEMO-01</span>
+        <div class="actions"><span class="btn">Details</span><span class="btn primary">Invoice</span></div>
+      </div>
+    </article>
+    <article class="order-card">
+      <div class="shop"><strong>Express · Completed</strong><span class="badge ok">ride-9002</span></div>
+      <div class="goods">
+        <div class="thumb ride" data-emoji="🚕"></div>
+        <div>
+          <p class="title">Hotel → CDG airport</p>
+          <p class="sub">2026-03-13 13:10 pickup · AF127</p>
+          <div class="chip-row"><span class="chip">transport</span><span class="chip">invoiceable</span></div>
+        </div>
+        <div class="price"><div class="now">48.90</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Driver: Mme. Martin · DEMO-02</span>
+        <div class="actions"><span class="btn">Details</span><span class="btn primary">Invoice</span></div>
+      </div>
+    </article>
+    <p class="plat-note">Fares follow the trip receipt; invoice from order details.</p>
+  </main>
+</body>
+</html>
