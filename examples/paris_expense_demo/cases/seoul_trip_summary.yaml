@@ -1,0 +1,49 @@
+case_id: seoul_trip_summary
+template: trip_summary
+title: "Seoul partner visit brief — Jan 2026"
+actor: "Jordan Lee"
+query: "Summarize the Seoul trip for the weekly brief."
+date_start: "2026-01-20"
+date_end: "2026-01-22"
+sources:
+  - booking
+  - rides
+  - browser
+merge:
+  sort_by: [date, source, line_id]
+  dedupe_by: null
+  category_map:
+    lodging: lodging
+    transport: transport
+    agenda: agenda
+sink: notes
+policy:
+  enabled: true
+  max_meal_amount: null
+  max_taxi_amount: 40
+  require_categories: ["lodging", "agenda"]
+notes:
+  - "Trip-summary template: itinerary-oriented, amounts optional."
+fixtures:
+  booking:
+    confirmation: HTL-ICN-1102
+    property: "Hotel in Gangnam"
+    check_in: "2026-01-20"
+    amount: 310.00
+    currency: USD
+    category: lodging
+    description: "Hotel 2 nights — Gangnam"
+  rides:
+    - ride_id: ride-s1
+      date: "2026-01-20"
+      amount: 38.00
+      currency: USD
+      category: transport
+      description: "ICN → hotel"
+  browser:
+    - page_id: web-agenda
+      date: "2026-01-21"
+      category: agenda
+      description: "Partner agenda page — 3 meetings"
+      url: "https://intranet.example/seoul-agenda"
+      evidence_ref: "browser:seoul-agenda"

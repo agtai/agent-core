@@ -1,0 +1,86 @@
+case_id: paris_expense
+template: expense
+title: "Paris customer visit — Mar 2026"
+actor: "Alex Chen"
+query: "Expense the Paris trip."
+date_start: "2026-03-10"
+date_end: "2026-03-13"
+sources:
+  - email
+  - photos
+  - booking
+  - rides
+merge:
+  sort_by: [date, source, line_id]
+  dedupe_by: null
+  category_map:
+    hotel: lodging
+    lodging: lodging
+    transport: transport
+    meal: meal
+    other: other
+sink: expense
+policy:
+  enabled: true
+  max_meal_amount: 80
+  max_taxi_amount: 50
+  require_categories: ["lodging", "transport"]
+  meal_categories: ["meal"]
+  taxi_categories: ["transport"]
+notes:
+  - "Sources are local fixtures; no live email/photos/apps were contacted."
+  - "Policy: meals ≤ 80 EUR, taxis ≤ 50 EUR (see policy block)."
+fixtures:
+  email:
+    - message_id: mail-1001
+      from: noreply@airfrance.com
+      subject: "Your electronic ticket — CDG"
+      date: "2026-03-10"
+      amount: 612.40
+      currency: EUR
+      category: transport
+      description: "Air France PEK→CDG round-trip (e-ticket)"
+      attachment: AF_eticket_1001.pdf
+    - message_id: mail-1002
+      from: receipts@lecomptoir.fr
+      subject: "Receipt — Le Comptoir du Relais"
+      date: "2026-03-12"
+      amount: 86.50
+      currency: EUR
+      category: meal
+      description: "Client dinner — Le Comptoir du Relais"
+      attachment: comptoir_receipt.jpg
+  photos:
+    - asset_id: photo-2201
+      date: "2026-03-11"
+      amount: 24.80
+      currency: EUR
+      category: meal
+      description: "Café lunch near Opera (photo OCR)"
+    - asset_id: photo-2202
+      date: "2026-03-13"
+      amount: 18.00
+      currency: EUR
+      category: transport
+      description: "Metro day pass (photo OCR)"
+  booking:
+    confirmation: HTL-PAR-77821
+    property: "Hôtel des Grands Boulevards"
+    check_in: "2026-03-10"
+    amount: 540.00
+    currency: EUR
+    category: lodging
+    description: "Hotel 3 nights — Grands Boulevards"
+  rides:
+    - ride_id: ride-9001
+      date: "2026-03-10"
+      amount: 52.30
+      currency: EUR
+      category: transport
+      description: "Airport taxi CDG → hotel"
+    - ride_id: ride-9002
+      date: "2026-03-13"
+      amount: 48.90
+      currency: EUR
+      category: transport
+      description: "Hotel → CDG"

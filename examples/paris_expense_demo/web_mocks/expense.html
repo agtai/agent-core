@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Expense — claims</title>
+  <link rel="stylesheet" href="shared.css" />
+  <link rel="stylesheet" href="platforms.css" />
+</head>
+<body class="plat">
+  <header class="plat-top" style="background:linear-gradient(90deg,#374151,#6b7280)">
+    <div class="plat-top-row">
+      <div class="plat-logo"><span class="mark">$</span> Ledger Expense · My claims</div>
+      <nav class="plat-nav"><a href="index.html">Hub</a></nav>
+    </div>
+  </header>
+  <main class="plat-wrap">
+    <div class="plat-tabs"><span class="on">All</span><span>Draft</span><span>In review</span><span>Done</span></div>
+    <article class="order-card">
+      <div class="shop"><strong>Paris customer visit — Mar 2026</strong><span class="badge ok">Submitted · pending finance</span></div>
+      <div class="goods">
+        <div class="thumb" data-emoji="📄" style="background:linear-gradient(145deg,#e5e7eb,#9ca3af)"></div>
+        <div>
+          <p class="title">Claim EXP-PARIS-EXPENSE-001</p>
+          <p class="sub">Claimant Alex Chen</p>
+          <div class="kv">
+            <span>Case</span><span>paris_expense</span>
+            <span>Window</span><span>2026-03-10 → 2026-03-13</span>
+            <span>Lines</span><span>7 (flight / hotel / meals / rides…)</span>
+            <span>Permission</span><span>write:claims.create</span>
+          </div>
+        </div>
+        <div class="price"><div class="now">1382.90</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Sink: expense</span>
+        <div class="actions"><span class="btn">View lines</span><span class="btn primary">Print PDF</span></div>
+      </div>
+    </article>
+    <article class="order-card">
+      <div class="shop"><strong>Drafts</strong><span class="badge gray">Empty</span></div>
+      <div class="goods">
+        <div class="thumb" data-emoji="📭" style="background:linear-gradient(145deg,#f3f4f6,#d1d5db)"></div>
+        <div>
+          <p class="title">No pending drafts</p>
+          <p class="sub">Nothing waiting to submit</p>
+        </div>
+        <div class="price"><div class="now">—</div></div>
+      </div>
+    </article>
+    <p class="plat-note">After submit, finance reviews the claim; track progress here.</p>
+  </main>
+</body>
+</html>

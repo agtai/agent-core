@@ -1,0 +1,59 @@
+case_id: berlin_reconcile
+template: reconcile
+title: "Berlin ops card reconcile — Feb 2026"
+actor: "Sam Rivera"
+query: "Reconcile the Berlin ops spend."
+date_start: "2026-02-01"
+date_end: "2026-02-05"
+sources:
+  - email
+  - db
+merge:
+  sort_by: [date, source, line_id]
+  dedupe_by: [date, amount, currency]
+  category_map:
+    transport: transport
+    meal: meal
+    software: software
+    other: other
+sink: ledger
+policy:
+  enabled: true
+  max_meal_amount: 40
+  max_taxi_amount: null
+  require_categories: ["transport"]
+  meal_categories: ["meal"]
+notes:
+  - "Reconcile template: email receipts vs finance DB rows."
+  - "Dedupe keeps the first evidence after sort (email before db)."
+fixtures:
+  email:
+    - message_id: mail-b1
+      date: "2026-02-02"
+      amount: 120.00
+      currency: EUR
+      category: transport
+      description: "Train BER→MUC"
+      attachment: train_b1.pdf
+    - message_id: mail-b2
+      date: "2026-02-03"
+      amount: 45.00
+      currency: EUR
+      category: meal
+      description: "Team lunch"
+      attachment: lunch_b2.pdf
+  db:
+    - row_id: db-900
+      date: "2026-02-02"
+      amount: 120.00
+      currency: EUR
+      category: transport
+      description: "Ledger: rail BER→MUC"
+      table: corp_card_txns
+    - row_id: db-901
+      date: "2026-02-04"
+      amount: 29.99
+      currency: EUR
+      category: software
+      description: "Ledger: SaaS seat"
+      table: corp_card_txns
