@@ -72,7 +72,7 @@ TeamAgent 依赖**。详见 `docs/features/F_35`（起步版）、`F_41`（统�
 | 符号 | 职责 |
 |---|---|
 | `AsyncTool(TeamTool)` | 异步工具基类。持 `parent_agent`(NativeHarness)；子类实现 `run_background(task_id, inputs)`；`invoke` 立即返回 launched |
-| `AsyncToolRuntime` | 挂在 NativeHarness 上的后台任务注册表 + 完成注入器。`launch(task_id, coro_factory, *, tool_name, description, format_completed=None, format_failed=None)` / `has_running` / `cancel_all` + 管控面 `get` / `list_all` / `cancel(task_id)` / `wait(task_id, timeout)`；`_tasks` 是 `dict[task_id, Task]`（非 set）+ per-task `_events`；完成经 `_maybe_spill`（内联 vs 写盘）后调注入回调（= `harness.send(immediate=False)`）。`_run`：回调存在且返回非 `None` 则用回调文本 inject，否则回退 `async_tool.completed` / `async_tool.failed` |
+| `AsyncToolRuntime` | 挂在 NativeHarness 上的后台任务注册表 + 完成注入器。`launch(task_id, coro_factory, *, tool_name, description, format_completed=None, format_failed=None)` / `has_running` / `cancel_all` + 管控面 `get` / `list_all` / `cancel(task_id)` / `wait(task_id, timeout)`；`_tasks` 是 `dict[task_id, Task]`（非 set）+ per-task `_events`；完成经 `_maybe_spill`（内联 vs 写盘）后调注入回调（= `harness.send(immediate=False)`）。`_run` 持有执行与退出；`_execute`：回调存在且返回非 `None` 则用回调文本 inject，否则回退 `async_tool.completed` / `async_tool.failed` |
 | `AsyncToolRecord` | 注册表行（task_id / tool_name / status / result / error / `output_file` / `format_completed` / `format_failed` 可选回调） |
 | `CompletionFormatter` / `FailureFormatter` | 类型别名（`Callable[[Any], str \| None]` / `Callable[[str], str \| None]`，`async_tools.__all__` 导出） |
 | `render_result_text` | 通用结果渲染，**完整不截断**（str 原样 / dict-list JSON / 其它 str()） |
@@ -111,3 +111,8 @@ swarmflow→`w`、未注册→`t`）；`id_generator.py` 在 agent_teams 顶层�
 2. **没有异步 tool_result。** 启动段与完成段是两个独立回合；完成结果绝不回到原 `tool_use_id`。
 3. **不收编 sessions_spawn / 不走 TaskScheduler 的 SESSION_SPAWN。** 避免结果写进 DeepAgent
    `pending_follow_ups`（进 session checkpoint 的 user-bound 语义）污染恢复。
+
+Cancellation settlement uses `core.common.wait_for_task_settlement` (F_79 / S_20).
+A cancel receipt does not establish task exit: observe `execution_settled`.
+Live IDs stay reserved through cleanup; late cancelled results do not start an
+injection. The same physical wait is used by the Live Voice Work adapter.

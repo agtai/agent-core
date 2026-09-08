@@ -44,3 +44,9 @@
 1. **Pool 只持 leader**。leader 由 spec 路径（`manager.activate` → `_apply_action` 写入）入 pool；teammate / human-agent 走 `Runner.run_agent_team*(member=True)` 入口（spawn 调用），完全不碰 pool。pool key 是 `team_name`，一个 team 只有一个 leader 占位。
 2. **`manager` 没有"已 build 实例 → pool"的快捷入口**。早期版本提供过 `register_instance` 作为这种快捷，已删除——pool 写入语义只剩一种（spec 经 `activate`），避免双入口下的 stale state 与漂移。
 3. **stream 退出 finally 关 gate**：默认 spec 路径的 finally 调 `_close_team_interact_gate`，run cycle 结束后 `interact_agent_team` 拿到的是 `gate_closed` 而非 `not_active`。`base=True` BaseTeam 路径与 `member=True` spawn 路径因为不入 pool，不参与 gate 生命周期。
+
+Background pause/resume additionally follows F_79: keep the original async-tool
+record and retry intent. Resume must observe that exact record settled and the
+avatar sessions aborted before calling `_relaunch` (which creates a fresh task
+ID). Failure leaves the intent paused; `resume()` reports True only if at least
+one relaunch succeeded.

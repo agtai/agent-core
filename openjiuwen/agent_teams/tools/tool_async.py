@@ -40,6 +40,8 @@ def _record_brief(record: AsyncToolRecord) -> dict[str, Any]:
         "tool_name": record.tool_name,
         "status": record.status,
         "description": record.description,
+        "execution_settled": record.execution_settled,
+        "cancellation_requested": record.cancellation_requested,
     }
 
 
@@ -145,6 +147,8 @@ class AsyncTaskOutputTool(TeamTool):
                 "status": record.status,
                 "result": result_text,
                 "error": record.error,
+                "execution_settled": record.execution_settled,
+                "cancellation_requested": record.cancellation_requested,
             },
         )
 
@@ -169,8 +173,8 @@ class AsyncTaskOutputTool(TeamTool):
         status = data.get("status")
         if status == "error":
             return f"[task {task_id}] status=error\n{data.get('error') or ''}"
-        if status == "running":
-            return f"[task {task_id}] status=running (not finished yet)"
+        if status in {"running", "cancelling", "unknown"}:
+            return f"[task {task_id}] status={status}; execution_settled={data.get('execution_settled', False)}"
         return f"[task {task_id}] status={status}\n{data.get('result') or ''}"
 
 
@@ -202,18 +206,28 @@ class AsyncTaskCancelTool(TeamTool):
         if not task_id:
             return ToolOutput(success=False, error="'task_id' is required")
         try:
-            ok = await self._parent_agent.async_tool_runtime.cancel(task_id)
+            runtime = self._parent_agent.async_tool_runtime
+            record = runtime.get(task_id)
+            ok = await runtime.cancel(task_id)
         except Exception as exc:  # noqa: BLE001 - always return a ToolOutput
             team_logger.error("[async_task_cancel] failed: %s", exc, exc_info=True)
             return ToolOutput(success=False, error=f"Internal error: {exc}")
         if not ok:
             return ToolOutput(success=False, error=f"Task '{task_id}' not found")
-        return ToolOutput(success=True, data={"task_id": task_id, "status": "cancelled"})
+        return ToolOutput(success=True, data={
+            "task_id": task_id, "status": record.status,
+            "execution_settled": record.execution_settled,
+            "cancellation_requested": record.cancellation_requested,
+            "error": record.error,
+        })
 
     def map_result(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to cancel async task"
-        return f"[task {output.data['task_id']}] cancelled."
+        data = output.data
+        return (f"[task {data['task_id']}] status={data['status']}; "
+                f"cancellation_requested={data['cancellation_requested']}; "
+                f"execution_settled={data['execution_settled']}")
 
 
 __all__ = ["AsyncTasksListTool", "AsyncTaskOutputTool", "AsyncTaskCancelTool"]

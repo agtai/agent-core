@@ -11,6 +11,7 @@ clears the parked set; both are no-ops with nothing registered.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from openjiuwen.agent_teams.runtime.background_task_controller import (
     BackgroundTaskController,
@@ -24,6 +25,9 @@ class _StubBackend:
     def __init__(self, seq: list) -> None:
         self._seq = seq
 
+    async def aclose(self) -> None:
+        pass
+
     async def abort_sessions(self) -> None:
         self._seq.append("abort_sessions")
 
@@ -32,6 +36,10 @@ class _StubRuntime:
     def __init__(self, seq: list) -> None:
         self._seq = seq
         self.cancelled: list[str] = []
+        self.record = SimpleNamespace(execution_settled=True)
+
+    def get(self, task_id):
+        return self.record
 
     async def cancel(self, task_id: str) -> bool:
         self._seq.append(f"cancel:{task_id}")

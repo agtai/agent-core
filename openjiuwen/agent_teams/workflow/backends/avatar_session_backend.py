@@ -239,19 +239,36 @@ class AvatarSessionManager:
 
     async def close_session(self, session_id: str) -> None:
         """Dispose one session's avatar and drop its row (idempotent)."""
-        state = self._sessions.pop(session_id, None)
-        if state is None or state.harness is None:
+        state = self._sessions.get(session_id)
+        if state is None:
             return
-        binding = kv_cache_hooks.build_current_harness_binding(state.harness)
-        try:
-            await cancellation_safe_evict_then_dispose(
-                binding=binding,
-                dispose=state.harness.dispose,
-                reason="swarmflow-stateful-session-close",
-                owner_id=session_id,
-            )
-        finally:
-            kv_cache_hooks.clear_harness_session_hooks(state.harness)
+        async with state.lock:
+            if self._sessions.get(session_id) is not state:
+                return
+            if state.harness is None:
+                self._sessions.pop(session_id, None)
+                return
+            binding = kv_cache_hooks.build_current_harness_binding(state.harness)
+            disposed = False
+
+            async def dispose() -> None:
+                nonlocal disposed
+                await state.harness.dispose()
+                disposed = True
+
+            try:
+                await cancellation_safe_evict_then_dispose(
+                    binding=binding, dispose=dispose,
+                    reason="swarmflow-stateful-session-close", owner_id=session_id,
+                )
+                # The KV helper is intentionally best effort; its normal return
+                # does not prove that the separate harness dispose succeeded.
+                if not disposed:
+                    raise BackendError(f"avatar disposal unconfirmed: {session_id}")
+            finally:
+                if disposed:
+                    self._sessions.pop(session_id, None)
+                    kv_cache_hooks.clear_harness_session_hooks(state.harness)
 
     async def aclose(self) -> None:
         """Cancel pending human waits, unsubscribe, and dispose every session."""
@@ -289,12 +306,16 @@ class AvatarSessionManager:
             if not fut.done():
                 fut.cancel()
         self._pending_human.clear()
+        failed = []
         for state in list(self._sessions.values()):
             if state.harness is not None:
                 try:
                     await state.harness.abort(immediate=True)
-                except Exception:  # noqa: BLE001 - best effort during pause
+                except Exception:  # noqa: BLE001 - attempt every avatar, then report failure
+                    failed.append(state.member_name)
                     team_logger.debug("[swarmflow] session abort failed for %s", state.member_name)
+        if failed:
+            raise BackendError(f"avatar abort unconfirmed: {', '.join(failed)}")
 
     def submit_human_reply(self, correlation_id: str, answer: str) -> bool:
         """Resolve a pending human turn with the person's raw reply.

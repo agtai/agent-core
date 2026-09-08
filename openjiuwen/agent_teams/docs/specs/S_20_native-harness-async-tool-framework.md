@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `harness/async_tools.py`、`harness/native_harness.py`、`id_generator.py`、`tools/tool_async.py`、`tools/tool_factory.py`、`tools/tool_permissions.py`、`paths.py`、`rails/team_tool_rail.py`、`workflow/tool_swarmflow.py`、`workflow/observer.py` |
-| 最近一次修订日期 | 2026-07-01 |
+| 最近一次修订日期 | 2026-09-09 |
 | 关联 feature | `F_35_native-harness-async-tool-framework.md`、`F_41_async-tool-control-and-spill.md`、`F_47_swarmflow-concurrency-governor.md`、`F_48_swarmflow-inline-script-execution.md` |
 
 ## 范围 / 边界
@@ -56,7 +56,7 @@ openjiuwen 工具循环与 Anthropic API 一样**强配对**：每个 `tool_call
 
 ## `AsyncToolRecord`
 
-- 字段：`task_id` / `tool_name` / `description` / `status`（running|completed|error）/
+- 字段：`task_id` / `tool_name` / `description` / `status`（running|cancelling|unknown|completed|error）/
   `result` / `error` / `output_file`（溢写时为磁盘路径字符串，否则 `None`）/
   `format_completed` / `format_failed`（可选回调，见下）。
 - `format_completed(result) -> str | None` / `format_failed(error) -> str | None`（类型别名
@@ -73,25 +73,25 @@ openjiuwen 工具循环与 Anthropic API 一样**强配对**：每个 `tool_call
   取消，取代起步版的无标识 `set`）、`_events: dict[task_id, asyncio.Event]`（per-task 完成
   信号，供 `wait` 阻塞唤醒）。
 - `launch(task_id, coro_factory, *, tool_name, description, format_completed=None,
-  format_failed=None)`：建 `running` 记录（含 format 回调）+ per-task event →
-  `asyncio.create_task` 入 `_tasks[task_id]`（防 GC）+ done callback `pop(task_id)` → `_run`。
-- `_run`：`await coro_factory()`；成功 → 记录 `completed` + 注入文本 =
-  `format_completed(result)` 若存在，否则 `_maybe_spill` + `async_tool.completed`；异常 →
-  记录 `error` + `team_logger.error` → `format_failed(str(exc))` 若存在，否则
-  `async_tool.failed`；`CancelledError` → 记录 `error="cancelled"` → `_signal` → 重抛（**不注入**）。
-- `_signal(task_id)`：set per-task event，唤醒阻塞的 `wait`。
-- `_maybe_spill(task_id, record, text) -> str`：`len(text) <= spill_threshold` 或 resolver 为
-  空 / 返回 `None` → 完整内联（保持"完整回灌"）；否则 `asyncio.to_thread` 写盘 +
-  `record.output_file` 置位，返回"摘要（前 1024 字符）+ `async_tool.spilled_notice`（路径 +
-  取回提示）"。写盘失败降级内联（不丢结果）。
-- `get(task_id)` / `list_all()`：registry 读取（管控工具用）。
-- `cancel(task_id) -> bool`：按 id 取消 task + 标记 record `error`/`"cancelled"` + `_signal`；
-  未知 id 返 `False`；已完成幂等（返 `True` 不改终态）。
-- `wait(task_id, timeout) -> AsyncToolRecord|None`：终态 / 未知立即返回；否则
-  `asyncio.wait_for(event.wait(), timeout)`（秒），超时返回 running record（**不 raise**）。
-- `has_running(tool_name)`：registry 中是否有该工具的 running 记录（观测 / 管控工具用；
-  **不作** swarmflow L1 门禁，见 `S_21` / `F_47`）。
-- `cancel_all()`：teardown 取消 `_tasks` 全部未完成。
+  format_failed=None)`：同 ID 的旧执行（包括清理/通知）未退出时拒绝；只有真实退出后才可复用
+  ID（普通调用者显式复用已退出 ID）。done callback 按具体 Task 对象匹配，不得删除后来的执行。
+- `core.common.wait_for_task_settlement` 是公共物理退出等待原语：先等实际 Task 或取消事件，
+  再按 `cancel_settlement_seconds`（默认 1 秒）等待退出。超时只产生未退出事实，不释放所有权；
+  取消等待者也不取消所借用的执行。Live Voice Work 消费同一原语，保留自身持久化/权限/播报。
+- `AsyncToolRecord` 增加 `execution_settled`、`cancellation_requested`；status 增加
+  `cancelling`、`unknown`。取消请求先进入 cancelling；超过退出等待期限为 unknown，实际退出
+  后 `execution_settled=True`，unknown 不改称成功。完成/失败文本在工具结果与溢写就绪后注入；
+  已请求取消时不得开始新的结果/错误注入。已经进入注入回调的效果不能宣称被撤回。
+- `_run` 持有真实 worker 到退出（含 finally 与已开始的通知回调）。`_maybe_spill` 的线程写入
+  即使收到取消仍须等实际线程退出，避免先报结束再写盘。已有 completed/error 结果不因宿主退出被改写。
+- done callback 只在执行真正退出时唤醒捕获的原 Event/记录；即使 ID 已被新执行复用，也必须结算原等待者。`wait(task_id, timeout)` 有界等待这个信号，
+  超时返回当前记录。单看 status 不足以认定物理执行退出。
+- `get` / `list_all` 读取同一注册表；`has_running` 按未退出执行统计，包括 cancelling/unknown。
+- `cancel(task_id) -> bool` 发出取消并至多等 `cancel_settlement_seconds`；True 仅表示目标已知。
+  必须读取记录的 status/`execution_settled` 确认实际结果。未知 False；已完成/失败幂等不改写。
+- `cancel_all()` 请求所有在途执行停止；重复请求不能再次打断正在进行的清理。
+- BackgroundTaskController 的 relaunch 创建新 task ID；因此必须先确认原记录的执行已退出且 avatar 会话已 abort。失败的恢复意图保留供重试，
+  不得清除意图并报告恢复成功。
 
 ## 管控工具（`tools/tool_async.py`）
 
@@ -101,9 +101,9 @@ openjiuwen 工具循环与 Anthropic API 一样**强配对**：每个 `tool_call
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
-| `async_tasks_list` | 无 | `list_all()` → 每行 `task_id / tool / status / description` |
-| `async_task_output` | `task_id`，`block:bool=false`，`timeout:int=30000`(ms) | block=false 取当前 record；block=true `wait(task_id, min(timeout,600000)/1000)`；`output_file` 非空读盘，否则内存 result。返回 `{task_id, status, result, error}` |
-| `async_task_cancel` | `task_id` | `cancel(task_id)` |
+| `async_tasks_list` | 无 | `list_all()` → 每行 `task_id / tool / status / description / execution_settled / cancellation_requested` |
+| `async_task_output` | `task_id`，`block:bool=false`，`timeout:int=30000`(ms) | block=false 取当前 record；block=true `wait(task_id, min(timeout,600000)/1000)`；`output_file` 非空读盘，否则内存 result。返回 `{task_id, status, result, error, execution_settled, cancellation_requested}` |
+| `async_task_cancel` | `task_id` | `cancel(task_id)` 后投射实际 status / execution_settled / cancellation_requested / error，不固定声称 cancelled |
 
 - 装配：均在 `LEADER_ONLY_TOOLS`（`tool_permissions.py`），`create_team_tools` 始终随 leader
   注入（**不 gate** —— registry 空时 list 返回 "No async tasks."，无害）。`timeout` 上限封顶
@@ -167,3 +167,11 @@ openjiuwen 工具循环与 Anthropic API 一样**强配对**：每个 `tool_call
   checkpoint 状态。
 - 溢写输出文件生命周期随 team —— `register_cleanup_path` 注册后由 `clean_team` 清理，不单独
   泄漏。
+
+Avatar abort failures propagate after attempting every avatar. Disposal retains
+the original session row and hooks until the actual harness dispose succeeds;
+the best-effort KV cleanup helper's normal return is not proof of disposal.
+The controller retries backend aclose before relaunch. Both abort and disposal
+failures therefore retain a retryable paused intent even when the outer workflow
+coroutine has already exited. Real manager/backend/KV-helper fault tests cover
+this boundary with failure injected only in the underlying harness operations.

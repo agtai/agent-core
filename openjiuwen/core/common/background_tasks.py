@@ -2,13 +2,66 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 import asyncio
+import math
 import sys
-from typing import TYPE_CHECKING, Any, Coroutine, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 import anyio
 
 if TYPE_CHECKING:
     from openjiuwen.core.common.task_manager.task import Task
+
+
+@dataclass(frozen=True)
+class TaskSettlement:
+    """Physical task-exit observation, independent of any product outcome."""
+
+    settled: bool
+    timed_out: bool
+    cancellation_requested: bool
+
+
+async def wait_for_task_settlement(
+    task: asyncio.Future,
+    *,
+    cancelled: asyncio.Event,
+    timeout: float | None = None,
+    settlement_timeout: float = 1.0,
+    request_cancel: Callable[[], None] | None = None,
+) -> TaskSettlement:
+    """Wait for execution or stop, then bound the wait for actual task exit.
+
+    A deadline sets the caller's cancellation event. ``request_cancel`` optionally
+    delivers a hard/cooperative stop to this exact task; an event-only runner
+    needs no callback. A settlement timeout leaves the task alive and owned by
+    the caller. Cancelling this observer neither cancels nor forgets that task.
+    Exceptions/results are left on the original task for its owner to consume.
+    """
+    for bound in (timeout, settlement_timeout):
+        if bound is not None and (
+            isinstance(bound, bool) or not isinstance(bound, (float, int))
+            or not math.isfinite(bound) or bound < 0
+        ):
+            raise ValueError("task wait bounds must be finite and nonnegative")
+    if settlement_timeout is None:
+        raise ValueError("settlement_timeout must be bounded")
+    stop = asyncio.create_task(cancelled.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {task, stop}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        timed_out = not done
+        if task not in done:
+            cancelled.set()
+            if request_cancel is not None and not task.done():
+                request_cancel()
+            if not task.done():
+                await asyncio.wait({task}, timeout=settlement_timeout)
+        return TaskSettlement(task.done(), timed_out, cancelled.is_set())
+    finally:
+        stop.cancel()
+        await asyncio.gather(stop, return_exceptions=True)
 
 
 def _get_loaded_task_group():

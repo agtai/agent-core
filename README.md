@@ -177,3 +177,15 @@ We welcome all forms of contributions, including but not limited to:
 This project is licensed under the Apache-2.0 License.
 
 This product serves solely as a workflow orchestration tool and does not embed any AI model capabilities. When users integrate AI models for specific business scenarios, they shall bear full responsibility for compliance obligations under the EU AI Act and other relevant regulatory frameworks.
+
+### Physical background task settlement
+
+`openjiuwen.core.common.wait_for_task_settlement(task, cancelled=event,
+timeout=None, settlement_timeout=1.0, request_cancel=None)` distinguishes a
+cancellation request from actual task exit. Its `TaskSettlement` reports
+`settled`, `timed_out` and `cancellation_requested`. An unsettled task remains
+owned by the caller; cancelling the observer does not cancel the borrowed task.
+The optional synchronous callback requests cancellation of that exact execution.
+The original task retains its result/exception. NativeHarness async tools and
+the Live Voice Work adapter use this same primitive. Async-tool control receipts
+expose `execution_settled`; an acknowledged cancel is not proof of termination.

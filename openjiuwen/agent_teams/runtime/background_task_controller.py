@@ -34,6 +34,13 @@ class SwarmflowRunHandle:
     relaunch: Callable[[], None]  # re-launch run_background with the SAME inputs
 
 
+@dataclass
+class _PausedRun:
+    handle: SwarmflowRunHandle
+    record: Any
+    sessions_aborted: bool
+
+
 class BackgroundTaskController:
     """Unified pause/resume control surface threaded through streaming.
 
@@ -44,7 +51,7 @@ class BackgroundTaskController:
 
     def __init__(self) -> None:
         self._active: dict[str, SwarmflowRunHandle] = {}
-        self._paused: dict[str, Callable[[], None]] = {}  # task_id → relaunch
+        self._paused: dict[str, _PausedRun] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -83,16 +90,19 @@ class BackgroundTaskController:
             if not self._active:
                 return False
             for task_id, handle in list(self._active.items()):
+                record = handle.native.async_tool_runtime.get(task_id)
                 handle.abort_event.set()
+                sessions_aborted = False
                 try:
                     await handle.backend.abort_sessions()
+                    sessions_aborted = True
                 except Exception:  # noqa: BLE001 - best effort; cancel still stops the run
                     team_logger.debug("[bg-ctl] abort_sessions failed for %s", task_id, exc_info=True)
                 try:
                     await handle.native.async_tool_runtime.cancel(task_id)
                 except Exception:  # noqa: BLE001 - cancel is best-effort
                     team_logger.debug("[bg-ctl] cancel failed for %s", task_id, exc_info=True)
-                self._paused[task_id] = handle.relaunch
+                self._paused[task_id] = _PausedRun(handle, record, sessions_aborted)
                 self._active.pop(task_id, None)
             return True
 
@@ -106,13 +116,30 @@ class BackgroundTaskController:
         async with self._lock:
             if not self._paused:
                 return False
-            for task_id, relaunch in list(self._paused.items()):
+            resumed = False
+            for task_id, paused in list(self._paused.items()):
+                handle = paused.handle
+                # Swarmflow relaunch uses a fresh task ID. Fence the original
+                # execution explicitly; duplicate-ID rejection alone cannot do it.
+                record = handle.native.async_tool_runtime.get(task_id)
+                if record is None or record is not paused.record or not record.execution_settled:
+                    continue
                 try:
-                    relaunch()
+                    if not paused.sessions_aborted:
+                        await handle.backend.abort_sessions()
+                        paused.sessions_aborted = True
+                    # The engine's finally is best effort. Retry retained avatar
+                    # disposal before starting another run against the same WAL.
+                    await handle.backend.aclose()
+                    handle.relaunch()
                 except Exception:  # noqa: BLE001 - a failed relaunch must not strand the rest
                     team_logger.debug("[bg-ctl] relaunch failed for %s", task_id, exc_info=True)
+                    # The old execution may still be settling. Preserve this
+                    # exact relaunch intent for retry; a failure is not a resume.
+                    continue
                 self._paused.pop(task_id, None)
-            return True
+                resumed = True
+            return resumed
 
     def is_paused(self) -> bool:
         """Whether any run is currently paused (awaiting resume)."""

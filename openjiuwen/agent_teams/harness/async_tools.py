@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ from openjiuwen.agent_teams.i18n import t
 from openjiuwen.agent_teams.id_generator import generate_id
 from openjiuwen.agent_teams.tools.tool_base import TeamTool
 from openjiuwen.core.common.logging import team_logger
+from openjiuwen.core.common.background_tasks import wait_for_task_settlement
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
 # A completion-injection callback: hand the harness the model-facing text. Wired
@@ -84,12 +86,14 @@ class AsyncToolRecord:
     task_id: str
     tool_name: str
     description: str
-    status: str = "running"  # running | completed | error
+    status: str = "running"  # running | cancelling | unknown | completed | error
     result: Any = None
     error: str = ""
     output_file: str | None = None  # set when an oversized result spills to disk
     format_completed: CompletionFormatter | None = None
     format_failed: FailureFormatter | None = None
+    execution_settled: bool = False
+    cancellation_requested: bool = False
 
 
 @dataclass
@@ -117,11 +121,18 @@ class AsyncToolRuntime:
     # blocking ``wait`` the moment the record reaches a terminal state.
     _tasks: "dict[str, asyncio.Task]" = field(default_factory=dict)
     _events: "dict[str, asyncio.Event]" = field(default_factory=dict)
+    _cancellations: dict[str, asyncio.Event] = field(default_factory=dict)
+    cancel_settlement_seconds: float = 1.0
+
+    def __post_init__(self) -> None:
+        bound = self.cancel_settlement_seconds
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)) or not math.isfinite(bound) or bound <= 0:
+            raise ValueError("cancel_settlement_seconds must be positive and finite")
 
     def has_running(self, tool_name: str) -> bool:
         """Return whether a task for ``tool_name`` is currently running."""
         return any(
-            record.status == "running" and record.tool_name == tool_name
+            not record.execution_settled and record.tool_name == tool_name
             for record in self.registry.values()
         )
 
@@ -147,17 +158,36 @@ class AsyncToolRuntime:
             format_completed: Optional callback to render completion text.
             format_failed: Optional callback to render failure text.
         """
-        self.registry[task_id] = AsyncToolRecord(
+        previous = self._tasks.get(task_id)
+        if previous is not None and not previous.done():
+            raise ValueError(f"Async tool task {task_id!r} is still owned")
+        record = self.registry[task_id] = AsyncToolRecord(
             task_id=task_id,
             tool_name=tool_name,
             description=description,
             format_completed=format_completed,
             format_failed=format_failed,
         )
-        self._events[task_id] = asyncio.Event()
+        completion = self._events[task_id] = asyncio.Event()
+        self._cancellations[task_id] = asyncio.Event()
         task = asyncio.create_task(self._run(task_id, coro_factory, tool_name))
         self._tasks[task_id] = task
-        task.add_done_callback(lambda _t, _id=task_id: self._tasks.pop(_id, None))
+
+        def finished(completed: asyncio.Task) -> None:
+            # An already-done ID may have been relaunched before this callback.
+            # Always settle its captured row/event, never the replacement's.
+            record.execution_settled = True
+            if completed.cancelled() and record.status in {"running", "cancelling"}:
+                record.status = "error"
+                record.error = "cancelled"
+            completion.set()
+            if self._tasks.get(task_id) is completed:
+                self._tasks.pop(task_id, None)
+                self._cancellations.pop(task_id, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(finished)
 
     async def _run(
         self,
@@ -165,17 +195,60 @@ class AsyncToolRuntime:
         coro_factory: Callable[[], Awaitable[Any]],
         tool_name: str,
     ) -> None:
-        """Run the task, update its record, then inject the result/error text."""
-        record = self.registry.get(task_id)
+        """Own execution until its coroutine and completion delivery exit."""
+        record = self.registry[task_id]
+        cancelled = self._cancellations[task_id]
+        worker = asyncio.create_task(self._execute(task_id, record, cancelled, coro_factory, tool_name))
         try:
-            result = await coro_factory()
+            settlement = await wait_for_task_settlement(
+                worker, cancelled=cancelled,
+                settlement_timeout=self.cancel_settlement_seconds,
+                request_cancel=worker.cancel,
+            )
+            if not settlement.settled:
+                record.status = "unknown"
+                record.error = "cancellation_outcome_unknown"
+            # Retain the exact ID and physical reservation even after timeout.
+            await asyncio.shield(asyncio.gather(worker, return_exceptions=True))
         except asyncio.CancelledError:
-            if record is not None:
+            cancelled.set()
+            record.cancellation_requested = True
+            if not worker.done():
+                worker.cancel()
+            await asyncio.shield(asyncio.gather(worker, return_exceptions=True))
+            raise
+        finally:
+            if (cancelled.is_set() or worker.cancelled()) and record.status not in {"completed", "error", "unknown"}:
                 record.status = "error"
                 record.error = "cancelled"
-            self._signal(task_id)
+
+    async def _execute(
+        self, task_id: str, record: AsyncToolRecord, cancelled: asyncio.Event,
+        coro_factory: Callable[[], Awaitable[Any]], tool_name: str,
+    ) -> None:
+        """Two-phase protocol; stop fencing precedes every new completion effect."""
+        if cancelled.is_set():
+            return
+        try:
+            result = await coro_factory()
+            if cancelled.is_set():
+                return
+            result_text = await self._maybe_spill(task_id, record, render_result_text(result))
+            if cancelled.is_set():
+                return
+            completion_text = record.format_completed(result) if record.format_completed else None
+            if completion_text is None:
+                completion_text = t("async_tool.completed", tool=tool_name, result=result_text)
+            if cancelled.is_set():
+                return
+            record.status = "completed"
+            record.result = result
+            await self._inject(completion_text)
+        except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - report any tool failure back
+            if cancelled.is_set():
+                return
             team_logger.error(
                 "[AsyncToolRuntime] task %s (%s) failed: %s",
                 task_id,
@@ -183,36 +256,16 @@ class AsyncToolRuntime:
                 exc,
                 exc_info=True,
             )
-            if record is not None:
-                record.status = "error"
-                record.error = str(exc)
-            self._signal(task_id)
+            record.status = "error"
+            record.error = str(exc)
             failure_text = None
-            if record is not None and record.format_failed is not None:
+            if record.format_failed is not None:
                 failure_text = record.format_failed(str(exc))
             if failure_text is None:
                 failure_text = t("async_tool.failed", tool=tool_name, error=str(exc))
+            if cancelled.is_set():
+                return
             await self._inject(failure_text)
-            return
-        if record is not None:
-            record.status = "completed"
-            record.result = result
-        result_text = render_result_text(result)
-        if record is not None:
-            result_text = await self._maybe_spill(task_id, record, result_text)
-        self._signal(task_id)
-        completion_text = None
-        if record is not None and record.format_completed is not None:
-            completion_text = record.format_completed(result)
-        if completion_text is None:
-            completion_text = t("async_tool.completed", tool=tool_name, result=result_text)
-        await self._inject(completion_text)
-
-    def _signal(self, task_id: str) -> None:
-        """Wake any ``wait`` blocked on this task — its record is now terminal."""
-        event = self._events.get(task_id)
-        if event is not None:
-            event.set()
 
     async def _maybe_spill(
         self,
@@ -244,7 +297,14 @@ class AsyncToolRuntime:
             return text
         path = out_dir / f"{task_id}.output"
         try:
-            await asyncio.to_thread(_write_output_file, path, text)
+            writing = asyncio.create_task(asyncio.to_thread(_write_output_file, path, text))
+            try:
+                await asyncio.shield(writing)
+            except asyncio.CancelledError:
+                # Cancelling an asyncio wrapper cannot stop its OS thread.
+                # Keep ownership until that actual file operation exits.
+                await asyncio.shield(asyncio.gather(writing, return_exceptions=True))
+                raise
         except Exception:  # noqa: BLE001 - a spill failure degrades to inline
             team_logger.warning(
                 "[AsyncToolRuntime] spill failed for %s; inlining full result",
@@ -266,24 +326,28 @@ class AsyncToolRuntime:
         return list(self.registry.values())
 
     async def cancel(self, task_id: str) -> bool:
-        """Cancel one task by id and mark its record. Return False if unknown.
+        """Request exact cancellation and wait a bounded time for settlement.
 
-        Idempotent on an already-finished task (returns True, leaves the
-        terminal record intact). The underlying ``asyncio.Task`` cancellation
-        takes effect at its next await point; the record is marked here so
-        ``get`` / ``list_all`` reflect the cancel immediately.
+        True means the target is known, not that cancellation has completed.
+        Inspect ``status`` and ``execution_settled`` on the returned registry row.
         """
-        task = self._tasks.get(task_id)
-        if task is None:
-            return False
-        if not task.done():
-            task.cancel()
         record = self.registry.get(task_id)
-        if record is not None and record.status == "running":
-            record.status = "error"
-            record.error = "cancelled"
-        self._signal(task_id)
+        if record is None:
+            return False
+        if record.status in {"completed", "error"}:
+            return True
+        self._request_cancel(task_id)
+        await self.wait(task_id, self.cancel_settlement_seconds)
         return True
+
+    def _request_cancel(self, task_id: str) -> None:
+        event = self._cancellations.get(task_id)
+        if event is not None:
+            record = self.registry[task_id]
+            record.cancellation_requested = True
+            if record.status == "running":
+                record.status = "cancelling"
+            event.set()
 
     async def wait(self, task_id: str, timeout: float) -> "AsyncToolRecord | None":
         """Block until ``task_id`` is terminal or ``timeout`` seconds elapse.
@@ -303,7 +367,7 @@ class AsyncToolRuntime:
         record = self.registry.get(task_id)
         if record is None:
             return None
-        if record.status != "running":
+        if record.execution_settled:
             return record
         event = self._events.get(task_id)
         if event is None:
@@ -312,7 +376,7 @@ class AsyncToolRuntime:
             await asyncio.wait_for(event.wait(), timeout)
         except asyncio.TimeoutError:
             pass
-        return self.registry.get(task_id)
+        return record
 
     async def _inject(self, text: str) -> None:
         """Best-effort completion injection; a stopped harness must not raise."""
@@ -323,9 +387,8 @@ class AsyncToolRuntime:
 
     def cancel_all(self) -> None:
         """Cancel all in-flight tasks (teardown)."""
-        for task in list(self._tasks.values()):
-            if not task.done():
-                task.cancel()
+        for task_id in list(self._tasks):
+            self._request_cancel(task_id)
 
 
 class AsyncTool(TeamTool):

@@ -380,3 +380,56 @@ def test_aclose_disposes_all_open_sessions(monkeypatch):
     asyncio.run(scenario())
     assert len(harnesses) == 2
     assert all(h.disposed for h in harnesses)
+
+
+@pytest.mark.asyncio
+async def test_real_backend_abort_and_best_effort_disposal_failures_block_resume(monkeypatch):
+    from types import SimpleNamespace
+    from openjiuwen.agent_teams.harness.async_tools import AsyncToolRuntime
+    from openjiuwen.agent_teams.runtime.background_task_controller import BackgroundTaskController, SwarmflowRunHandle
+    from openjiuwen.agent_teams.workflow.backends.team_worker_backend import TeamWorkerBackend
+
+    harnesses = []
+    _patch_build(monkeypatch, harnesses)
+    mgr = _mgr()
+    sid = await mgr.open_session(kind="agent", instructions=None, opts={"label": "retained"})
+    # Avatar is lazy; one turn creates the actual manager-owned harness.
+    await mgr.send_turn(sid, "first", {}, None)
+    harness = harnesses[0]
+    fail_abort, fail_dispose = [True], [True]
+    aborted, disposed = [], []
+    async def abort(*, immediate):
+        if fail_abort:
+            raise OSError("avatar abort failed")
+        aborted.append(immediate)
+    async def dispose():
+        if fail_dispose:
+            raise OSError("avatar dispose failed")
+        disposed.append(True)
+    monkeypatch.setattr(harness, "abort", abort)
+    monkeypatch.setattr(harness, "dispose", dispose)
+    backend = object.__new__(TeamWorkerBackend)
+    backend._session_mgr = mgr
+    async def inject(text):
+        pass
+    runtime = AsyncToolRuntime(inject=inject)
+    async def original():
+        return "outer coroutine exited"
+    runtime.launch("original", original, tool_name="swarmflow", description="d")
+    await runtime.wait("original", 2)
+    launched = []
+    ctl = BackgroundTaskController()
+    ctl.register(SwarmflowRunHandle("original", asyncio.Event(), backend,
+        SimpleNamespace(async_tool_runtime=runtime), lambda: launched.append(True)))
+    assert await ctl.pause()
+    # Real best-effort KV cleanup logs the error; manager must retain its owner.
+    with pytest.raises(BackendError, match="disposal unconfirmed"):
+        await backend.aclose()
+    assert sid in mgr._sessions and not disposed
+    assert not await ctl.resume() and ctl.is_paused() and launched == []
+    fail_abort.clear()
+    assert not await ctl.resume() and launched == []  # disposal is still unconfirmed
+    assert aborted and sid in mgr._sessions
+    fail_dispose.clear()
+    assert await ctl.resume() and launched == [True]
+    assert disposed == [True] and sid not in mgr._sessions and not ctl.is_paused()
