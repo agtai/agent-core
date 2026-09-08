@@ -221,7 +221,8 @@ def test_browser_probe_cards_tool_reports_runtime_error() -> None:
 def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "content": [
                 {
@@ -242,7 +243,7 @@ def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
     )
 
     runtime.ensure_runtime_ready.assert_called_once()
-    runtime._code_executor.assert_called_once()
+    runtime._evaluate_page_js.assert_awaited_once()
     assert result["ok"] is True
     assert result["url"] == "https://books.toscrape.com/"
     assert result["cards"][0]["title"] == "Book"
@@ -257,6 +258,7 @@ def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
 def test_runtime_probe_cards_handles_missing_code_executor() -> None:
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver = lambda: False  # type: ignore[method-assign]
     runtime._code_executor = None
 
     result = _run(runtime.probe_cards())
@@ -370,7 +372,8 @@ def test_runtime_probe_cards_unwraps_result_field_and_records_cache(tmp_path, mo
 
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "result": (
                 "### Result\n"
@@ -544,7 +547,8 @@ def test_runtime_probe_cards_records_rejected_cache_attempt(tmp_path, monkeypatc
 
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "content": [
                 {

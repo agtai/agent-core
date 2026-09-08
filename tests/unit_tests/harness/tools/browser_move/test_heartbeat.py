@@ -105,6 +105,7 @@ def test_start_heartbeat_replaces_done_task() -> None:
 def test_check_connection_raises_when_client_not_found() -> None:
     async def _test():
         svc = _make_service()
+        svc._driver_backend = "playwright_mcp"  # exercise MCP ping path
         with patch(
             "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.get_registered_client",
             return_value=None,
@@ -137,6 +138,7 @@ def test_browser_runtime_stdio_patch_creates_pingable_client() -> None:
 def test_check_connection_raises_when_ping_fails() -> None:
     async def _test():
         svc = _make_service()
+        svc._driver_backend = "playwright_mcp"  # exercise MCP ping path
         mock_client = MagicMock()
         mock_client.ping = AsyncMock(return_value=False)
         with patch(

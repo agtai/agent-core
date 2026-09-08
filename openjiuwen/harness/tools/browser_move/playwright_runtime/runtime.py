@@ -45,11 +45,23 @@ from .browser_working_context import (
     BrowserWorkingContextStore,
     latest_browser_user_request,
 )
-from .config import BrowserInstanceConfig, BrowserRunGuardrails, resolve_browser_driver_backend, resolve_browser_driver_cdp_url
+from .config import (
+    BrowserInstanceConfig,
+    BrowserRunGuardrails,
+    resolve_browser_driver_backend,
+    resolve_browser_driver_cdp_url,
+)
+from .probe_js import (
+    BROWSER_STATE_SEMANTIC_JS,
+    CARD_PROBE_JS,
+    INTERACTIVE_PROBE_JS,
+)
 from .probes import (
     build_browser_state_metadata_js,
     build_card_probe_js,
+    build_card_probe_params,
     build_interactive_probe_js,
+    build_interactive_probe_params,
 )
 from .page_state import CARD_EVIDENCE_FIELDS, BrowserPageState, BrowserTarget
 from .probe_semantics import normalize_card_probe_payload
@@ -769,165 +781,6 @@ class BrowserAgentRuntime:
             )
         return payload
 
-    async def _get_playwright_mcp_tool(self, tool_name: str) -> Any:
-        """Resolve a registered Playwright MCP tool through Runner.resource_mgr."""
-        server_id = str(getattr(self._service.mcp_cfg, "server_id", "") or "").strip()
-        server_name = str(getattr(self._service.mcp_cfg, "server_name", "") or "").strip()
-
-        # When this runtime is bound to a specific browser identity, the cfg
-        # server_id is already unique; the generic fallbacks below could resolve
-        # the legacy/unkeyed server, so they are skipped to keep isolation.
-        keyed = bool(self._instance and self._instance.key)
-
-        server_id_candidates = [
-            server_id,
-            server_id.replace("-", "_"),
-            server_id.replace("_", "-"),
-        ]
-        if not keyed:
-            server_id_candidates += [
-                "playwright_official_stdio",
-                "playwright-official-stdio",
-                "playwright",
-            ]
-
-        server_name_candidates = [
-            server_name,
-            server_name.replace("-", "_"),
-            server_name.replace("_", "-"),
-        ]
-        if not keyed:
-            server_name_candidates += [
-                "playwright-official",
-                "playwright_official",
-                "playwright",
-            ]
-
-        def _first_tool(value: Any) -> Any:
-            if isinstance(value, list):
-                return next((item for item in value if item is not None), None)
-            return value
-
-        tried: list[str] = []
-
-        for candidate in server_id_candidates:
-            if not candidate:
-                continue
-
-            tried.append(f"server_id={candidate}")
-
-            tool = None
-            try:
-                tool = await Runner.resource_mgr.get_mcp_tool(
-                    name=tool_name,
-                    server_id=candidate,
-                    skip_if_tag_not_exists=True,
-                    ignore_exception=True,
-                )
-                tool = _first_tool(tool)
-            except Exception:
-                logger.debug(
-                    "Failed to resolve MCP tool %s using server_id=%s",
-                    tool_name,
-                    candidate,
-                    exc_info=True,
-                )
-
-            if tool is not None:
-                return tool
-
-        for candidate in server_name_candidates:
-            if not candidate:
-                continue
-
-            tried.append(f"server_name={candidate}")
-
-            tool = None
-            try:
-                tool = await Runner.resource_mgr.get_mcp_tool(
-                    name=tool_name,
-                    server_name=candidate,
-                    skip_if_tag_not_exists=True,
-                    ignore_exception=True,
-                )
-                tool = _first_tool(tool)
-            except Exception:
-                logger.debug(
-                    "Failed to resolve MCP tool %s using server_name=%s",
-                    tool_name,
-                    candidate,
-                    exc_info=True,
-                )
-
-            if tool is not None:
-                return tool
-
-        raise RuntimeError(f"Registered Playwright MCP tool not found: {tool_name}. Tried {', '.join(tried)}")
-
-    async def _get_playwright_run_code_tool(self) -> tuple[Any, str]:
-        """Resolve browser_run_code_unsafe, with browser_run_code as compatibility fallback."""
-        try:
-            return await self._get_playwright_mcp_tool("browser_run_code_unsafe"), "browser_run_code_unsafe"
-        except RuntimeError:
-            logger.debug(
-                "browser_run_code_unsafe is unavailable; falling back to browser_run_code",
-                exc_info=True,
-            )
-
-        return await self._get_playwright_mcp_tool("browser_run_code"), "browser_run_code"
-
-    async def _call_playwright_run_code_unsafe(self, js_code: str) -> Any:
-        """Execute a compact runtime RPC over the registered Playwright transport."""
-        total_started_at = time.perf_counter()
-        resolution_started_at = time.perf_counter()
-        tool, tool_name = await self._get_playwright_run_code_tool()
-        resolution_elapsed_ms = int(max(0.0, (time.perf_counter() - resolution_started_at) * 1000))
-
-        invoke_started_at = time.perf_counter()
-        result = await tool.invoke({"code": js_code})
-        invoke_elapsed_ms = int(max(0.0, (time.perf_counter() - invoke_started_at) * 1000))
-
-        success = getattr(result, "success", None)
-        if success is False:
-            error = str(getattr(result, "error", "") or "").strip()
-            raise RuntimeError(error or f"{tool_name} failed")
-
-        data = getattr(result, "data", None)
-        if data is not None:
-            payload = data
-        else:
-            payload = result
-        transport_response_size_bytes = len(str(payload).encode("utf-8", "ignore"))
-        compact_payload = self._compact_run_code_payload(payload)
-        return {
-            "__browser_compact_rpc__": True,
-            "payload": compact_payload,
-            "rpc_metrics": {
-                "tool_name": tool_name,
-                "tool_resolution_elapsed_ms": resolution_elapsed_ms,
-                "transport_invoke_elapsed_ms": invoke_elapsed_ms,
-                "rpc_total_elapsed_ms": int(max(0.0, (time.perf_counter() - total_started_at) * 1000)),
-                "script_size_bytes": len(js_code.encode("utf-8", "ignore")),
-                "transport_response_size_bytes": transport_response_size_bytes,
-                "response_size_bytes": len(str(compact_payload).encode("utf-8", "ignore")),
-            },
-        }
-
-    async def _call_playwright_tool(self, tool_name: str, inputs: Dict[str, Any]) -> Any:
-        """Invoke one registered Playwright MCP tool and unwrap its result data."""
-        tool = await self._get_playwright_mcp_tool(tool_name)
-        result = await tool.invoke(inputs)
-
-        success = getattr(result, "success", None)
-        if success is False:
-            error = str(getattr(result, "error", "") or "").strip()
-            raise RuntimeError(error or f"{tool_name} failed")
-
-        data = getattr(result, "data", None)
-        if data is not None:
-            return data
-        return result
-
     async def ensure_runtime_ready(self) -> None:
         _ACTIVE_BROWSER_RUNTIMES.add(self)
         await self._service.ensure_runtime_ready()
@@ -936,21 +789,26 @@ class BrowserAgentRuntime:
             if self._code_executor is not None:
                 return
 
-            async def _driver_code_executor(js_code: str):
-                # B1: expects a page-scoped JS function expression (B3 ports probes).
-                driver = await self._ensure_browser_driver()
-                return await driver.evaluate(js_code)
+            async def _driver_code_executor(js_code: str, *, args: Any = None):
+                # Page-scoped function expression: (params) => {...} or () => {...}.
+                return await self._evaluate_page_js(js_code, args=args)
 
             self._code_executor = _driver_code_executor
-            self._controller.bind_code_executor(_driver_code_executor)
+            self._controller.bind_code_executor(lambda js_code: _driver_code_executor(js_code, args=None))
             self._controller.register_builtin_actions()
             return
 
         if self._code_executor is not None:
             return
 
+        # Legacy MCP path: only reachable when BROWSER_DRIVER_BACKEND is not
+        # browser_use. Unit tests may monkeypatch _call_playwright_run_code_unsafe
+        # on the instance; the class no longer ships an MCP resolver.
         async def _direct_code_executor(js_code: str):
-            return await self._call_playwright_run_code_unsafe(js_code)
+            call = getattr(self, "_call_playwright_run_code_unsafe", None)
+            if not callable(call):
+                raise RuntimeError("Playwright MCP hands removed; set BROWSER_DRIVER_BACKEND=browser_use")
+            return await call(js_code)
 
         self._code_executor = _direct_code_executor
         self._controller.bind_code_executor(_direct_code_executor)
@@ -1061,6 +919,10 @@ class BrowserAgentRuntime:
             ax_text = observation.ax_text or ""
             if ax_text:
                 snapshot_audit = write_browser_agent_audit_artifact("ax_snapshot", ax_text)
+            try:
+                tab_refs = await driver.list_tabs()
+            except Exception:
+                tab_refs = observation.tabs
             tabs = [
                 {
                     "index": index,
@@ -1069,20 +931,41 @@ class BrowserAgentRuntime:
                     "title": tab.title,
                     "target_id": tab.target_id,
                 }
-                for index, tab in enumerate(observation.tabs)
+                for index, tab in enumerate(tab_refs)
             ]
+            page_position: Dict[str, Any] = {
+                "pixels_above": observation.pixels_above,
+                "pixels_below": observation.pixels_below,
+            }
+            semantic_from_page: Dict[str, Any] = {}
+            try:
+                meta_raw = await driver.evaluate(BROWSER_STATE_SEMANTIC_JS)
+                meta_parsed = extract_json_object(meta_raw) if not isinstance(meta_raw, dict) else meta_raw
+                if isinstance(meta_parsed, dict):
+                    position = meta_parsed.get("page_position")
+                    if isinstance(position, dict):
+                        page_position = {**page_position, **position}
+                    semantic = meta_parsed.get("semantic_state")
+                    if isinstance(semantic, dict):
+                        semantic_from_page = semantic
+            except Exception as exc:
+                metadata_error = f"browser state metadata capture failed: {exc}"
+                logger.warning(
+                    "[BrowserAgentRuntime] driver semantic metadata capture failed: %s",
+                    exc,
+                    exc_info=True,
+                )
             metadata = {
                 "ok": True,
                 "url": observation.url,
                 "title": observation.title,
                 "tabs": tabs,
-                "page_position": {
-                    "pixels_above": observation.pixels_above,
-                    "pixels_below": observation.pixels_below,
-                },
+                "page_position": page_position,
+                "semantic_state": semantic_from_page,
             }
             if observation.errors:
-                metadata_error = "; ".join(observation.errors)
+                observe_error = "; ".join(observation.errors)
+                metadata_error = f"{metadata_error}; {observe_error}" if metadata_error else observe_error
             self._register_observation_targets(observation)
             if ax_text:
                 self._register_snapshot_refs(ax_text, replace=True)
@@ -1099,10 +982,16 @@ class BrowserAgentRuntime:
         page_state = self.export_page_state()
 
         errors = [error for error in (dom_error, metadata_error) if error]
-        semantic_state: Dict[str, Any] = {
-            "url": metadata.get("url") or "",
-            "field_coverage": sorted(self._ensure_page_state().field_coverage),
-        }
+        semantic_state: Dict[str, Any] = {}
+        raw_semantic = metadata.get("semantic_state")
+        if isinstance(raw_semantic, dict):
+            semantic_state.update(raw_semantic)
+        semantic_state.update(
+            {
+                "url": metadata.get("url") or "",
+                "field_coverage": sorted(self._ensure_page_state().field_coverage),
+            }
+        )
         semantic_tracker = self._ensure_semantic_state_tracker()
         if errors:
             semantic_progress = semantic_tracker.latest
@@ -1318,9 +1207,7 @@ class BrowserAgentRuntime:
 
             if ref is None:
                 # Legacy AX refs have no CDP identity; ask for a fresh observation.
-                raise ValueError(
-                    f"PageState target has no executable locator for driver stamp: {target.target_id}"
-                )
+                raise ValueError(f"PageState target has no executable locator for driver stamp: {target.target_id}")
 
             try:
                 selector = await driver.stamp(ref, attribute=attribute, value=marker_value)
@@ -2064,12 +1951,15 @@ class BrowserAgentRuntime:
         if self._uses_browser_driver():
             driver = await self._ensure_browser_driver()
             return await driver.evaluate(source, args=args)
-        # Playwright MCP path expects a page closure for run_code; wrap pure functions.
+        # Legacy MCP path for unit-test doubles that monkeypatch run_code.
         if source.lstrip().startswith("(") or source.lstrip().startswith("async"):
             js_code = f"async (page) => page.evaluate({source!r}, {json.dumps(args, ensure_ascii=False)})"
         else:
             js_code = source
-        return await self._call_playwright_run_code_unsafe(js_code)
+        call = getattr(self, "_call_playwright_run_code_unsafe", None)
+        if not callable(call):
+            raise RuntimeError("Playwright MCP hands removed; set BROWSER_DRIVER_BACKEND=browser_use")
+        return await call(js_code)
 
     async def batch_interact(
         self,
@@ -2214,16 +2104,8 @@ class BrowserAgentRuntime:
         """Return compact visible/high-value interactive elements from the current page."""
         await self.ensure_runtime_ready()
 
-        if self._code_executor is None:
-            return {
-                "ok": False,
-                "error": "browser_code_executor_not_ready",
-                "elements": [],
-                "page_state": self.export_page_state(),
-            }
-
         effective_max_items = min(40, max(1, int(max_items)))
-        js_code = build_interactive_probe_js(
+        params = build_interactive_probe_params(
             max_items=effective_max_items,
             viewport_only=viewport_only,
             query=query,
@@ -2232,7 +2114,18 @@ class BrowserAgentRuntime:
         )
 
         try:
-            raw = await self._code_executor(js_code)
+            if self._uses_browser_driver():
+                raw = await self._evaluate_page_js(INTERACTIVE_PROBE_JS, args=params)
+            else:
+                if self._code_executor is None:
+                    return {
+                        "ok": False,
+                        "error": "browser_code_executor_not_ready",
+                        "elements": [],
+                        "page_state": self.export_page_state(),
+                    }
+                js_code = build_interactive_probe_js(**params)
+                raw = await self._code_executor(js_code)
             raw = self._unwrap_mcp_text_result(raw)
             raw_audit = write_browser_agent_audit_artifact("interactive_probe", raw)
         except Exception as exc:
@@ -2244,6 +2137,8 @@ class BrowserAgentRuntime:
             }
 
         parsed = extract_json_object(raw)
+        if not parsed and isinstance(raw, dict):
+            parsed = raw
         if not parsed:
             return {
                 "ok": False,
@@ -2289,20 +2184,12 @@ class BrowserAgentRuntime:
         """Return compact repeated card/listing structures from the current page."""
         await self.ensure_runtime_ready()
 
-        if self._code_executor is None:
-            return {
-                "ok": False,
-                "error": "browser_code_executor_not_ready",
-                "cards": [],
-                "page_state": self.export_page_state(),
-            }
-
         site_profiles = site_profiles_for_url(self._ensure_page_state().url)
         selector_cache = get_selector_cache()
         selector_cache_records = selector_cache.export_for_probe()
 
         effective_max_cards = min(20, max(1, int(max_cards)))
-        js_code = build_card_probe_js(
+        params = build_card_probe_params(
             max_cards=effective_max_cards,
             viewport_only=viewport_only,
             include_buttons=include_buttons,
@@ -2313,7 +2200,18 @@ class BrowserAgentRuntime:
         )
 
         try:
-            raw = await self._code_executor(js_code)
+            if self._uses_browser_driver():
+                raw = await self._evaluate_page_js(CARD_PROBE_JS, args=params)
+            else:
+                if self._code_executor is None:
+                    return {
+                        "ok": False,
+                        "error": "browser_code_executor_not_ready",
+                        "cards": [],
+                        "page_state": self.export_page_state(),
+                    }
+                js_code = build_card_probe_js(**params)
+                raw = await self._code_executor(js_code)
             raw = self._unwrap_mcp_text_result(raw)
             raw_audit = write_browser_agent_audit_artifact("card_probe", raw)
         except Exception as exc:
@@ -2325,6 +2223,8 @@ class BrowserAgentRuntime:
             }
 
         parsed = extract_json_object(raw)
+        if not parsed and isinstance(raw, dict):
+            parsed = raw
         if not parsed:
             return {
                 "ok": False,
@@ -2861,9 +2761,7 @@ class BrowserRuntimeRail(AgentRail):
             "missing_fields": missing[:32],
             "missing_slots": missing_slots[:12],
             "requested_slots": [
-                dict(slot)
-                for slot in (state.get("required_evidence_slots") or [])[:12]
-                if isinstance(slot, dict)
+                dict(slot) for slot in (state.get("required_evidence_slots") or [])[:12] if isinstance(slot, dict)
             ],
             "blockers": blockers[:10],
             "field_coverage": list(state.get("field_coverage") or [])[:32],
@@ -2896,7 +2794,8 @@ class BrowserRuntimeRail(AgentRail):
                 requirements
                 or state.get("structured_evidence")
                 or state.get("evidence_slots")
-                or state.get("terminal_reason") in {
+                or state.get("terminal_reason")
+                in {
                     "model_provider_unavailable",
                     "model_tool_protocol_error",
                     "runtime_completion_requirements_missing",
@@ -3687,9 +3586,7 @@ class BrowserRuntimeRail(AgentRail):
         state["resume_count"] = int(state.get("resume_count") or 0) + 1
         state["resume_instruction"] = resume_instruction[:2_000]
         state["status"] = "in_progress"
-        state["next_action_class"] = (
-            "collect_missing_evidence" if missing else "materially_different_strategy"
-        )
+        state["next_action_class"] = "collect_missing_evidence" if missing else "materially_different_strategy"
         state["terminal_reason"] = ""
         state.pop(_BROWSER_TERMINAL_SYNTHESIS_KEY, None)
         state["replan_required"] = False
@@ -3830,9 +3727,7 @@ class BrowserRuntimeRail(AgentRail):
             token in normalized for token in ("comprehensive", "relevance", "综合", "默认排序")
         )
         latest_requested = any(token in normalized for token in ("latest", "newest", "最新", "最近发布"))
-        split_title_variants = bool(
-            "title" in required_fields and comprehensive_requested and latest_requested
-        )
+        split_title_variants = bool("title" in required_fields and comprehensive_requested and latest_requested)
         slots = [
             {"entity": entity, "variant": "default", "field": field_name}
             for field_name in required_fields
@@ -3937,11 +3832,7 @@ class BrowserRuntimeRail(AgentRail):
         filter_terms_present = _contains_any_token(serialized, filter_terms)
         script_tool = any(token in name for token in ("evaluate", "run_code"))
         filter_intent = bool(
-            filter_terms_present
-            and (
-                not script_tool
-                or cls._operation_intent(name, args) == "script_mutation"
-            )
+            filter_terms_present and (not script_tool or cls._operation_intent(name, args) == "script_mutation")
         )
         if "browser_batch_interact" in name:
             steps = args.get("steps")
@@ -4503,15 +4394,18 @@ class BrowserRuntimeRail(AgentRail):
         steps = args.get("steps")
         if not isinstance(steps, list) or not steps:
             return False
-        read_only_ops = _BATCH_SAFE_READ_SELECTOR_OPS | _BATCH_EXPLICIT_SELECTOR_OPS | {
-            "wait_for_text",
-            "wait_for_load_state",
-            "wait_for_url",
-            "wait_for_tab",
-        }
+        read_only_ops = (
+            _BATCH_SAFE_READ_SELECTOR_OPS
+            | _BATCH_EXPLICIT_SELECTOR_OPS
+            | {
+                "wait_for_text",
+                "wait_for_load_state",
+                "wait_for_url",
+                "wait_for_tab",
+            }
+        )
         return all(
-            isinstance(step, dict) and str(step.get("op") or "").strip().lower() in read_only_ops
-            for step in steps
+            isinstance(step, dict) and str(step.get("op") or "").strip().lower() in read_only_ops for step in steps
         )
 
     @staticmethod
@@ -5158,7 +5052,7 @@ class BrowserRuntimeRail(AgentRail):
         details["completion_evidence"] = completion_evidence[:300]
         phase_order = list(phases)
         try:
-            remaining_phases = phase_order[phase_order.index(phase) + 1:]
+            remaining_phases = phase_order[phase_order.index(phase) + 1 :]
         except ValueError:
             remaining_phases = []
         next_phase = next(
