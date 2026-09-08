@@ -2,6 +2,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
 from typing import Any
+from copy import deepcopy
 
 from pydantic import ConfigDict
 
@@ -216,6 +217,7 @@ class AssistantMessageChunk(AssistantMessage, BaseMessageChunk):
         return AssistantMessageChunk(
             role=self.role,
             content=combined_content,
+            metadata=deepcopy({**self.metadata, **other.metadata}),
             tool_calls=merged_tool_calls if merged_tool_calls else None,
             usage_metadata=other.usage_metadata or self.usage_metadata,
             finish_reason=merged_finish_reason,
