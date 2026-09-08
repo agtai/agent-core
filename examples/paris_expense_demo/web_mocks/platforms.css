@@ -288,3 +288,170 @@ body.hotel-skin .plat-tabs .on {
   background: linear-gradient(165deg, #fffdf8, #fff5eb);
   border-color: #f0d2b0;
 }
+
+.erp-banner {
+  border-radius: 0.5rem;
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.85rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.erp-banner.wait { background: #f3f4f6; color: #4b5563; }
+.erp-banner.work { background: #eff6ff; color: #1d4ed8; }
+.erp-banner.ready { background: #fff7ed; color: #c2410c; }
+.erp-banner.ok { background: #ecfdf5; color: #047857; }
+.erp-banner.bad { background: #fef2f2; color: #b91c1c; }
+
+.erp-card {
+  background: #fff;
+  border-radius: 0.65rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  padding: 1rem 1.05rem 1.1rem;
+}
+.erp-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.65rem 0.85rem;
+  margin-bottom: 1rem;
+}
+.erp-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+.erp-grid input {
+  border: 1px solid #e5e7eb;
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.92rem;
+  color: #111827;
+  background: #f9fafb;
+}
+.erp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.erp-table th {
+  text-align: left;
+  font-size: 0.72rem;
+  color: #9ca3af;
+  font-weight: 600;
+  padding: 0.35rem 0.4rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+.erp-table td {
+  padding: 0.5rem 0.4rem;
+  border-bottom: 1px solid #f3f4f6;
+  vertical-align: top;
+}
+.erp-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.erp-table .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; color: #6b7280; }
+.erp-table .empty td { color: #9ca3af; text-align: center; padding: 1.4rem 0.5rem; }
+.erp-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.9rem;
+}
+.erp-total { font-weight: 700; font-size: 1.05rem; }
+.erp-claim { font-size: 0.78rem; color: #6b7280; margin-top: 0.15rem; }
+.erp-submit {
+  border: 0;
+  background: #111827;
+  color: #fff;
+  border-radius: 999px;
+  padding: 0.55rem 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.erp-submit:disabled { opacity: 0.45; cursor: not-allowed; }
+.erp-cancel {
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #4b5563;
+  border-radius: 999px;
+  padding: 0.55rem 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.erp-cancel:disabled { opacity: 0.45; cursor: not-allowed; }
+.erp-btns { display: flex; gap: 0.5rem; align-items: center; }
+.erp-del {
+  border: 0;
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 999px;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.erp-table input,
+.erp-table select {
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.3rem;
+  padding: 0.28rem 0.35rem;
+  font: inherit;
+  background: #fff;
+}
+.erp-table input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; }
+.erp-add {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px dashed #e5e7eb;
+}
+.erp-add h2 { font-size: 0.88rem; margin: 0 0 0.55rem; }
+.erp-add-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  gap: 0.5rem 0.65rem;
+}
+.erp-add-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  color: #6b7280;
+}
+.erp-add-grid .span2 { grid-column: span 2; }
+.erp-add-grid input,
+.erp-add-grid select {
+  border: 1px solid #e5e7eb;
+  border-radius: 0.3rem;
+  padding: 0.35rem 0.45rem;
+  font: inherit;
+}
+.erp-add-btn {
+  margin-top: 0.65rem;
+  border: 1px solid #374151;
+  background: #fff;
+  color: #111827;
+  border-radius: 999px;
+  padding: 0.4rem 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.erp-memory {
+  margin-top: 1rem;
+  background: #fff;
+  border-radius: 0.65rem;
+  padding: 0.85rem 1rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,.06);
+}
+.erp-memory h2 { font-size: 0.9rem; margin: 0 0 0.45rem; }
+.erp-memory ul { margin: 0; padding-left: 1.1rem; color: #4b5563; font-size: 0.85rem; }
+.erp-memory li { margin: 0.25rem 0; }
+.erp-memory li.f-policy { color: #b45309; }
+.erp-memory li.f-missing { color: #b91c1c; }
+.erp-memory li.f-info { color: #047857; }
+@media (max-width: 640px) {
+  .erp-grid { grid-template-columns: 1fr; }
+  .erp-add-grid { grid-template-columns: 1fr 1fr; }
+  .erp-add-grid .span2 { grid-column: span 2; }
+  .erp-foot { flex-direction: column; align-items: stretch; }
+}
+

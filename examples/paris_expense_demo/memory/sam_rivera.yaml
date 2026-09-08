@@ -1,0 +1,22 @@
+actor: "Sam Rivera"
+user_id: sam.rivera
+records:
+  - id: profile-sam
+    kind: profile
+    scope: read:memory.profile
+    text: "Sam Rivera, cost center CC-2208, ops card owner. Reconciles email receipts against the finance ledger."
+    data:
+      cost_center: CC-2208
+      default_currency: EUR
+      preferred_sources: [email, db]
+
+  - id: convo-berlin
+    kind: conversation
+    scope: read:memory.chat
+    date: "2026-01-28"
+    text: "Slack #ops: Berlin offsite Feb 1–5. Keep the company-card ledger clean."
+    data:
+      trip_city: Berlin
+      date_start: "2026-02-01"
+      date_end: "2026-02-05"
+      keywords: [berlin, ops, reconcile]

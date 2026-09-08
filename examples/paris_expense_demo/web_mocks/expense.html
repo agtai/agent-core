@@ -3,52 +3,302 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Expense — claims</title>
+  <title>Ledger Expense — new claim</title>
   <link rel="stylesheet" href="shared.css" />
   <link rel="stylesheet" href="platforms.css" />
 </head>
 <body class="plat">
   <header class="plat-top" style="background:linear-gradient(90deg,#374151,#6b7280)">
     <div class="plat-top-row">
-      <div class="plat-logo"><span class="mark">$</span> Ledger Expense · My claims</div>
+      <div class="plat-logo"><span class="mark">$</span> Ledger Expense · New claim</div>
       <nav class="plat-nav"><a href="index.html">Hub</a></nav>
     </div>
   </header>
   <main class="plat-wrap">
-    <div class="plat-tabs"><span class="on">All</span><span>Draft</span><span>In review</span><span>Done</span></div>
-    <article class="order-card">
-      <div class="shop"><strong>Paris customer visit — Mar 2026</strong><span class="badge ok">Submitted · pending finance</span></div>
-      <div class="goods">
-        <div class="thumb" data-emoji="📄" style="background:linear-gradient(145deg,#e5e7eb,#9ca3af)"></div>
-        <div>
-          <p class="title">Claim EXP-PARIS-EXPENSE-001</p>
-          <p class="sub">Claimant Alex Chen</p>
-          <div class="kv">
-            <span>Case</span><span>paris_expense</span>
-            <span>Window</span><span>2026-03-10 → 2026-03-13</span>
-            <span>Lines</span><span>7 (flight / hotel / meals / rides…)</span>
-            <span>Permission</span><span>write:claims.create</span>
-          </div>
-        </div>
-        <div class="price"><div class="now">1382.90</div><div class="unit">EUR</div></div>
+    <div class="plat-tabs">
+      <span>All</span><span class="on">Draft</span><span>In review</span><span>Done</span>
+    </div>
+
+    <div id="banner" class="erp-banner wait">Waiting for the agent to fill this claim.</div>
+
+    <article class="erp-card">
+      <div class="erp-grid">
+        <label>Title<input id="f-title" readonly placeholder="—" /></label>
+        <label>Claimant<input id="f-actor" readonly placeholder="—" /></label>
+        <label>Cost center<input id="f-cc" readonly placeholder="from memory" /></label>
+        <label>Window<input id="f-window" readonly placeholder="—" /></label>
       </div>
-      <div class="order-foot">
-        <span>Sink: expense</span>
-        <div class="actions"><span class="btn">View lines</span><span class="btn primary">Print PDF</span></div>
+
+      <table class="erp-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Category</th>
+            <th>Description</th>
+            <th>Evidence</th>
+            <th class="num">Amount</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="lines">
+          <tr class="empty"><td colspan="6">No lines yet — the agent types them in.</td></tr>
+        </tbody>
+      </table>
+
+      <form id="add-box" class="erp-add" hidden>
+        <h2>Add a receipt</h2>
+        <div class="erp-add-grid">
+          <label>Date<input id="a-date" type="date" /></label>
+          <label>Category
+            <select id="a-cat">
+              <option value="meal">meal</option>
+              <option value="transport">transport</option>
+              <option value="lodging">lodging</option>
+              <option value="other">other</option>
+            </select>
+          </label>
+          <label>Amount<input id="a-amt" type="number" step="0.01" min="0" placeholder="0.00" /></label>
+          <label>Currency<input id="a-cur" value="EUR" /></label>
+          <label class="span2">Description<input id="a-desc" placeholder="What is this receipt for?" /></label>
+          <label class="span2">Receipt file<input id="a-file" type="file" /></label>
+        </div>
+        <button type="submit" class="erp-add-btn">Add line</button>
+      </form>
+
+      <div class="erp-foot">
+        <div>
+          <div class="erp-total" id="totals">Total —</div>
+          <div class="erp-claim" id="claim">Claim id —</div>
+        </div>
+        <div class="erp-btns">
+          <button type="button" class="erp-cancel" id="cancel" disabled>Cancel</button>
+          <button type="button" class="erp-submit" id="submit" disabled>Submit to finance</button>
+        </div>
       </div>
     </article>
-    <article class="order-card">
-      <div class="shop"><strong>Drafts</strong><span class="badge gray">Empty</span></div>
-      <div class="goods">
-        <div class="thumb" data-emoji="📭" style="background:linear-gradient(145deg,#f3f4f6,#d1d5db)"></div>
-        <div>
-          <p class="title">No pending drafts</p>
-          <p class="sub">Nothing waiting to submit</p>
-        </div>
-        <div class="price"><div class="now">—</div></div>
-      </div>
-    </article>
-    <p class="plat-note">After submit, finance reviews the claim; track progress here.</p>
+
+    <section class="erp-memory" id="findings-box" hidden>
+      <h2>Policy tips</h2>
+      <ul id="findings-list"></ul>
+    </section>
+
+    <section class="erp-memory" id="memory-box" hidden>
+      <h2>Recalled from memory</h2>
+      <ul id="memory-list"></ul>
+    </section>
+
+    <p class="plat-note">
+      Local mock ERP. After the agent fills the form, edit or delete a line,
+      attach a missing receipt, then submit here — the terminal waits for this page.
+    </p>
   </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let mode = "watch";
+    let lastStatus = "";
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    function money(amount, currency) {
+      if (amount == null || amount === "") return "—";
+      const n = Number(amount);
+      if (Number.isNaN(n)) return "—";
+      return n.toFixed(2) + (currency ? " " + currency : "");
+    }
+
+    function editable() {
+      return mode === "edit";
+    }
+
+    function render(state) {
+      const status = state.status || "empty";
+      lastStatus = status;
+      const banner = $("banner");
+      banner.textContent = state.message || status;
+      banner.className = "erp-banner " + (
+        status === "submitted" ? "ok" :
+        status === "cancelled" ? "bad" :
+        status === "draft" ? "ready" :
+        status === "filling" ? "work" : "wait"
+      );
+
+      $("f-title").value = state.title || "";
+      $("f-actor").value = state.actor || "";
+      $("f-cc").value = state.cost_center || "";
+      $("f-window").value = (state.date_start && state.date_end)
+        ? state.date_start + " → " + state.date_end
+        : "";
+
+      const lines = state.lines || [];
+      const body = $("lines");
+      const canEdit = status === "draft";
+      if (!lines.length) {
+        body.innerHTML = '<tr class="empty"><td colspan="6">No lines yet — the agent types them in.</td></tr>';
+      } else if (canEdit) {
+        body.innerHTML = lines.map((row, idx) => (
+          "<tr data-idx='" + idx + "'>"
+          + "<td><input data-f='date' type='date' value='" + esc(row.date || "") + "' /></td>"
+          + "<td><select data-f='category'>"
+          + ["lodging","meal","transport","other"].map((c) => (
+              "<option value='" + c + "'" + (row.category === c ? " selected" : "") + ">" + c + "</option>"
+            )).join("")
+          + "</select></td>"
+          + "<td><input data-f='description' value='" + esc(row.description || "") + "' /></td>"
+          + "<td><input data-f='evidence' class='mono' value='" + esc(row.evidence || "") + "' /></td>"
+          + "<td class='num'><input data-f='amount' type='number' step='0.01' value='"
+          + (row.amount == null ? "" : esc(row.amount)) + "' /></td>"
+          + "<td><button type='button' class='erp-del' data-del='" + idx + "'>Delete</button></td>"
+          + "</tr>"
+        )).join("");
+      } else {
+        body.innerHTML = lines.map((row) => (
+          "<tr>"
+          + "<td>" + esc(row.date || "") + "</td>"
+          + "<td>" + esc(row.category || "") + "</td>"
+          + "<td>" + esc(row.description || "") + "</td>"
+          + "<td class='mono'>" + esc(row.evidence || "") + "</td>"
+          + "<td class='num'>" + money(row.amount, row.currency) + "</td>"
+          + "<td></td>"
+          + "</tr>"
+        )).join("");
+      }
+
+      const totals = state.totals || {};
+      const keys = Object.keys(totals);
+      $("totals").textContent = keys.length
+        ? "Total " + keys.map((c) => money(totals[c], c)).join(" · ")
+        : "Total —";
+      $("claim").textContent = state.claim_id ? ("Claim " + state.claim_id) : "Claim id —";
+
+      $("add-box").hidden = !canEdit;
+      $("submit").disabled = !canEdit || !lines.length;
+      $("cancel").disabled = !canEdit;
+      $("submit").textContent = status === "submitted" ? "Submitted" : "Submit to finance";
+      if (canEdit && !$("a-date").value && state.date_start) {
+        $("a-date").value = state.date_start;
+      }
+
+      const findings = state.findings || [];
+      const fbox = $("findings-box");
+      const flist = $("findings-list");
+      if (findings.length) {
+        fbox.hidden = false;
+        flist.innerHTML = findings.map((f) => (
+          "<li class='f-" + esc(f.kind || "info") + "'>[" + esc(f.kind || "info") + "] "
+          + esc(f.message || "") + "</li>"
+        )).join("");
+      } else {
+        fbox.hidden = true;
+        flist.innerHTML = "";
+      }
+
+      const recalled = state.recalled || [];
+      const box = $("memory-box");
+      const list = $("memory-list");
+      if (recalled.length) {
+        box.hidden = false;
+        list.innerHTML = recalled.map((t) => "<li>" + esc(t) + "</li>").join("");
+      } else {
+        box.hidden = true;
+        list.innerHTML = "";
+      }
+
+      const tabs = document.querySelectorAll(".plat-tabs span");
+      tabs.forEach((el) => el.classList.remove("on"));
+      const idx = status === "submitted" ? 2 : 1;
+      if (tabs[idx]) tabs[idx].classList.add("on");
+    }
+
+    async function api(path, payload) {
+      const res = await fetch(path, {
+        method: payload === undefined ? "GET" : "POST",
+        headers: payload === undefined ? {} : { "Content-Type": "application/json" },
+        body: payload === undefined ? undefined : JSON.stringify(payload),
+        cache: "no-store",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        $("banner").textContent = data.message || ("Request failed (" + res.status + ")");
+        $("banner").className = "erp-banner bad";
+      }
+      return data;
+    }
+
+    async function saveRow(tr) {
+      const idx = Number(tr.getAttribute("data-idx"));
+      const line = {};
+      tr.querySelectorAll("[data-f]").forEach((el) => {
+        line[el.getAttribute("data-f")] = el.value;
+      });
+      if (line.amount !== "") line.amount = Number(line.amount);
+      render(await api("/api/erp/line", { action: "update", index: idx, line }));
+    }
+
+    $("lines").addEventListener("focusout", (ev) => {
+      if (!editable()) return;
+      const tr = ev.target.closest("tr[data-idx]");
+      if (!tr) return;
+      if (tr.contains(ev.relatedTarget)) return;
+      saveRow(tr);
+    });
+
+    $("lines").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("[data-del]");
+      if (!btn || !editable()) return;
+      render(await api("/api/erp/line", { action: "delete", index: Number(btn.getAttribute("data-del")) }));
+    });
+
+    $("add-box").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const file = $("a-file").files[0];
+      const line = {
+        date: $("a-date").value,
+        category: $("a-cat").value,
+        description: $("a-desc").value,
+        amount: $("a-amt").value === "" ? null : Number($("a-amt").value),
+        currency: $("a-cur").value || "EUR",
+        evidence: file ? file.name : ($("a-desc").value || "manual-upload"),
+        source: "manual",
+      };
+      const state = await api("/api/erp/line", { action: "add", line });
+      $("a-desc").value = "";
+      $("a-amt").value = "";
+      $("a-file").value = "";
+      render(state);
+    });
+
+    $("submit").addEventListener("click", async () => {
+      if (!editable()) return;
+      mode = "locked";
+      render(await api("/api/erp/submit", {}));
+    });
+
+    $("cancel").addEventListener("click", async () => {
+      if (!editable()) return;
+      mode = "locked";
+      render(await api("/api/erp/cancel", {}));
+    });
+
+    async function tick() {
+      try {
+        const state = await api("/api/erp");
+        const status = state.status || "empty";
+        if (mode === "edit" && status === "draft") return;
+        if (status === "draft") mode = "edit";
+        else if (status === "submitted" || status === "cancelled") mode = "locked";
+        else mode = "watch";
+        render(state);
+      } catch (err) {
+        $("banner").textContent = "ERP API not reachable. Re-run start-web.sh (not python -m http.server).";
+        $("banner").className = "erp-banner bad";
+      }
+    }
+    tick();
+    setInterval(tick, 700);
+  </script>
 </body>
 </html>

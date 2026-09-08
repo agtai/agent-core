@@ -20,6 +20,7 @@ def render_approval_card(draft: CollectionDraft) -> str:
         f" Case:     {draft.case_id}  ({draft.template})",
         f" Title:    {draft.title}",
         f" Actor:    {draft.actor}",
+        f" Cost ctr: {draft.cost_center or '—'}",
         f" Window:   {draft.date_start} → {draft.date_end}",
         f" Sink:     {source_label(draft.sink)} ({draft.sink})",
         thin,

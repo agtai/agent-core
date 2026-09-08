@@ -22,14 +22,15 @@ merge:
 sink: expense
 policy:
   enabled: true
-  max_meal_amount: 80
+  # Generic template cap; Alex's memory pack overrides this to 80.
+  max_meal_amount: 100
   max_taxi_amount: 50
   require_categories: ["lodging", "transport"]
   meal_categories: ["meal"]
   taxi_categories: ["transport"]
 notes:
   - "Sources are local fixtures; no live email/photos/apps were contacted."
-  - "Policy: meals ≤ 80 EUR, taxis ≤ 50 EUR (see policy block)."
+  - "Meal cap 100 EUR in this file is overridden by Alex's remembered 80 EUR cap."
 fixtures:
   email:
     - message_id: mail-1001

@@ -114,6 +114,9 @@ class CollectionDraft:
     plan_reason: str = ""
     denied_sources: list[str] = field(default_factory=list)
     sink: str = "expense"
+    cost_center: str = ""
+    memory_snippets: list[str] = field(default_factory=list)
+    policy_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_by_currency(self) -> dict[str, float]:

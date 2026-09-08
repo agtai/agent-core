@@ -2,5 +2,5 @@
 
 """Multi-source collection demo (Paris is one case pack).
 
-Supports plan → permission → collect → policy tips → approve.
+Supports recall → plan → permission → collect → fill mock ERP → page approve.
 """

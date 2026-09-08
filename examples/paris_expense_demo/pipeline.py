@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .config import load_case, source_label
+from .memory_store import MEMORY_PERMISSION, apply_memory, recall_memory, render_memory_card
 from .merge import merge_evidence
 from .models import CaseConfig, CollectionDraft, PermissionUsed, SubmitResult
 from .permission_gate import ask_source_permission
@@ -28,7 +29,14 @@ def collect_case(
 ) -> CollectionDraft:
     """Plan sources, ask permission per source, merge, then attach policy tips."""
     deny_sources = deny_sources or set()
-    plan: SourcePlan = plan_sources(case, mode=plan_mode, query_override=query_override)
+    recalled = recall_memory(case, auto_grant=auto_grant)
+    print(render_memory_card(recalled))
+    print()
+    case = apply_memory(case, recalled)
+    base_query = (query_override or case.query).strip()
+    if recalled.augmented_query:
+        base_query = f"{base_query} {recalled.augmented_query}".strip()
+    plan: SourcePlan = plan_sources(case, mode=plan_mode, query_override=base_query)
     print(f"Plan ({plan.mode}): {plan.reason}")
     print(
         "Sources to call: "
@@ -39,6 +47,8 @@ def collect_case(
     evidence = []
     permissions: list[PermissionUsed] = []
     denied: list[str] = []
+    if recalled.granted:
+        permissions.append(MEMORY_PERMISSION)
 
     for name in plan.sources:
         meta = permission_meta(name)
@@ -56,9 +66,17 @@ def collect_case(
 
     lines = merge_evidence(evidence, case.merge)
     notes = list(case.notes)
+    notes.extend(recalled.notes)
     notes.append(
         f"plan_mode={plan.mode}; collected: "
-        + (", ".join(source_label(p.source) for p in permissions) or "(none)")
+        + (
+            ", ".join(
+                source_label(p.source)
+                for p in permissions
+                if p.source != "memory"
+            )
+            or "(none)"
+        )
     )
     if denied:
         notes.append(
@@ -78,6 +96,18 @@ def collect_case(
         plan_reason=plan.reason,
         denied_sources=denied,
         sink=case.sink,
+        cost_center=recalled.cost_center,
+        memory_snippets=list(recalled.snippets),
+        policy_snapshot={
+            "enabled": case.policy.enabled,
+            "max_meal_amount": case.policy.max_meal_amount,
+            "max_taxi_amount": case.policy.max_taxi_amount,
+            "require_categories": list(case.policy.require_categories),
+            "meal_categories": list(case.policy.meal_categories),
+            "taxi_categories": list(case.policy.taxi_categories),
+            "template": case.template,
+            "denied_sources": [source_label(s) for s in denied],
+        },
     )
     draft.findings = evaluate_policy(draft, case, planned_sources=plan.sources)
     return draft
