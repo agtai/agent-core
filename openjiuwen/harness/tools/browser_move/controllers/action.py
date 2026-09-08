@@ -404,6 +404,7 @@ class ActionController(BaseController):
         self._action_specs: dict[str, dict[str, Any]] = action_specs if action_specs is not None else {}
         self._runtime_runner: RuntimeRunner | None = runtime_runner
         self._code_executor: CodeExecutor | None = code_executor
+        self._runtime: Any | None = None
         self._lock: asyncio.Lock = lock if lock is not None else asyncio.Lock()
 
     @property
@@ -414,10 +415,15 @@ class ActionController(BaseController):
     def code_executor(self) -> CodeExecutor | None:
         return self._code_executor
 
+    @property
+    def runtime(self) -> Any | None:
+        return self._runtime
+
     def bind_runtime(self, runtime: Any) -> None:
         run_browser_task = getattr(runtime, "run_browser_task", None)
         if run_browser_task is None or not callable(run_browser_task):
             raise ValueError("runtime must expose an async run_browser_task(...) method")
+        self._runtime = runtime
 
         async def _runner(
             *,
@@ -576,6 +582,7 @@ class ActionController(BaseController):
             "action_specs": copy.deepcopy(self._action_specs),
             "runtime_runner": self._runtime_runner,
             "code_executor": self._code_executor,
+            "runtime": self._runtime,
         }
 
     def restore(self, snapshot: dict[str, Any]) -> None:
@@ -585,6 +592,27 @@ class ActionController(BaseController):
         self._action_specs.update(copy.deepcopy(dict(snapshot.get("action_specs", {}))))
         self._runtime_runner = snapshot.get("runtime_runner")
         self._code_executor = snapshot.get("code_executor")
+        self._runtime = snapshot.get("runtime")
+
+
+async def _driver_from_controller(ctl: ActionController) -> Any | None:
+    """Return a connected BrowserDriver when the bound runtime uses one."""
+    runtime = ctl.runtime
+    if runtime is None:
+        return None
+    uses = getattr(runtime, "_uses_browser_driver", None)
+    if callable(uses):
+        try:
+            if not uses():
+                return None
+        except Exception:
+            return None
+    elif not bool(uses):
+        return None
+    ensure = getattr(runtime, "_ensure_browser_driver", None)
+    if ensure is None or not callable(ensure):
+        return None
+    return await ensure()
 
 
 def _normalize_action_name(name: str) -> str:
@@ -1714,6 +1742,76 @@ def register_builtin_actions(controller: ActionController | None = None) -> None
                     "Aliases source/target and source_x/source_y/target_x/target_y are also supported."
                 ),
             }
+
+        driver = await _driver_from_controller(ctl)
+        if driver is not None:
+            from openjiuwen.harness.tools.browser_move.drivers.base import SelectorRef
+
+            async def _point_from_selector(selector: str, offset: Any, label: str) -> dict[str, Any] | None:
+                if not selector:
+                    return None
+                resolved = await driver.resolve(SelectorRef(css=str(selector)))
+                box = resolved.box
+                if box is None:
+                    return None
+                ox = 0.5
+                oy = 0.5
+                if isinstance(offset, Mapping):
+                    try:
+                        ox = float(offset.get("x", 0.5))
+                        oy = float(offset.get("y", 0.5))
+                    except (TypeError, ValueError):
+                        ox, oy = 0.5, 0.5
+                return {
+                    "x": int(box.x + box.width * ox),
+                    "y": int(box.y + box.height * oy),
+                    "label": label,
+                }
+
+            source = None
+            target = None
+            if payload.get("element_source") or payload.get("element_target"):
+                if payload.get("element_source"):
+                    source = await _point_from_selector(
+                        payload.get("element_source"),
+                        payload.get("element_source_offset"),
+                        "source",
+                    )
+                    if source is None:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "Failed to determine source coordinates from selector. "
+                                'Use the exact visible text (e.g. "Learn more" not "More information") '
+                                "or a valid CSS/Playwright selector."
+                            ),
+                            "source": None,
+                            "target": None,
+                        }
+                if payload.get("element_target"):
+                    target = await _point_from_selector(
+                        payload.get("element_target"),
+                        payload.get("element_target_offset"),
+                        "target",
+                    )
+                    if target is None:
+                        return {
+                            "ok": False,
+                            "error": "Failed to determine target coordinates from selector",
+                            "source": source,
+                            "target": None,
+                        }
+            else:
+                source = {
+                    "x": int(payload["coord_source_x"]),
+                    "y": int(payload["coord_source_y"]),
+                }
+                target = {
+                    "x": int(payload["coord_target_x"]),
+                    "y": int(payload["coord_target_y"]),
+                }
+            return {"ok": True, "source": source, "target": target, "error": None}
+
         js_code = _build_coordinate_script(payload)
         code_executor = ctl.code_executor
         if code_executor is not None:
@@ -1868,6 +1966,91 @@ def register_builtin_actions(controller: ActionController | None = None) -> None
                     "Aliases source/target and source_x/source_y/target_x/target_y are also supported."
                 ),
             }
+
+        driver = await _driver_from_controller(ctl)
+        if driver is not None:
+            from openjiuwen.harness.tools.browser_move.drivers.base import SelectorRef
+
+            steps_n = max(1, _to_int_or_none(payload.get("steps")) or 10)
+            delay_n = max(0, _to_int_or_none(payload.get("delay_ms")) or 5)
+            if payload.get("element_source") and payload.get("element_target"):
+                source_ref = SelectorRef(css=str(payload["element_source"]))
+                target_ref = SelectorRef(css=str(payload["element_target"]))
+                act = await driver.drag(source_ref, target_ref, steps=steps_n, delay_ms=delay_n)
+                source_box = (await driver.resolve(source_ref)).box
+                target_box = (await driver.resolve(target_ref)).box
+                source = (
+                    {"x": int(source_box.x + source_box.width / 2), "y": int(source_box.y + source_box.height / 2)}
+                    if source_box
+                    else None
+                )
+                target = (
+                    {"x": int(target_box.x + target_box.width / 2), "y": int(target_box.y + target_box.height / 2)}
+                    if target_box
+                    else None
+                )
+                message = f"Dragged element '{payload['element_source']}' to '{payload['element_target']}'"
+            else:
+                # Coordinate-only drag: stamp ephemeral points via evaluate is unavailable;
+                # approximate with a selector-less drag by resolving page corners through evaluate.
+                source = {
+                    "x": int(payload["coord_source_x"]),
+                    "y": int(payload["coord_source_y"]),
+                }
+                target = {
+                    "x": int(payload["coord_target_x"]),
+                    "y": int(payload["coord_target_y"]),
+                }
+                # Use driver.drag with temporary stamped body markers built via evaluate.
+                stamp_js = """(pts) => {
+                  const mk = (name, x, y) => {
+                    let el = document.getElementById(name);
+                    if (!el) {
+                      el = document.createElement('div');
+                      el.id = name;
+                      el.style.position = 'fixed';
+                      el.style.width = '1px';
+                      el.style.height = '1px';
+                      el.style.pointerEvents = 'none';
+                      document.body.appendChild(el);
+                    }
+                    el.style.left = x + 'px';
+                    el.style.top = y + 'px';
+                    return '#' + name;
+                  };
+                  return {
+                    source: mk('__openjiuwen_drag_source__', pts.sx, pts.sy),
+                    target: mk('__openjiuwen_drag_target__', pts.tx, pts.ty),
+                  };
+                }"""
+                markers = await driver.evaluate(
+                    stamp_js,
+                    args={
+                        "sx": source["x"],
+                        "sy": source["y"],
+                        "tx": target["x"],
+                        "ty": target["y"],
+                    },
+                )
+                if isinstance(markers, str):
+                    markers = extract_json_object(markers) or {}
+                act = await driver.drag(
+                    SelectorRef(css=str((markers or {}).get("source") or "body")),
+                    SelectorRef(css=str((markers or {}).get("target") or "body")),
+                    steps=steps_n,
+                    delay_ms=delay_n,
+                )
+                message = f"Dragged from ({source['x']}, {source['y']}) to ({target['x']}, {target['y']})"
+            return {
+                "ok": bool(act.ok),
+                "message": message if act.ok else None,
+                "source": source,
+                "target": target,
+                "steps": steps_n,
+                "delay_ms": delay_n,
+                "error": None if act.ok else (act.detail or "drag failed"),
+            }
+
         js_code = _build_drag_script(payload)
         code_executor = ctl.code_executor
         if code_executor is not None:
@@ -1961,6 +2144,72 @@ def register_builtin_actions(controller: ActionController | None = None) -> None
                 "validation_errors": validation_errors,
                 "session_id": session_id,
                 "request_id": request_id,
+            }
+
+        driver = await _driver_from_controller(ctl)
+        if driver is not None:
+            from openjiuwen.harness.tools.browser_move.playwright_runtime.batch_executor import (
+                execute_batch,
+            )
+
+            try:
+                per_step_timeout = int(timeout_ms or 2500)
+            except (TypeError, ValueError):
+                per_step_timeout = 2500
+            per_step_timeout = max(250, min(30000, per_step_timeout))
+            try:
+                condition_timeout = int(condition_timeout_ms or 10000)
+            except (TypeError, ValueError):
+                condition_timeout = 10000
+            condition_timeout = max(per_step_timeout, min(30000, condition_timeout))
+            try:
+                after_each = int(wait_after_each_ms or 0)
+            except (TypeError, ValueError):
+                after_each = 0
+            after_each = max(0, min(5000, after_each))
+
+            executor_started_at = time.perf_counter()
+            parsed = await execute_batch(
+                driver,
+                steps=list(steps),
+                timeout_ms=per_step_timeout,
+                condition_timeout_ms=condition_timeout,
+                wait_after_each_ms=after_each,
+                continue_on_error=continue_on_error,
+                generation_id=generation_id,
+            )
+            executor_elapsed_ms = int(max(0.0, (time.perf_counter() - executor_started_at) * 1000))
+            completed_steps = parsed.get("steps") if isinstance(parsed.get("steps"), list) else []
+            compact_steps = []
+            for item in completed_steps:
+                compact = _compact_batch_step(item)
+                if compact is not None:
+                    compact_steps.append(compact)
+            extracted = parsed.get("extracted")
+            field_provenance = _compact_extraction_provenance(completed_steps, generation_id)
+            return {
+                "ok": bool(parsed.get("ok", False)),
+                "status": str(parsed.get("status") or "failed"),
+                "error": parsed.get("error"),
+                "action": "browser_batch_interact",
+                "execution_mode": "driver_batch",
+                "session_id": session_id,
+                "request_id": request_id,
+                "generation_id": generation_id,
+                "steps": compact_steps,
+                "extracted": dict(extracted) if isinstance(extracted, Mapping) else {},
+                "field_provenance": field_provenance,
+                "conditions": _compact_batch_conditions(parsed, completed_steps),
+                "metrics": {
+                    "script_build_elapsed_ms": 0,
+                    "executor_elapsed_ms": executor_elapsed_ms,
+                    "script_size_bytes": 0,
+                    "response_size_bytes": len(str(parsed).encode("utf-8", "ignore")),
+                },
+                "_runtime_page": {
+                    "url": str(parsed.get("url") or ""),
+                    "title": str(parsed.get("title") or ""),
+                },
             }
 
         original_step_count = len(steps)
@@ -2271,6 +2520,29 @@ def register_builtin_actions(controller: ActionController | None = None) -> None
                 "session_id": session_id,
                 "request_id": request_id,
             }
+
+        driver = await _driver_from_controller(ctl)
+        if driver is not None:
+            from openjiuwen.harness.tools.browser_move.drivers.base import SelectorRef
+
+            try:
+                act = await driver.upload_files(SelectorRef(css=effective_selector), effective_paths)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "selector": effective_selector,
+                    "paths": effective_paths,
+                    "session_id": session_id,
+                    "request_id": request_id,
+                }
+            return {
+                "ok": bool(act.ok),
+                "selector": effective_selector,
+                "paths": effective_paths,
+                "error": None if act.ok else (act.detail or "upload_files failed"),
+            }
+
         js_code = _build_set_input_files_script(effective_selector, effective_paths)
         code_executor = ctl.code_executor
         if code_executor is not None:

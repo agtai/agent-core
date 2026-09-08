@@ -63,11 +63,6 @@ from .site_profiles import (
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
 
 
-_BROWSER_UNTIL_B2_MESSAGE = (
-    "Multi-step / wait_for_* / non-primitive batch execution requires the B2 batch_executor; "
-    "not available in B1. Use a single-step navigate/click/type/fill/select_option/press/sleep/"
-    "wait_for_text/screenshot batch, or wait for B2."
-)
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
 _BROWSER_PROGRESS_FORMAT_SECTION_NAME = "browser_progress_format"
@@ -1508,7 +1503,7 @@ class BrowserAgentRuntime:
             checks.append({"index": index, "selector": selector})
         if not checks:
             return
-        script = f"""() => {{
+        script = f"""(unused) => {{
           const checks = {json.dumps(checks, ensure_ascii=False)};
           const results = checks.map((check) => {{
             let nodes = [];
@@ -1521,10 +1516,12 @@ class BrowserAgentRuntime:
               element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
             return {{...check, match_count: nodes.length, visible}};
           }});
-          return JSON.stringify({{ok: true, results}});
+          return {{ok: true, results}};
         }}"""
-        raw = await self._call_playwright_run_code_unsafe(script)
+        raw = await self._evaluate_page_js(script)
         parsed = extract_json_object(self._unwrap_mcp_text_result(raw))
+        if not parsed and isinstance(raw, dict):
+            parsed = raw
         results = parsed.get("results") if isinstance(parsed, dict) else None
         if not isinstance(results, list):
             raise ValueError("Could not validate safe batch read locators")
@@ -1643,13 +1640,13 @@ class BrowserAgentRuntime:
         if not selector:
             raise ValueError(f"Stale target_id {target_id} has no runtime-owned selector to refresh")
         await self.ensure_runtime_ready()
-        script = f"""() => {{
+        script = f"""(unused) => {{
           const selector = {json.dumps(selector)};
           let nodes = [];
           try {{ nodes = Array.from(document.querySelectorAll(selector)); }}
-          catch (error) {{ return JSON.stringify({{ok: false, error: String(error)}}); }}
+          catch (error) {{ return {{ok: false, error: String(error)}}; }}
           const element = nodes[0];
-          if (!element) return JSON.stringify({{ok: true, match_count: nodes.length, visible: false}});
+          if (!element) return {{ok: true, match_count: nodes.length, visible: false}};
           const style = getComputedStyle(element);
           const rect = element.getBoundingClientRect();
           const visible = Boolean(element.isConnected && rect.width > 0 && rect.height > 0 &&
@@ -1660,10 +1657,12 @@ class BrowserAgentRuntime:
             Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2))
           ) : null;
           const actionable = Boolean(visible && enabled && hit && (hit === element || element.contains(hit)));
-          return JSON.stringify({{ok: true, match_count: nodes.length, visible, enabled, actionable}});
+          return {{ok: true, match_count: nodes.length, visible, enabled, actionable}};
         }}"""
-        raw = await self._call_playwright_run_code_unsafe(script)
+        raw = await self._evaluate_page_js(script)
         validation = extract_json_object(self._unwrap_mcp_text_result(raw))
+        if not validation and isinstance(raw, dict):
+            validation = raw
         valid = (
             (
                 validation.get("ok") is True
@@ -1979,33 +1978,98 @@ class BrowserAgentRuntime:
             "_runtime_page": {"url": runtime_url, "title": runtime_title},
         }
 
-    def _until_b2_batch_error(self, steps: Any) -> Dict[str, Any]:
-        """Explicit B1 per-step error for batches that need batch_executor (B2)."""
-        step_list = steps if isinstance(steps, list) else []
+    async def _run_batch_via_driver(
+        self,
+        steps: list[Dict[str, Any]],
+        *,
+        timeout_ms: Any = None,
+        condition_timeout_ms: Any = None,
+        wait_after_each_ms: Any = None,
+        continue_on_error: bool = False,
+        generation_id: str = "g0",
+    ) -> Dict[str, Any]:
+        """Execute multi-step / non-primitive batches through ``batch_executor``."""
+        from .batch_executor import execute_batch
+
+        driver = await self._ensure_browser_driver()
+        try:
+            per_step_timeout = int(timeout_ms or 2500)
+        except (TypeError, ValueError):
+            per_step_timeout = 2500
+        try:
+            condition_timeout = int(condition_timeout_ms or 10000)
+        except (TypeError, ValueError):
+            condition_timeout = 10000
+        try:
+            after_each = int(wait_after_each_ms or 0)
+        except (TypeError, ValueError):
+            after_each = 0
+
+        started_at = time.perf_counter()
+        parsed = await execute_batch(
+            driver,
+            steps=steps,
+            timeout_ms=max(250, min(30000, per_step_timeout)),
+            condition_timeout_ms=max(per_step_timeout, min(30000, condition_timeout)),
+            wait_after_each_ms=max(0, min(5000, after_each)),
+            continue_on_error=continue_on_error,
+            generation_id=generation_id,
+        )
+        executor_elapsed_ms = int(max(0.0, (time.perf_counter() - started_at) * 1000))
+        document_changed = bool(parsed.pop("document_changed", False))
+        runtime_url = str(parsed.get("url") or "")
+        runtime_title = str(parsed.get("title") or "")
+        self._apply_document_changed(changed=document_changed, url=runtime_url, title=runtime_title)
+
         step_results = []
-        for index, step in enumerate(step_list):
-            op = str((step or {}).get("op") or "").strip().lower() if isinstance(step, dict) else ""
-            step_results.append(
-                {
-                    "index": index,
-                    "op": op,
-                    "ok": False,
-                    "status": "failed",
-                    "error": _BROWSER_UNTIL_B2_MESSAGE,
-                }
-            )
+        for item in parsed.get("steps") if isinstance(parsed.get("steps"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            compact = {
+                "index": item.get("index"),
+                "op": str(item.get("op") or ""),
+                "ok": bool(item.get("ok", False)),
+                "status": "completed" if item.get("ok") else "failed",
+                "elapsed_ms": int(item.get("elapsed_ms") or 0),
+            }
+            for key in ("phase", "error", "field", "text", "value", "selector", "raw_text", "path"):
+                if item.get(key) not in (None, ""):
+                    compact[key] = item.get(key)
+            step_results.append(compact)
+
+        conditions = parsed.get("conditions") if isinstance(parsed.get("conditions"), list) else []
+        extracted = parsed.get("extracted") if isinstance(parsed.get("extracted"), dict) else {}
         return {
-            "ok": False,
-            "status": "failed",
-            "error": _BROWSER_UNTIL_B2_MESSAGE,
+            "ok": bool(parsed.get("ok", False)),
+            "status": str(parsed.get("status") or "failed"),
+            "error": parsed.get("error"),
             "action": "browser_batch_interact",
-            "execution_mode": "until_b2",
+            "execution_mode": "driver_batch",
             "generation_id": self.generation_id,
             "steps": step_results,
-            "extracted": {},
-            "conditions": [],
-            "page_state": self.export_page_state(),
+            "extracted": extracted,
+            "conditions": conditions,
+            "metrics": {
+                "tool_name": "browser_driver_batch",
+                "executor_elapsed_ms": executor_elapsed_ms,
+                "response_size_bytes": len(str(parsed).encode("utf-8", "ignore")),
+                "preflight_elapsed_ms": parsed.get("preflight_elapsed_ms"),
+                "preflight_target_count": parsed.get("preflight_target_count"),
+            },
+            "_runtime_page": {"url": runtime_url, "title": runtime_title},
         }
+
+    async def _evaluate_page_js(self, source: str, *, args: Any = None) -> Any:
+        """Run page-scoped JS via BrowserDriver when available, else Playwright MCP."""
+        if self._uses_browser_driver():
+            driver = await self._ensure_browser_driver()
+            return await driver.evaluate(source, args=args)
+        # Playwright MCP path expects a page closure for run_code; wrap pure functions.
+        if source.lstrip().startswith("(") or source.lstrip().startswith("async"):
+            js_code = f"async (page) => page.evaluate({source!r}, {json.dumps(args, ensure_ascii=False)})"
+        else:
+            js_code = source
+        return await self._call_playwright_run_code_unsafe(js_code)
 
     async def batch_interact(
         self,
@@ -2061,7 +2125,14 @@ class BrowserAgentRuntime:
             result = await self._run_single_batch_primitive(resolved_steps[0])
         if result is None:
             if self._uses_browser_driver():
-                result = self._until_b2_batch_error(resolved_steps)
+                result = await self._run_batch_via_driver(
+                    resolved_steps,
+                    timeout_ms=timeout_ms,
+                    condition_timeout_ms=condition_timeout_ms,
+                    wait_after_each_ms=wait_after_each_ms,
+                    continue_on_error=continue_on_error,
+                    generation_id=effective_generation_id,
+                )
             else:
                 self._controller.bind_runtime(self)
                 if self._code_executor is not None:

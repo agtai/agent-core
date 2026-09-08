@@ -226,23 +226,39 @@ def test_single_batch_primitive_spec_routes_supported_ops(step: dict[str, Any], 
     assert tool_name == expected_tool
 
 
-def test_multi_step_batch_returns_until_b2_error() -> None:
-    runtime = _make_driver_runtime(FakeDriver())
-    result = runtime._until_b2_batch_error(
-        [
-            {"op": "click", "selector": "#first"},
-            {"op": "click", "selector": "#second"},
-        ]
-    )
-    error = str(result["error"])
-    assert "B2" in error or "until" in error.lower()
-    assert result["execution_mode"] == "until_b2"
-    assert result["steps"][0]["ok"] is False
+def test_multi_step_batch_uses_driver_batch_executor() -> None:
+    driver = FakeDriver(driver_generation=1)
+    runtime = _make_driver_runtime(driver)
+
+    async def _coro() -> dict[str, Any]:
+        await driver.connect(cdp_url="http://127.0.0.1:9222")
+        return await runtime._run_batch_via_driver(
+            [
+                {"op": "click", "selector": "#first"},
+                {"op": "click", "selector": "#second"},
+            ],
+            generation_id="g0",
+        )
+
+    result = _run(_coro())
+    assert result["execution_mode"] == "driver_batch"
+    assert result["action"] == "browser_batch_interact"
+    click_calls = [call for call in driver.act_calls if call.method == "click"]
+    assert len(click_calls) >= 2
 
 
-def test_non_primitive_wait_op_returns_until_b2_error() -> None:
-    runtime = _make_driver_runtime(FakeDriver())
+def test_non_primitive_wait_op_routes_through_driver_batch() -> None:
+    driver = FakeDriver(driver_generation=1)
+    runtime = _make_driver_runtime(driver)
     assert BrowserAgentRuntime._single_batch_primitive_spec({"op": "wait_for_selector", "selector": "#x"}) is None
-    result = runtime._until_b2_batch_error([{"op": "wait_for_selector", "selector": "#x"}])
-    error = str(result["error"])
-    assert "B2" in error or "until" in error.lower()
+
+    async def _coro() -> dict[str, Any]:
+        await driver.connect(cdp_url="http://127.0.0.1:9222")
+        return await runtime._run_batch_via_driver(
+            [{"op": "wait_for_selector", "selector": "#x"}],
+            generation_id="g0",
+        )
+
+    result = _run(_coro())
+    assert result["execution_mode"] == "driver_batch"
+    assert any(call.method == "evaluate" for call in driver.act_calls)

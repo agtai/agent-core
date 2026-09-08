@@ -78,12 +78,14 @@ class FakeDriver:
         *,
         driver_generation: int = 1,
         vanished_backend_node_ids: frozenset[int] | None = None,
+        evaluate_handler: Any = None,
     ) -> None:
         self._observations = list(observations or [_default_observation(driver_generation=driver_generation)])
         self._obs_index = 0
         self._driver_generation = int(driver_generation)
         self._connected = False
         self._vanished = vanished_backend_node_ids or frozenset()
+        self._evaluate_handler = evaluate_handler
         self.act_calls: list[ActCall] = []
         self._info = DriverInfo(
             backend="fake",
@@ -353,8 +355,46 @@ class FakeDriver:
         _ = (await_promise, return_by_value)
         self._require_connected()
         self._record("evaluate", source=source, args=args)
+        if self._evaluate_handler is not None:
+            return await self._evaluate_handler(source, args)
+        # Default: satisfy batch_executor locate / selector-state / page-meta polls.
+        if isinstance(args, dict):
+            if "data-openjiuwen-batch-tmp" in source:
+                selector = str(
+                    args.get("selector")
+                    or (f"[data-testid='{args['testid']}']" if args.get("testid") else "")
+                    or "#fake-located"
+                )
+                return {
+                    "ok": True,
+                    "match_count": 1,
+                    "visible": True,
+                    "enabled": True,
+                    "selector": selector,
+                    "tag": "button",
+                    "text": "ok",
+                    "value": "ok",
+                }
+            if "selector" in args or "attribute" in args or "max_chars" in args:
+                return {
+                    "ok": True,
+                    "match_count": 1,
+                    "visible": True,
+                    "enabled": True,
+                    "text": str(args.get("text") or "ok"),
+                    "value": str(args.get("value") or "ok"),
+                    "attr": "ok",
+                }
+            if "sx" in args and "tx" in args:
+                return {"source": "#__openjiuwen_drag_source__", "target": "#__openjiuwen_drag_target__"}
         if args is not None and isinstance(args, str):
-            return args in (source or "")
+            # wait_for_text / has-text probes
+            return True
+        if "location.href" in source or "document.title" in source:
+            obs = self._observations[min(self._obs_index, len(self._observations) - 1)]
+            return {"url": obs.url, "title": obs.title}
+        if "innerText" in source and "body" in source:
+            return "fake page text"
         return True
 
     async def wait_load_state(self, state: str = "load", *, timeout_ms: int) -> ActResult:
