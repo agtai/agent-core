@@ -28,7 +28,13 @@ from openjiuwen.core.single_agent.agents.react_agent import ReActAgent
 from ..drivers.managed_browser import ManagedBrowserDriver, _default_chrome_user_data_dir
 from ..utils.parsing import extract_json_object
 from .agents import build_browser_worker_agent
-from .config import BrowserInstanceConfig, BrowserRunGuardrails, parse_command_args, resolve_playwright_mcp_cwd
+from .config import (
+    BrowserInstanceConfig,
+    BrowserRunGuardrails,
+    parse_command_args,
+    resolve_browser_driver_backend,
+    resolve_playwright_mcp_cwd,
+)
 from .profiles import BrowserProfile, BrowserProfileStore
 from .service_registry import BROWSER_SERVICE_REGISTRY, BrowserServiceIdentity
 
@@ -246,6 +252,7 @@ class BrowserService:
         self._profile_store = BrowserProfileStore(self._resolve_profile_store_path())
         self._profile_name = self._resolve_profile_name()
         self._driver_mode = self._resolve_driver_mode()
+        self._driver_backend = self._resolve_driver_backend()
         self._active_profile: Optional[BrowserProfile] = None
         self._managed_driver: Optional[ManagedBrowserDriver] = None
         self._registered_cdp_endpoint: str = ""
@@ -327,6 +334,27 @@ class BrowserService:
                 raise ValueError("BROWSER_DRIVER must be one of: remote, managed, extension")
             return explicit
         return "remote"
+
+    def _resolve_driver_backend(self) -> str:
+        """Resolve which BrowserDriver library drives Chrome (not how Chrome is obtained).
+
+        Distinct from ``BROWSER_DRIVER`` / ``_driver_mode`` (managed|remote|extension).
+        ``browser_use`` is the only registered backend; MCP registration is skipped for it.
+        """
+        return resolve_browser_driver_backend(self._instance)
+
+    def uses_browser_driver(self) -> bool:
+        """True when hands go through BrowserDriver (browser_use) instead of Playwright MCP."""
+        return self._driver_backend == "browser_use"
+
+    @property
+    def cdp_endpoint(self) -> str:
+        """Live CDP endpoint after managed/remote Chrome resolution."""
+        return self._configured_cdp_endpoint()
+
+    @property
+    def driver_backend(self) -> str:
+        return self._driver_backend
 
     def _build_lifecycle_identity(self) -> BrowserServiceIdentity:
         """Build the process resource identity for this browser instance."""
@@ -824,31 +852,38 @@ class BrowserService:
             browser_rebound = await self._ensure_managed_driver_started()
             configured_endpoint = self._configured_cdp_endpoint()
             if browser_rebound or configured_endpoint != self._registered_cdp_endpoint:
-                await self._refresh_mcp_server_binding()
-                self._browser_agent = None
+                if self.uses_browser_driver():
+                    # No npm MCP server to rebind; Runtime reconnects its BrowserDriver.
+                    self._registered_cdp_endpoint = configured_endpoint
+                    self._browser_agent = None
+                else:
+                    await self._refresh_mcp_server_binding()
+                    self._browser_agent = None
             return
 
-        if shutil.which("npx") is None:
-            raise RuntimeError("npx not found in PATH. Install Node.js first.")
+        if not self.uses_browser_driver():
+            if shutil.which("npx") is None:
+                raise RuntimeError("npx not found in PATH. Install Node.js first.")
 
-        from .browser_tools import ensure_browser_runtime_client_patch
+            from .browser_tools import ensure_browser_runtime_client_patch
 
-        ensure_browser_runtime_client_patch()
+            ensure_browser_runtime_client_patch()
 
         await self._ensure_managed_driver_started()
         self._ensure_screenshots_dir()
         await Runner.start()
 
-        register_result = await Runner.resource_mgr.add_mcp_server(self.mcp_cfg, tag="browser.service")
-        if register_result is not None and not getattr(register_result, "is_ok", lambda: False)():
-            if hasattr(register_result, "error") and callable(register_result.error):
-                error_value = register_result.error()
-            elif hasattr(register_result, "msg") and callable(register_result.msg):
-                error_value = register_result.msg()
-            else:
-                error_value = getattr(register_result, "value", register_result)
-            if "already exist" not in str(error_value):
-                raise RuntimeError(f"Failed to register Playwright MCP server: {error_value}")
+        if not self.uses_browser_driver():
+            register_result = await Runner.resource_mgr.add_mcp_server(self.mcp_cfg, tag="browser.service")
+            if register_result is not None and not getattr(register_result, "is_ok", lambda: False)():
+                if hasattr(register_result, "error") and callable(register_result.error):
+                    error_value = register_result.error()
+                elif hasattr(register_result, "msg") and callable(register_result.msg):
+                    error_value = register_result.msg()
+                else:
+                    error_value = getattr(register_result, "value", register_result)
+                if "already exist" not in str(error_value):
+                    raise RuntimeError(f"Failed to register Playwright MCP server: {error_value}")
 
         self._registered_cdp_endpoint = self._configured_cdp_endpoint()
         self.started = True
@@ -861,6 +896,10 @@ class BrowserService:
     async def ensure_started(self) -> None:
         await self.ensure_runtime_ready()
         if self._browser_agent is not None:
+            return
+        if self.uses_browser_driver():
+            # browser_use path: no Playwright MCP worker agent. Runtime tools +
+            # BrowserDriver own the hands; the DeepAgent browser subagent stays.
             return
 
         self._browser_agent = build_browser_worker_agent(
@@ -897,6 +936,11 @@ class BrowserService:
                 if self._managed_driver:
                     self._managed_driver.clear()
                 raise RuntimeError("Chrome CDP endpoint not responding")
+        if self.uses_browser_driver():
+            # Hands live in the browser-use sidecar; there is no MCP client to ping.
+            # Managed Chrome readiness above is enough when a managed driver is present.
+            # Remote/extension modes rely on Runtime.driver.health() for live checks.
+            return
         server_id = (self.mcp_cfg.server_id or "").strip() or self.mcp_cfg.server_name
         client = get_registered_client(server_id)
         if client is None:

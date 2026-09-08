@@ -76,6 +76,11 @@ class BrowserInstanceConfig:
     profile_name: str = ""  # "" -> key, then env BROWSER_PROFILE_NAME
     cdp_url: str = ""  # remote mode: explicit CDP endpoint
     browser_binary: str = ""  # optional Chrome path override
+    # "" -> env BROWSER_DRIVER_BACKEND, then "browser_use". Distinct from
+    # ``driver_mode`` above (BROWSER_DRIVER): that selects how Chrome is
+    # obtained (managed/remote/extension); this selects which library drives
+    # it (browser_use today). Never merge or cross-read the two.
+    browser_driver_backend: str = ""
 
     def sanitized_key(self) -> str:
         """Return the key reduced to id-safe characters (``[A-Za-z0-9_-]``)."""
@@ -261,6 +266,37 @@ def build_playwright_mcp_config(
         client_type="stdio",
         params=params,
     )
+
+
+def resolve_browser_driver_backend(instance: Optional[BrowserInstanceConfig] = None) -> str:
+    """Resolve which :class:`BrowserDriver` backend drives this instance.
+
+    Distinct from ``BROWSER_DRIVER`` (``managed``/``remote``/``extension``),
+    which selects how Chrome itself is obtained. ``BROWSER_DRIVER_BACKEND``
+    selects which driver library drives it (``browser_use`` is the only
+    registered backend today; ``playwright_mcp`` is reserved as a name only,
+    see drivers/registry.py). Never merge or cross-read the two settings.
+    """
+    explicit = (instance.browser_driver_backend or "").strip().lower() if instance else ""
+    if not explicit:
+        explicit = (os.getenv("BROWSER_DRIVER_BACKEND") or "").strip().lower()
+    return explicit or "browser_use"
+
+
+def resolve_browser_driver_cdp_url(*, service_cdp_endpoint: str = "") -> str:
+    """Resolve the CDP endpoint a :class:`BrowserDriver` should attach to.
+
+    ``BROWSER_CDP_URL`` is a new, explicit override that wins for clarity.
+    Otherwise this reuses the existing chain already resolved onto the
+    Playwright MCP config (instance ``cdp_url``, then
+    ``PLAYWRIGHT_MCP_CDP_ENDPOINT``/``PLAYWRIGHT_CDP_URL``, then the live
+    managed-Chrome endpoint once launched) via ``service_cdp_endpoint``, which
+    callers pass as ``BrowserService.cdp_endpoint``.
+    """
+    explicit = first_non_empty_env("BROWSER_CDP_URL")
+    if explicit:
+        return explicit
+    return str(service_cdp_endpoint or "").strip()
 
 
 def build_runtime_settings(instance: Optional[BrowserInstanceConfig] = None) -> RuntimeSettings:

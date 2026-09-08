@@ -45,7 +45,7 @@ from .browser_working_context import (
     BrowserWorkingContextStore,
     latest_browser_user_request,
 )
-from .config import BrowserInstanceConfig, BrowserRunGuardrails
+from .config import BrowserInstanceConfig, BrowserRunGuardrails, resolve_browser_driver_backend, resolve_browser_driver_cdp_url
 from .probes import (
     build_browser_state_metadata_js,
     build_card_probe_js,
@@ -63,6 +63,11 @@ from .site_profiles import (
 from .status_logging import BrowserSubagentStatusLogger, is_browser_subagent_status_log_enabled
 
 
+_BROWSER_UNTIL_B2_MESSAGE = (
+    "Multi-step / wait_for_* / non-primitive batch execution requires the B2 batch_executor; "
+    "not available in B1. Use a single-step navigate/click/type/fill/select_option/press/sleep/"
+    "wait_for_text/screenshot batch, or wait for B2."
+)
 _BROWSER_PROGRESS_STATE_KEY = "__browser_subagent_progress_state__"
 _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
 _BROWSER_PROGRESS_FORMAT_SECTION_NAME = "browser_progress_format"
@@ -366,6 +371,8 @@ class BrowserAgentRuntime:
         self._browser_list_actions_tool = None
         self._controller: BaseController = ActionController()
         self._code_executor = None
+        self._driver = None
+        self._driver_info = None
         self._browser_probe_interactives_tool = None
         self._browser_probe_cards_tool = None
         self._browser_batch_interact_tool = None
@@ -376,6 +383,48 @@ class BrowserAgentRuntime:
         self._last_observed_url = ""
         self._semantic_state_tracker = SemanticStateTracker()
         _ACTIVE_BROWSER_RUNTIMES.add(self)
+
+    def _uses_browser_driver(self) -> bool:
+        """True when this runtime drives Chrome via BrowserDriver (browser_use).
+
+        Lightweight test doubles constructed via ``__new__`` (no ``_service``)
+        keep the legacy Playwright MCP path so existing unit tests stay valid.
+        """
+        service = getattr(self, "_service", None)
+        if service is None:
+            return False
+        uses = getattr(service, "uses_browser_driver", None)
+        if callable(uses):
+            return bool(uses())
+        return resolve_browser_driver_backend(getattr(self, "_instance", None)) == "browser_use"
+
+    async def _ensure_browser_driver(self) -> Any:
+        """Lazily create and connect the BrowserDriver for the browser_use backend."""
+        driver = getattr(self, "_driver", None)
+        if driver is not None:
+            return driver
+        from openjiuwen.harness.tools.browser_move.drivers.registry import create_browser_driver
+
+        backend = resolve_browser_driver_backend(getattr(self, "_instance", None))
+        driver = create_browser_driver(backend)
+        cdp_url = resolve_browser_driver_cdp_url(service_cdp_endpoint=self._service.cdp_endpoint)
+        if not cdp_url:
+            raise RuntimeError(
+                "No CDP endpoint available for BrowserDriver.connect(); "
+                "set BROWSER_CDP_URL or start managed/remote Chrome first"
+            )
+        self._driver_info = await driver.connect(cdp_url=cdp_url)
+        self._driver = driver
+        return driver
+
+    def _apply_document_changed(self, *, changed: bool, url: str = "", title: str = "") -> None:
+        """Bump PageState generation from an observed document change (not tool-name sniffing)."""
+        if changed:
+            self._observe_page_url(url, force_navigation=True)
+        elif url:
+            self._observe_page_url(url)
+        if title:
+            self._ensure_page_state().observe(title=title)
 
     @property
     def service(self) -> BrowserService:
@@ -887,6 +936,21 @@ class BrowserAgentRuntime:
     async def ensure_runtime_ready(self) -> None:
         _ACTIVE_BROWSER_RUNTIMES.add(self)
         await self._service.ensure_runtime_ready()
+        if self._uses_browser_driver():
+            await self._ensure_browser_driver()
+            if self._code_executor is not None:
+                return
+
+            async def _driver_code_executor(js_code: str):
+                # B1: expects a page-scoped JS function expression (B3 ports probes).
+                driver = await self._ensure_browser_driver()
+                return await driver.evaluate(js_code)
+
+            self._code_executor = _driver_code_executor
+            self._controller.bind_code_executor(_driver_code_executor)
+            self._controller.register_builtin_actions()
+            return
+
         if self._code_executor is not None:
             return
 
@@ -900,6 +964,8 @@ class BrowserAgentRuntime:
     async def capture_browser_state(self, *, action_group_id: str = "") -> Dict[str, Any]:
         """Capture a fresh, non-cached browser observation for the next model call."""
         await self.ensure_runtime_ready()
+        if self._uses_browser_driver():
+            return await self._capture_browser_state_via_driver(action_group_id=action_group_id)
 
         dom = ""
         dom_error = None
@@ -986,6 +1052,129 @@ class BrowserAgentRuntime:
             "dom_error": dom_error,
             "audit": {"ax_snapshot": snapshot_audit} if snapshot_audit else {},
         }
+
+    async def _capture_browser_state_via_driver(self, *, action_group_id: str = "") -> Dict[str, Any]:
+        """Capture state through BrowserDriver.observe (fills the former browser_snapshot slot)."""
+        driver = await self._ensure_browser_driver()
+        dom_error = None
+        snapshot_audit: Dict[str, Any] = {}
+        ax_text = ""
+        metadata: Dict[str, Any] = {}
+        metadata_error = None
+        try:
+            observation = await driver.observe(include_dom=True, include_screenshot=False, cached=False)
+            ax_text = observation.ax_text or ""
+            if ax_text:
+                snapshot_audit = write_browser_agent_audit_artifact("ax_snapshot", ax_text)
+            tabs = [
+                {
+                    "index": index,
+                    "current": bool(tab.active),
+                    "url": tab.url,
+                    "title": tab.title,
+                    "target_id": tab.target_id,
+                }
+                for index, tab in enumerate(observation.tabs)
+            ]
+            metadata = {
+                "ok": True,
+                "url": observation.url,
+                "title": observation.title,
+                "tabs": tabs,
+                "page_position": {
+                    "pixels_above": observation.pixels_above,
+                    "pixels_below": observation.pixels_below,
+                },
+            }
+            if observation.errors:
+                metadata_error = "; ".join(observation.errors)
+            self._register_observation_targets(observation)
+            if ax_text:
+                self._register_snapshot_refs(ax_text, replace=True)
+        except Exception as exc:
+            dom_error = f"driver.observe failed: {exc}"
+            logger.warning(
+                "[BrowserAgentRuntime] driver observation capture failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        self._observe_page_url(metadata.get("url"))
+        self._ensure_page_state().observe(title=metadata.get("title"))
+        page_state = self.export_page_state()
+
+        errors = [error for error in (dom_error, metadata_error) if error]
+        semantic_state: Dict[str, Any] = {
+            "url": metadata.get("url") or "",
+            "field_coverage": sorted(self._ensure_page_state().field_coverage),
+        }
+        semantic_tracker = self._ensure_semantic_state_tracker()
+        if errors:
+            semantic_progress = semantic_tracker.latest
+            semantic_progress.update(
+                {
+                    "progress": "unknown",
+                    "observable_progress": False,
+                    "capture_error": "; ".join(errors),
+                }
+            )
+        else:
+            semantic_progress = semantic_tracker.observe(
+                semantic_state,
+                action_group_id=action_group_id,
+            )
+        return {
+            "ok": not errors,
+            "error": "; ".join(errors) or None,
+            "url": metadata.get("url") or "",
+            "title": metadata.get("title") or "",
+            "tabs": metadata.get("tabs") or [],
+            "page_position": metadata.get("page_position") or {},
+            "semantic_state": semantic_state,
+            "semantic_progress": semantic_progress,
+            "field_coverage": semantic_state.get("field_coverage") or [],
+            "page_state": page_state,
+            "dom": "",
+            "dom_error": dom_error,
+            "audit": {"ax_snapshot": snapshot_audit} if snapshot_audit else {},
+        }
+
+    def _register_observation_targets(self, observation: Any) -> None:
+        """Mint PageState targets from a driver Observation (bu_index + backend_node_id)."""
+        page_state = self._ensure_page_state()
+        elements = getattr(observation, "elements", ()) or ()
+        driver_generation = int(getattr(observation, "driver_generation", 0) or 0)
+        for element in elements:
+            index = getattr(element, "index", None)
+            backend_node_id = getattr(element, "backend_node_id", None)
+            if index is None or backend_node_id is None:
+                continue
+            locator = {
+                "bu_index": str(index),
+                "backend_node_id": str(backend_node_id),
+                "driver_generation": str(driver_generation),
+            }
+            frame_id = getattr(element, "frame_id", None)
+            if frame_id:
+                locator["frame_id"] = str(frame_id)
+            try:
+                page_state._new_target(
+                    source="bu",
+                    locator=locator,
+                    role=str(getattr(element, "role", None) or ""),
+                    name=str(getattr(element, "name", None) or ""),
+                    text=str(getattr(element, "name", None) or ""),
+                    visible=bool(getattr(element, "visible", False)),
+                    enabled=True,
+                    actionable=bool(getattr(element, "visible", False)),
+                    clickable=bool(getattr(element, "visible", False)),
+                )
+            except Exception:
+                logger.debug(
+                    "[BrowserAgentRuntime] skipped bu target registration for index=%s",
+                    index,
+                    exc_info=True,
+                )
 
     async def capture_compact_browser_state(self, *, action_group_id: str) -> Dict[str, Any]:
         """Merge completed read-only observations without another browser round trip."""
@@ -1088,15 +1277,82 @@ class BrowserAgentRuntime:
         )
 
     async def _materialize_ax_target(self, target: BrowserTarget) -> BrowserTarget:
-        """Convert an MCP AX ref into a temporary DOM marker without model translation."""
+        """Stamp a temporary DOM marker and store the resulting CSS selector.
+
+        Replaces Playwright MCP ``browser_evaluate`` on an AX ref. With the
+        browser_use driver this uses ``driver.stamp`` on an IndexRef / NodeRef
+        (or falls back to a SelectorRef when only a CSS locator exists).
+        """
         if target.locator.get("selector"):
             return target
+
+        attribute = "data-openjiuwen-target-id"
+        marker_value = target.target_id
+
+        if self._uses_browser_driver():
+            from openjiuwen.harness.tools.browser_move.drivers.base import IndexRef, NodeRef, SelectorRef
+            from openjiuwen.harness.tools.browser_move.drivers.errors import (
+                StaleIndexError,
+                StaleNodeError,
+            )
+
+            driver = await self._ensure_browser_driver()
+            locator = dict(target.locator)
+            ref = None
+            bu_index = str(locator.get("bu_index") or "").strip()
+            driver_generation_raw = str(locator.get("driver_generation") or "").strip()
+            backend_node_id_raw = str(locator.get("backend_node_id") or "").strip()
+            frame_id = locator.get("frame_id")
+            css = str(locator.get("css") or locator.get("selector") or "").strip()
+
+            if bu_index and driver_generation_raw:
+                try:
+                    ref = IndexRef(index=int(bu_index), driver_generation=int(driver_generation_raw))
+                except (TypeError, ValueError):
+                    ref = None
+            if ref is None and backend_node_id_raw:
+                try:
+                    ref = NodeRef(
+                        backend_node_id=int(backend_node_id_raw),
+                        frame_id=str(frame_id) if frame_id else None,
+                    )
+                except (TypeError, ValueError):
+                    ref = None
+            if ref is None and css:
+                ref = SelectorRef(css=css)
+
+            if ref is None:
+                # Legacy AX refs have no CDP identity; ask for a fresh observation.
+                raise ValueError(
+                    f"PageState target has no executable locator for driver stamp: {target.target_id}"
+                )
+
+            try:
+                selector = await driver.stamp(ref, attribute=attribute, value=marker_value)
+            except StaleIndexError:
+                if not backend_node_id_raw:
+                    raise
+                selector = await driver.stamp(
+                    NodeRef(
+                        backend_node_id=int(backend_node_id_raw),
+                        frame_id=str(frame_id) if frame_id else None,
+                    ),
+                    attribute=attribute,
+                    value=marker_value,
+                )
+            except StaleNodeError as exc:
+                raise ValueError(str(exc) or f"Stale backend node for {target.target_id}") from exc
+
+            self._ensure_page_state().update_target_locator(
+                target.target_id,
+                {"selector": selector},
+            )
+            return target
+
         ref_value = str(target.ref or target.locator.get("ref") or "").strip()
         if not ref_value:
             raise ValueError(f"PageState target has no executable locator: {target.target_id}")
 
-        attribute = "data-openjiuwen-target-id"
-        marker_value = target.target_id
         function = (
             f"(element) => {{element.setAttribute({json.dumps(attribute)}, {json.dumps(marker_value)});return true;}}"
         )
@@ -1160,12 +1416,16 @@ class BrowserAgentRuntime:
                 f"Target {target.target_id} has primary_link={target.href}; "
                 "call browser_navigate directly instead of clicking it in a batch"
             )
-        requires_actionability = op in _BATCH_MUTATING_TARGET_OPS and target.source != "ax"
+        requires_actionability = op in _BATCH_MUTATING_TARGET_OPS and target.source not in {"ax", "bu"}
         if requires_actionability:
             is_unavailable = not target.visible or not target.enabled or not target.actionable
             if is_unavailable:
                 raise ValueError(f"PageState target {target.target_id} is not actionable in {target.generation_id}")
-        if target.locator.get("ref"):
+        if target.locator.get("ref") or (
+            self._uses_browser_driver()
+            and not target.locator.get("selector")
+            and (target.locator.get("bu_index") or target.locator.get("backend_node_id"))
+        ):
             target = await self._materialize_ax_target(target)
 
         locator = dict(target.locator)
@@ -1450,7 +1710,12 @@ class BrowserAgentRuntime:
     def _single_batch_primitive_spec(
         step: Dict[str, Any],
     ) -> Optional[tuple[str, Dict[str, Any]]]:
-        """Map a semantically equivalent one-step batch to an MCP primitive."""
+        """Map a semantically equivalent one-step batch to a hands verb.
+
+        On the Playwright MCP path the verb is an MCP tool name. On the
+        BrowserDriver path the same mapping is interpreted by
+        ``_run_single_batch_primitive`` as a driver method name.
+        """
         op = str(step.get("op") or "").strip().lower()
         selector = str(step.get("selector") or "").strip()
         element = str(step.get("description") or step.get("resolved_target_id") or selector or op)
@@ -1502,6 +1767,9 @@ class BrowserAgentRuntime:
         self,
         step: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        if self._uses_browser_driver():
+            return await self._run_single_batch_primitive_via_driver(step)
+
         spec = self._single_batch_primitive_spec(step)
         if spec is None:
             return None
@@ -1582,6 +1850,163 @@ class BrowserAgentRuntime:
             "_runtime_page": {"url": runtime_url, "title": runtime_title},
         }
 
+    async def _run_single_batch_primitive_via_driver(
+        self,
+        step: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """B1 beachhead: route one-step batches through BrowserDriver verbs."""
+        from openjiuwen.harness.tools.browser_move.drivers.base import SelectorRef
+
+        spec = self._single_batch_primitive_spec(step)
+        if spec is None:
+            return None
+
+        tool_name, tool_args = spec
+        op = str(step.get("op") or "").strip().lower()
+        driver = await self._ensure_browser_driver()
+        started_at = time.perf_counter()
+        success = False
+        error = ""
+        runtime_url = ""
+        runtime_title = ""
+        document_changed = False
+        payload: Any = None
+
+        try:
+            if tool_name == "browser_navigate":
+                nav = await driver.navigate(str(tool_args.get("url") or ""))
+                success = True
+                runtime_url = nav.url
+                runtime_title = nav.title
+                document_changed = bool(nav.changed_document)
+                payload = {"url": nav.url, "title": nav.title}
+            elif tool_name == "browser_click":
+                selector = str(tool_args.get("target") or "").strip()
+                act = await driver.click(SelectorRef(css=selector))
+                success = bool(act.ok)
+                error = "" if act.ok else act.detail
+                document_changed = bool(act.document_changed)
+                payload = {"detail": act.detail}
+            elif tool_name == "browser_type":
+                selector = str(tool_args.get("target") or "").strip()
+                act = await driver.type_text(
+                    SelectorRef(css=selector),
+                    str(tool_args.get("text") or ""),
+                    clear=True,
+                    press_enter=False,
+                )
+                success = bool(act.ok)
+                error = "" if act.ok else act.detail
+                document_changed = bool(act.document_changed)
+                payload = {"detail": act.detail}
+            elif tool_name == "browser_select_option":
+                selector = str(tool_args.get("target") or "").strip()
+                values = tool_args.get("values") or []
+                label = str(values[0]) if values else None
+                act = await driver.select_option(SelectorRef(css=selector), label=label)
+                success = bool(act.ok)
+                error = "" if act.ok else act.detail
+                document_changed = bool(act.document_changed)
+                payload = {"detail": act.detail}
+            elif tool_name == "browser_press_key":
+                act = await driver.press_key(str(tool_args.get("key") or "Enter"))
+                success = bool(act.ok)
+                error = "" if act.ok else act.detail
+                document_changed = bool(act.document_changed)
+                payload = {"detail": act.detail}
+            elif tool_name == "browser_wait_for" and "time" in tool_args:
+                await asyncio.sleep(float(tool_args.get("time") or 0))
+                success = True
+                payload = {"waited_s": tool_args.get("time")}
+            elif tool_name == "browser_wait_for" and "text" in tool_args:
+                needle = str(tool_args.get("text") or "")
+                deadline = time.perf_counter() + 30.0
+                found = False
+                while time.perf_counter() < deadline:
+                    present = await driver.evaluate(
+                        "(text) => document.body && document.body.innerText.includes(text)",
+                        args=needle,
+                    )
+                    if present:
+                        found = True
+                        break
+                    await asyncio.sleep(0.2)
+                success = found
+                error = "" if found else f"text not found: {needle!r}"
+                payload = {"text": needle, "found": found}
+            elif tool_name == "browser_take_screenshot":
+                b64 = await driver.screenshot(full_page=bool(tool_args.get("fullPage", False)))
+                success = True
+                payload = {"screenshot_b64": b64}
+            else:
+                return None
+        except Exception as exc:
+            success = False
+            error = str(exc)
+            payload = None
+
+        self._apply_document_changed(changed=document_changed, url=runtime_url, title=runtime_title)
+        elapsed_ms = int(max(0.0, (time.perf_counter() - started_at) * 1000))
+        step_result = {
+            "index": 0,
+            "op": op,
+            "ok": success,
+            "status": "completed" if success else "failed",
+            "elapsed_ms": elapsed_ms,
+        }
+        if error:
+            step_result["error"] = error
+        conditions = []
+        if op in _SINGLE_BATCH_CONDITION_OPS:
+            condition = dict(step_result)
+            condition["observed"] = {"text": str(step.get("text") or "")}
+            conditions.append(condition)
+        return {
+            "ok": success,
+            "status": "completed" if success else "failed",
+            "error": error or None,
+            "action": "browser_batch_interact",
+            "execution_mode": "primitive",
+            "generation_id": self.generation_id,
+            "steps": [step_result],
+            "extracted": {},
+            "conditions": conditions,
+            "metrics": {
+                "tool_name": tool_name,
+                "executor_elapsed_ms": elapsed_ms,
+                "response_size_bytes": len(str(payload).encode("utf-8", "ignore")),
+            },
+            "_runtime_page": {"url": runtime_url, "title": runtime_title},
+        }
+
+    def _until_b2_batch_error(self, steps: Any) -> Dict[str, Any]:
+        """Explicit B1 per-step error for batches that need batch_executor (B2)."""
+        step_list = steps if isinstance(steps, list) else []
+        step_results = []
+        for index, step in enumerate(step_list):
+            op = str((step or {}).get("op") or "").strip().lower() if isinstance(step, dict) else ""
+            step_results.append(
+                {
+                    "index": index,
+                    "op": op,
+                    "ok": False,
+                    "status": "failed",
+                    "error": _BROWSER_UNTIL_B2_MESSAGE,
+                }
+            )
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": _BROWSER_UNTIL_B2_MESSAGE,
+            "action": "browser_batch_interact",
+            "execution_mode": "until_b2",
+            "generation_id": self.generation_id,
+            "steps": step_results,
+            "extracted": {},
+            "conditions": [],
+            "page_state": self.export_page_state(),
+        }
+
     async def batch_interact(
         self,
         *,
@@ -1635,21 +2060,24 @@ class BrowserAgentRuntime:
         if len(resolved_steps) == 1:
             result = await self._run_single_batch_primitive(resolved_steps[0])
         if result is None:
-            self._controller.bind_runtime(self)
-            if self._code_executor is not None:
-                self._controller.bind_code_executor(self._code_executor)
-            result = await self._controller.run_action(
-                action="browser_batch_interact",
-                session_id=session_id,
-                request_id=request_id,
-                steps=resolved_steps,
-                timeout_ms=timeout_ms,
-                condition_timeout_ms=condition_timeout_ms,
-                wait_after_each_ms=wait_after_each_ms,
-                continue_on_error=continue_on_error,
-                global_timeout_ms=global_timeout_ms,
-                generation_id=effective_generation_id,
-            )
+            if self._uses_browser_driver():
+                result = self._until_b2_batch_error(resolved_steps)
+            else:
+                self._controller.bind_runtime(self)
+                if self._code_executor is not None:
+                    self._controller.bind_code_executor(self._code_executor)
+                result = await self._controller.run_action(
+                    action="browser_batch_interact",
+                    session_id=session_id,
+                    request_id=request_id,
+                    steps=resolved_steps,
+                    timeout_ms=timeout_ms,
+                    condition_timeout_ms=condition_timeout_ms,
+                    wait_after_each_ms=wait_after_each_ms,
+                    continue_on_error=continue_on_error,
+                    global_timeout_ms=global_timeout_ms,
+                    generation_id=effective_generation_id,
+                )
         if isinstance(result, dict):
             runtime_page = result.pop("_runtime_page", {})
             runtime_url = runtime_page.get("url") if isinstance(runtime_page, dict) else ""
@@ -1886,17 +2314,37 @@ class BrowserAgentRuntime:
         }
 
     async def runtime_health(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "ok": bool(self._service.connection_healthy),
             "started": bool(self._service.started),
             "last_heartbeat_ok": self._service.last_heartbeat_ok,
             "provider": self._service.provider,
             "api_base": self._service.api_base,
             "model_name": self._service.model_name,
+            "driver_backend": resolve_browser_driver_backend(self._instance),
         }
+        if self._driver is not None:
+            try:
+                health = await self._driver.health()
+                payload["driver"] = {
+                    "connected": health.connected,
+                    "url": health.url,
+                    "tab_count": health.tab_count,
+                    "latency_ms": health.latency_ms,
+                    "error": health.error,
+                }
+                if health.connected:
+                    payload["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - health aggregation must not raise
+                payload["driver"] = {"connected": False, "error": str(exc)}
+        return payload
 
     async def shutdown(self) -> None:
         try:
+            if self._driver is not None:
+                await self._driver.close()
+                self._driver = None
+                self._driver_info = None
             await self._service.shutdown()
         finally:
             _ACTIVE_BROWSER_RUNTIMES.discard(self)

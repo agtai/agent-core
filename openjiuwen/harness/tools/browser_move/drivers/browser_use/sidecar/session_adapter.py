@@ -1,0 +1,553 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""The only module in this subtree that imports ``browser_use``.
+
+Wraps a single ``browser_use.browser.session.BrowserSession`` (attach-only,
+``is_local=False``) and exposes plain-dict-in/plain-dict-out async methods
+that ``main.py`` dispatches wire requests to. Everything here operates on
+wire-level dicts (JSON-safe), never on the ``drivers.base`` dataclasses --
+those live in the agent-core process, not here.
+
+Element refs cross the wire as plain dicts:
+    {"kind": "index", "index": <int>, "driver_generation": <int>}
+    {"kind": "selector", "css": <str>, "nth": <int>}
+    {"kind": "text", "text": <str>, "role": <str | None>}
+    {"kind": "node", "backend_node_id": <int>, "frame_id": <str | None>}
+
+Runs as a flat sibling module inside the sidecar process (``import
+session_adapter``), importing sibling modules the same way.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import time
+from typing import Any
+
+import cdp
+import exceptions
+import keys as key_utils
+import mapping
+
+
+def browser_use_version() -> str:
+    try:
+        import importlib.metadata
+
+        return importlib.metadata.version("browser-use")
+    except Exception:  # noqa: BLE001 - version string is best-effort, never fatal
+        return "unknown"
+
+
+class SessionAdapter:
+    """Owns the browser-use session and translates wire calls into it."""
+
+    def __init__(self) -> None:
+        self._session: Any = None
+        self._cdp_session: Any = None
+        self._driver_generation = 0
+        self._index_cache: dict[int, Any] = {}
+
+    # -- lifecycle ---------------------------------------------------
+
+    async def connect(self, *, cdp_url: str, timeout_s: float = 30.0) -> dict[str, Any]:
+        from browser_use.browser.profile import BrowserProfile
+        from browser_use.browser.session import BrowserSession
+
+        profile = BrowserProfile(headless=None)
+        self._session = BrowserSession(cdp_url=cdp_url, is_local=False, browser_profile=profile)
+        await self._session.start()
+        self._cdp_session = await self._session.get_or_create_cdp_session()
+
+        version_info: dict[str, Any] = {}
+        try:
+            version_info = await self._cdp_session.cdp_client.send.Browser.getVersion(session_id=None) or {}
+        except Exception:  # noqa: BLE001 - version info is best-effort
+            version_info = {}
+
+        try:
+            initial_url = await self._session.get_current_page_url()
+        except Exception:  # noqa: BLE001
+            initial_url = ""
+
+        return {
+            "backend": "browser_use",
+            "browser_version": str(version_info.get("product", "") or ""),
+            "protocol_version": str(version_info.get("protocolVersion", "") or ""),
+            "backend_version": browser_use_version(),
+            "initial_url": initial_url,
+        }
+
+    async def health(self) -> dict[str, Any]:
+        if self._session is None:
+            return {"connected": False, "url": "", "tab_count": 0, "latency_ms": 0.0, "error": "not connected"}
+        started = time.monotonic()
+        try:
+            url = await self._session.get_current_page_url()
+            tabs = await self._session.get_tabs()
+            latency_ms = (time.monotonic() - started) * 1000.0
+            return {"connected": True, "url": url, "tab_count": len(tabs), "latency_ms": latency_ms, "error": None}
+        except Exception as exc:  # noqa: BLE001 - health() must never raise
+            latency_ms = (time.monotonic() - started) * 1000.0
+            return {"connected": False, "url": "", "tab_count": 0, "latency_ms": latency_ms, "error": str(exc)}
+
+    async def close(self) -> None:
+        """Detach only. MUST NOT KILL CHROME -- ``stop()``, never ``kill()``."""
+        if self._session is not None:
+            await self._session.stop()
+        self._session = None
+        self._cdp_session = None
+        self._index_cache = {}
+
+    # -- eyes ----------------------------------------------------------
+
+    async def observe(
+        self, *, include_dom: bool = True, include_screenshot: bool = False, cached: bool = False
+    ) -> dict[str, Any]:
+        summary = await self._session.get_browser_state_summary(
+            include_screenshot=include_screenshot, cached=cached
+        )
+        self._driver_generation += 1
+        dom_state = getattr(summary, "dom_state", None)
+        self._index_cache = dict(getattr(dom_state, "selector_map", None) or {})
+        return mapping.map_browser_state_summary(
+            summary,
+            driver_generation=self._driver_generation,
+            captured_at=time.time(),
+            include_screenshot=include_screenshot,
+        )
+
+    async def screenshot(self, *, full_page: bool = False, clip: dict[str, Any] | None = None) -> str:
+        data = await self._session.take_screenshot(full_page=full_page, clip=clip)
+        return base64.b64encode(data).decode("ascii")
+
+    async def list_tabs(self) -> list[dict[str, Any]]:
+        tabs = await self._session.get_tabs()
+        try:
+            current_url = await self._session.get_current_page_url()
+        except Exception:  # noqa: BLE001
+            current_url = ""
+        return [mapping.map_tab(tab, current_url) for tab in tabs]
+
+    # -- id bridge -------------------------------------------------------
+
+    async def resolve(self, ref: dict[str, Any]) -> dict[str, Any]:
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        box = await self._element_box(backend_node_id)
+        tag, attributes, visible = await self._element_facts(backend_node_id)
+        return {
+            "backend_node_id": backend_node_id,
+            "frame_id": ref.get("frame_id"),
+            "box": box,
+            "visible": visible,
+            "tag": tag,
+            "attributes": attributes,
+        }
+
+    async def stamp(self, ref: dict[str, Any], *, attribute: str, value: str) -> str:
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        cdp_session = await self._ensure_cdp_session()
+        await cdp.call_function_on_backend_node(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            backend_node_id,
+            "function(attr, val){ this.setAttribute(attr, val); }",
+            arguments=[{"value": attribute}, {"value": value}],
+            return_by_value=True,
+        )
+        return f'[{attribute}="{value}"]'
+
+    # -- hands: navigation ------------------------------------------------
+
+    async def navigate(
+        self,
+        *,
+        url: str,
+        wait_until: str = "load",
+        timeout_ms: int | None = None,
+        new_tab: bool = False,
+    ) -> dict[str, Any]:
+        from browser_use.browser.events import NavigateToUrlEvent
+
+        before_url = await self._safe_current_url()
+        event = self._session.event_bus.dispatch(
+            NavigateToUrlEvent(url=url, wait_until=wait_until, timeout_ms=timeout_ms, new_tab=new_tab)
+        )
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._nav_result(before_url)
+
+    async def go_back(self) -> dict[str, Any]:
+        from browser_use.browser.events import GoBackEvent
+
+        before_url = await self._safe_current_url()
+        event = self._session.event_bus.dispatch(GoBackEvent())
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._nav_result(before_url)
+
+    async def go_forward(self) -> dict[str, Any]:
+        from browser_use.browser.events import GoForwardEvent
+
+        before_url = await self._safe_current_url()
+        event = self._session.event_bus.dispatch(GoForwardEvent())
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._nav_result(before_url)
+
+    async def reload(self) -> dict[str, Any]:
+        from browser_use.browser.events import RefreshEvent
+
+        before_url = await self._safe_current_url()
+        event = self._session.event_bus.dispatch(RefreshEvent())
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._nav_result(before_url)
+
+    # -- hands: element actions -------------------------------------------
+
+    async def click(
+        self,
+        ref: dict[str, Any],
+        *,
+        button: str = "left",
+        click_count: int = 1,
+        modifiers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        box = await self._element_box(backend_node_id)
+        if box is None:
+            raise exceptions.ElementNotFound(f"element (backend_node_id={backend_node_id}) has no bounding box")
+        cx, cy = box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
+        cdp_session = await self._ensure_cdp_session()
+        for _ in range(max(1, click_count)):
+            await cdp.dispatch_mouse_click(
+                cdp_session.cdp_client, cdp_session.session_id, x=cx, y=cy, button=button, click_count=click_count
+            )
+        return await self._act_result(before_url, ok=True, detail="clicked")
+
+    async def type_text(
+        self,
+        ref: dict[str, Any],
+        text: str,
+        *,
+        clear: bool = True,
+        press_enter: bool = False,
+        sensitive: bool = False,
+    ) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        cdp_session = await self._ensure_cdp_session()
+        box = await self._element_box(backend_node_id)
+        if box is not None:
+            cx, cy = box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
+            await cdp.dispatch_mouse_click(cdp_session.cdp_client, cdp_session.session_id, x=cx, y=cy)
+        if clear:
+            await cdp.call_function_on_backend_node(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                backend_node_id,
+                "function(){ if ('value' in this) { this.value = ''; } else { this.textContent = ''; } "
+                "this.dispatchEvent(new Event('input', {bubbles: true})); }",
+            )
+        await cdp.insert_text(cdp_session.cdp_client, cdp_session.session_id, text)
+        if press_enter:
+            await cdp.dispatch_key_press(cdp_session.cdp_client, cdp_session.session_id, "Enter")
+        detail = "typed" if not sensitive else "typed (sensitive)"
+        return await self._act_result(before_url, ok=True, detail=detail)
+
+    async def press_key(self, keys: str) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import SendKeysEvent
+
+        event = self._session.event_bus.dispatch(SendKeysEvent(keys=key_utils.normalize_key_combo(keys)))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._act_result(before_url, ok=True, detail="keys sent")
+
+    async def select_option(
+        self, ref: dict[str, Any], *, value: str | None = None, label: str | None = None
+    ) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import SelectDropdownOptionEvent
+
+        node = await self._node_for_event(ref)
+        text = label if label is not None else (value or "")
+        event = self._session.event_bus.dispatch(SelectDropdownOptionEvent(node=node, text=text))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._act_result(before_url, ok=True, detail="option selected")
+
+    async def set_checked(self, ref: dict[str, Any], checked: bool) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        cdp_session = await self._ensure_cdp_session()
+        await cdp.call_function_on_backend_node(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            backend_node_id,
+            "function(want){ if (this.checked !== want) { this.checked = want; "
+            "this.dispatchEvent(new Event('click', {bubbles: true})); "
+            "this.dispatchEvent(new Event('change', {bubbles: true})); } }",
+            arguments=[{"value": bool(checked)}],
+        )
+        return await self._act_result(before_url, ok=True, detail="checked state set")
+
+    async def scroll(
+        self, *, direction: str, amount: float, ref: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import ScrollEvent
+
+        node = await self._node_for_event(ref) if ref is not None else None
+        event = self._session.event_bus.dispatch(ScrollEvent(node=node, direction=direction, amount=amount))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._act_result(before_url, ok=True, detail="scrolled")
+
+    async def upload_files(self, ref: dict[str, Any], paths: list[str]) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import UploadFileEvent
+
+        node = await self._node_for_event(ref)
+        file_path = paths[0] if paths else ""
+        event = self._session.event_bus.dispatch(UploadFileEvent(node=node, file_path=file_path))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._act_result(before_url, ok=True, detail=f"uploaded {len(paths)} file(s)")
+
+    async def drag(
+        self, source: dict[str, Any], target: dict[str, Any], *, steps: int = 10, delay_ms: int = 0
+    ) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        source_id = await self._resolve_ref_to_backend_node_id(source)
+        target_id = await self._resolve_ref_to_backend_node_id(target)
+        source_box = await self._element_box(source_id)
+        target_box = await self._element_box(target_id)
+        if source_box is None or target_box is None:
+            raise exceptions.ElementNotFound("drag source or target has no bounding box")
+        sx, sy = source_box["x"] + source_box["width"] / 2.0, source_box["y"] + source_box["height"] / 2.0
+        tx, ty = target_box["x"] + target_box["width"] / 2.0, target_box["y"] + target_box["height"] / 2.0
+        cdp_session = await self._ensure_cdp_session()
+        client, session_id = cdp_session.cdp_client, cdp_session.session_id
+        await client.send.Input.dispatchMouseEvent(
+            params={"type": "mousePressed", "x": sx, "y": sy, "button": "left", "clickCount": 1, "modifiers": 0},
+            session_id=session_id,
+        )
+        steps = max(1, steps)
+        for step in range(1, steps + 1):
+            frac = step / steps
+            await cdp.dispatch_mouse_move(client, session_id, x=sx + (tx - sx) * frac, y=sy + (ty - sy) * frac)
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000.0)
+        await client.send.Input.dispatchMouseEvent(
+            params={"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1, "modifiers": 0},
+            session_id=session_id,
+        )
+        return await self._act_result(before_url, ok=True, detail="dragged")
+
+    async def switch_tab(self, tab: dict[str, Any]) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import SwitchTabEvent
+
+        event = self._session.event_bus.dispatch(SwitchTabEvent(target_id=tab["target_id"]))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        self._cdp_session = None  # invalidate cached CDP session across tab switch
+        return await self._act_result(before_url, ok=True, detail="switched tab")
+
+    async def close_tab(self, tab: dict[str, Any]) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        from browser_use.browser.events import CloseTabEvent
+
+        event = self._session.event_bus.dispatch(CloseTabEvent(target_id=tab["target_id"]))
+        await event
+        await event.event_result(raise_if_any=True, raise_if_none=False)
+        return await self._act_result(before_url, ok=True, detail="closed tab")
+
+    # -- evaluate and wait ------------------------------------------------
+
+    async def evaluate(
+        self,
+        source: str,
+        *,
+        args: Any = None,
+        await_promise: bool = True,
+        return_by_value: bool = True,
+    ) -> Any:
+        cdp_session = await self._ensure_cdp_session()
+        return await cdp.evaluate_expression(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            source,
+            args,
+            await_promise=await_promise,
+            return_by_value=return_by_value,
+        )
+
+    async def wait_load_state(self, *, state: str = "load", timeout_ms: int) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        await asyncio.sleep(min(timeout_ms / 1000.0, 5.0))
+        return await self._act_result(before_url, ok=True, detail=f"waited for {state}")
+
+    # -- internal helpers -------------------------------------------------
+
+    async def _ensure_cdp_session(self) -> Any:
+        if self._cdp_session is None:
+            self._cdp_session = await self._session.get_or_create_cdp_session()
+        return self._cdp_session
+
+    async def _safe_current_url(self) -> str:
+        try:
+            return await self._session.get_current_page_url()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _nav_result(self, before_url: str) -> dict[str, Any]:
+        url = await self._safe_current_url()
+        try:
+            title = await self._session.get_current_page_title()
+        except Exception:  # noqa: BLE001
+            title = ""
+        self._driver_generation += 1
+        return {
+            "url": url,
+            "title": title,
+            "changed_document": url != before_url,
+            "driver_generation": self._driver_generation,
+        }
+
+    async def _act_result(self, before_url: str, *, ok: bool, detail: str) -> dict[str, Any]:
+        url = await self._safe_current_url()
+        changed = url != before_url
+        if changed:
+            self._driver_generation += 1
+        return {"ok": ok, "detail": detail, "document_changed": changed, "driver_generation": self._driver_generation}
+
+    def _node_from_index(self, index: int, driver_generation: int) -> Any:
+        if driver_generation != self._driver_generation:
+            raise exceptions.StaleIndexError(
+                f"index {index} was observed at driver_generation {driver_generation}, "
+                f"current is {self._driver_generation}"
+            )
+        node = self._index_cache.get(index)
+        if node is None:
+            raise exceptions.StaleIndexError(f"index {index} is not present in the last observation")
+        return node
+
+    async def _resolve_ref_to_backend_node_id(self, ref: dict[str, Any]) -> int:
+        """Resolve any wire ElementRef dict to a CDP backendNodeId."""
+        kind = ref.get("kind")
+        if kind == "index":
+            node = self._node_from_index(int(ref["index"]), int(ref["driver_generation"]))
+            backend_node_id = getattr(node, "backend_node_id", None)
+            if backend_node_id is None:
+                raise exceptions.StaleIndexError(f"index {ref['index']} has no backend_node_id")
+            return int(backend_node_id)
+        if kind == "node":
+            return int(ref["backend_node_id"])
+        if kind == "selector":
+            cdp_session = await self._ensure_cdp_session()
+            node_id = await cdp.query_selector_node_id(cdp_session.cdp_client, cdp_session.session_id, ref["css"])
+            if node_id is None:
+                raise exceptions.ElementNotFound(f"no element matches selector {ref['css']!r}")
+            return await cdp.describe_node_backend_id(cdp_session.cdp_client, cdp_session.session_id, node_id)
+        if kind == "text":
+            return await self._resolve_text_ref(ref)
+        raise exceptions.ElementNotFound(f"unsupported element ref kind {kind!r}")
+
+    async def _resolve_text_ref(self, ref: dict[str, Any]) -> int:
+        cdp_session = await self._ensure_cdp_session()
+        text = str(ref.get("text", ""))
+        role = ref.get("role")
+        find_fn = (
+            "(args) => { "
+            "const text = args.text; const role = args.role; "
+            "const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT); "
+            "let node = walker.currentNode; "
+            "while (node) { "
+            "  if (node.textContent && node.textContent.includes(text) && "
+            "      (!role || node.getAttribute('role') === role)) { return node; } "
+            "  node = walker.nextNode(); "
+            "} "
+            "return null; }"
+        )
+        result = await cdp_session.cdp_client.send.Runtime.evaluate(
+            params={
+                "expression": f"({find_fn})({json.dumps({'text': text, 'role': role})})",
+                "awaitPromise": True,
+                "returnByValue": False,
+            },
+            session_id=cdp_session.session_id,
+        )
+        object_id = (result.get("result") or {}).get("objectId")
+        if not object_id:
+            raise exceptions.ElementNotFound(f"no element matches text {text!r}")
+        node_id = await cdp.request_node_id_from_object(cdp_session.cdp_client, cdp_session.session_id, object_id)
+        return await cdp.describe_node_backend_id(cdp_session.cdp_client, cdp_session.session_id, node_id)
+
+    async def _node_for_event(self, ref: dict[str, Any] | None) -> Any:
+        """Return a real ``EnhancedDOMTreeNode`` for BU high-level events.
+
+        Only ``IndexRef`` carries a full cached node object; other ref kinds
+        are resolved to a backend node id and looked up freshly via
+        ``BrowserSession.get_dom_element_by_index`` when possible, else the
+        cached node keyed by backend id from the last observation.
+        """
+        if ref is None:
+            return None
+        if ref.get("kind") == "index":
+            return self._node_from_index(int(ref["index"]), int(ref["driver_generation"]))
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        for node in self._index_cache.values():
+            if getattr(node, "backend_node_id", None) == backend_node_id:
+                return node
+        raise exceptions.ElementNotFound(
+            f"backend_node_id={backend_node_id} has no cached selector-map node for this action; "
+            "re-observe the page first"
+        )
+
+    async def _element_box(self, backend_node_id: int) -> dict[str, float] | None:
+        cdp_session = await self._ensure_cdp_session()
+        try:
+            rect = await cdp.call_function_on_backend_node(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                backend_node_id,
+                "function(){ const r = this.getBoundingClientRect(); "
+                "return {x: r.x, y: r.y, width: r.width, height: r.height}; }",
+            )
+        except exceptions.DriverError:
+            return None
+        if not isinstance(rect, dict):
+            return None
+        return {k: float(rect.get(k, 0.0) or 0.0) for k in ("x", "y", "width", "height")}
+
+    async def _element_facts(self, backend_node_id: int) -> tuple[str, dict[str, str], bool]:
+        cdp_session = await self._ensure_cdp_session()
+        try:
+            facts = await cdp.call_function_on_backend_node(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                backend_node_id,
+                "function(){ const attrs = {}; for (const a of this.attributes || []) { attrs[a.name] = a.value; } "
+                "const r = this.getBoundingClientRect(); "
+                "return {tag: this.tagName ? this.tagName.toLowerCase() : '', attributes: attrs, "
+                "visible: !!(r.width > 0 && r.height > 0)}; }",
+            )
+        except exceptions.DriverError:
+            return "", {}, False
+        if not isinstance(facts, dict):
+            return "", {}, False
+        return (
+            str(facts.get("tag", "")),
+            dict(facts.get("attributes", {}) or {}),
+            bool(facts.get("visible", False)),
+        )
+
+
+__all__ = ["SessionAdapter", "browser_use_version"]

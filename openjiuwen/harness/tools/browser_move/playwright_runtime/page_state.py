@@ -459,6 +459,8 @@ class BrowserPageState:
                 f"Stale AX target_id {target.target_id} belongs to {target.generation_id}; "
                 "capture the current page snapshot again."
             )
+        # ``bu`` targets may refresh via backend_node_id / current-generation
+        # equivalents; they are not stuck behind the AX re-snapshot rule.
 
         current_targets = [
             candidate
@@ -492,7 +494,9 @@ class BrowserPageState:
             raise ValueError(f"Unknown PageState target_id: {target_id}")
         if stale.generation == self.generation:
             return stale.target_id
-        if stale.source == "ax" or not (stale.selector or stale.href):
+        if stale.source == "ax":
+            raise ValueError(f"Stale target_id {stale.target_id} has no refreshable runtime identity.")
+        if not (stale.selector or stale.href or stale.locator.get("backend_node_id")):
             raise ValueError(f"Stale target_id {stale.target_id} has no refreshable runtime identity.")
         target = self._new_target(
             source=stale.source,
