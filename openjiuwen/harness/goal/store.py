@@ -12,7 +12,7 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from openjiuwen.harness.goal.schema import GoalRecord
+from openjiuwen.harness.goal.schema import GoalOperationError, GoalRecord
 
 if TYPE_CHECKING:
     from openjiuwen.core.session.agent import Session
@@ -34,10 +34,20 @@ class SessionGoalStore:
 
     def load(self) -> Optional[GoalRecord]:
         """Load the current GoalRecord from session state."""
+        return self._read(repair=True)
+
+    def peek(self) -> Optional[GoalRecord]:
+        """Read without repairing or clearing state; corrupt data is unavailable."""
+        return self._read(repair=False)
+
+    def _read(self, *, repair: bool) -> Optional[GoalRecord]:
         data = self._session.get_state(SESSION_GOAL_RECORD_KEY)
         if data is None:
             return None
         if not isinstance(data, dict):
+            if not repair:
+                raise GoalOperationError(operation="get", code="invalid_state",
+                                         message="Stored Goal state is invalid")
             logger.warning(
                 "[GoalStore] Invalid goal state type %s in session %s, clearing",
                 type(data).__name__,
@@ -46,8 +56,15 @@ class SessionGoalStore:
             self.clear()
             return None
         try:
-            return GoalRecord.from_dict(data)
+            record = GoalRecord.from_dict(data)
+            if not repair and record.session_id != self.session_id:
+                raise GoalOperationError(operation="get", code="invalid_state",
+                                         message="Stored Goal belongs to another session")
+            return record
         except (KeyError, ValueError, TypeError) as exc:
+            if not repair:
+                raise GoalOperationError(operation="get", code="invalid_state",
+                                         message="Stored Goal state is invalid") from exc
             logger.warning(
                 "[GoalStore] Failed to deserialize goal state in session %s: %s, clearing",
                 self.session_id,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -31,6 +32,10 @@ class GoalStore(Protocol):
         ...
 
     def load(self) -> Optional[GoalRecord]:
+        ...
+
+    def peek(self) -> Optional[GoalRecord]:
+        """Read without writes or automatic corrupt-state repair."""
         ...
 
     def save(self, record: GoalRecord) -> None:
@@ -84,7 +89,7 @@ class GoalManager:
         whether an attempt-boundary ``chat.final`` is intermediate). Prefer
         ``await get()`` when a lock-consistent snapshot is required.
         """
-        record = self._store.load()
+        record = self._store.peek()
         return record.copy_for_response() if record is not None else None
 
     async def get(self) -> Optional[GoalRecord]:
@@ -99,6 +104,9 @@ class GoalManager:
         overwrite_confirmed: bool = False,
         token_budget: Optional[int] = None,
         max_attempts: Optional[int] = None,
+        expected_goal_id: str | None = None,
+        expected_control_revision: int | None = None,
+        before_effect: Callable[[], Awaitable[None] | None] | None = None,
     ) -> GoalRecord:
         normalized = objective.strip()
         if not normalized:
@@ -121,7 +129,8 @@ class GoalManager:
             )
 
         async with self._control_lock:
-            existing = self._store.load()
+            await self._admit_control(before_effect)
+            existing = self._read_control_target("set", expected_goal_id, expected_control_revision)
             if existing is not None and not overwrite_confirmed:
                 raise GoalOperationError(
                     operation="set",
@@ -161,9 +170,34 @@ class GoalManager:
 
             return record.copy_for_response()
 
-    async def pause(self) -> Optional[GoalRecord]:
+    @staticmethod
+    async def _admit_control(before_effect):
+        if before_effect is not None:
+            result = before_effect()
+            if inspect.isawaitable(result):
+                await result
+
+    def _read_control_target(self, operation, expected_goal_id, expected_control_revision):
+        """Read/check under the interaction lock before any write or effect."""
+        if expected_goal_id is None and expected_control_revision is None:
+            return self._store.load()
+        if (not isinstance(expected_goal_id, str) or not expected_goal_id
+                or type(expected_control_revision) is not int or expected_control_revision < 1):
+            raise GoalOperationError(operation=operation, code="invalid_target",
+                                     message="Goal ID and positive control revision are required together")
+        record = self._store.peek()
+        if (record is None or record.goal_id != expected_goal_id
+                or record.control_revision != expected_control_revision):
+            raise GoalOperationError(operation=operation, code="stale_goal",
+                                     message="Goal control target has changed")
+        return record
+
+    async def pause(self, *, expected_goal_id: str | None = None,
+                    expected_control_revision: int | None = None,
+                    before_effect: Callable[[], Awaitable[None] | None] | None = None) -> Optional[GoalRecord]:
         async with self._control_lock:
-            record = self._store.load()
+            await self._admit_control(before_effect)
+            record = self._read_control_target("pause", expected_goal_id, expected_control_revision)
             if record is None:
                 return None
             if record.status is GoalStatus.ACTIVE:
@@ -184,6 +218,7 @@ class GoalManager:
                 if self._has_in_flight_goal_attempt(record):
                     record.start_timing()
                 record.status = GoalStatus.PAUSED
+                record.control_revision += 1
                 record.touch(bump_revision=False)
                 self._store.save(record)
                 await self._commit_store_locked()
@@ -191,9 +226,12 @@ class GoalManager:
                     self._emit_goal_updated_locked(record)
             return record.copy_for_response()
 
-    async def resume(self) -> Optional[GoalRecord]:
+    async def resume(self, *, expected_goal_id: str | None = None,
+                     expected_control_revision: int | None = None,
+                     before_effect: Callable[[], Awaitable[None] | None] | None = None) -> Optional[GoalRecord]:
         async with self._control_lock:
-            record = self._store.load()
+            await self._admit_control(before_effect)
+            record = self._read_control_target("resume", expected_goal_id, expected_control_revision)
             if record is None:
                 return None
             if record.status in (GoalStatus.PAUSED, GoalStatus.BLOCKED):
@@ -204,6 +242,7 @@ class GoalManager:
                 in_flight = self._has_in_flight_goal_attempt(record)
                 record.settle_active_time(keep_active=False)
                 record.status = GoalStatus.ACTIVE
+                record.control_revision += 1
                 record.start_timing()
                 # Idle / BLOCKED resume bumps revision and may ensure a new
                 # attempt (generation token). If the same attempt is still
@@ -218,9 +257,12 @@ class GoalManager:
                     self._emit_goal_updated_locked(record)
             return record.copy_for_response()
 
-    async def clear(self) -> Optional[GoalRecord]:
+    async def clear(self, *, expected_goal_id: str | None = None,
+                    expected_control_revision: int | None = None,
+                    before_effect: Callable[[], Awaitable[None] | None] | None = None) -> Optional[GoalRecord]:
         async with self._control_lock:
-            record = self._store.load()
+            await self._admit_control(before_effect)
+            record = self._read_control_target("clear", expected_goal_id, expected_control_revision)
             if record is None:
                 return None
             record.settle_active_time(keep_active=False)
@@ -309,6 +351,7 @@ class GoalManager:
             if record is None or not self._matches_in_flight(record, goal_id, revision):
                 return None
             record.last_assessment = assessment
+            previous_status = record.status
             if assessment.status is GoalAssessmentStatus.COMPLETE:
                 record.settle_active_time(keep_active=False)
                 record.status = GoalStatus.COMPLETED
@@ -323,6 +366,8 @@ class GoalManager:
                 # Attempt finished under pause: stop the clock; resume opens a
                 # fresh segment so idle pause time is not counted.
                 record.settle_active_time(keep_active=False)
+            if record.status is not previous_status:
+                record.control_revision += 1
             record.touch()
             self._store.save(record)
             await self._commit_store_locked()

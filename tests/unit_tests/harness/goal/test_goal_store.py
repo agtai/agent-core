@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import Mock
+
+import pytest
 
 from openjiuwen.core.session.state.base import InMemoryStateLike
-from openjiuwen.harness.goal.schema import GoalRecord, GoalStatus
+from openjiuwen.harness.goal.schema import GoalOperationError, GoalRecord, GoalStatus
 from openjiuwen.harness.goal.store import SESSION_GOAL_RECORD_KEY, SessionGoalStore
 
 
@@ -41,6 +44,18 @@ class MergeSession:
 
     def update_state(self, value: dict[str, Any]) -> None:
         self._state.update(value)
+
+
+@pytest.mark.parametrize("raw", ["not-a-record", {"goal_id": "g"},
+    GoalRecord.create(session_id="other", objective="private").to_dict()])
+def test_peek_rejects_invalid_or_wrong_session_state_without_repair(raw) -> None:
+    session = FakeSession()
+    session.update_state({SESSION_GOAL_RECORD_KEY: raw})
+    session.update_state = Mock(side_effect=AssertionError("read must not write"))
+    with pytest.raises(GoalOperationError, match="Stored Goal"):
+        SessionGoalStore(session).peek()
+    assert session.get_state(SESSION_GOAL_RECORD_KEY) == raw
+    session.update_state.assert_not_called()
 
 
 def test_session_store_save_load_and_clear() -> None:

@@ -18,7 +18,7 @@ from openjiuwen.harness.goal.schema import (
     GoalOperationError,
     GoalStatus,
 )
-from openjiuwen.harness.goal.store import SessionGoalStore
+from openjiuwen.harness.goal.store import SESSION_GOAL_RECORD_KEY, SessionGoalStore
 from openjiuwen.harness.task_loop.event_manager import EventManager
 from openjiuwen.harness.schema.interaction import InteractionEvent, InteractionEventType
 
@@ -90,6 +90,82 @@ class ManagerHarness:
 
     def notify_work(self) -> None:
         self.notify_calls += 1
+
+
+def test_read_only_manager_peek_preserves_corrupt_state_with_zero_execution_effects() -> None:
+    harness = ManagerHarness(output_attached=False)
+    harness.session.update_state({SESSION_GOAL_RECORD_KEY: "corrupt"})
+    with pytest.raises(GoalOperationError, match="Stored Goal"):
+        harness.manager.peek()
+    assert harness.session.get_state(SESSION_GOAL_RECORD_KEY) == "corrupt"
+    assert harness.session.commit_count == harness.notify_calls == 0
+    assert harness.cancel_calls == harness.emitted == []
+
+
+@pytest.mark.asyncio
+async def test_conditional_control_fences_aba_without_invalidating_finishing_attempt() -> None:
+    harness = ManagerHarness()
+    created = await harness.manager.set("Finish report")
+    # A live attempt keeps its generation when paused/resumed.
+    event = harness.events.next_work()
+    assert event is not None
+    started = await harness.manager.begin_attempt(goal_id=created.goal_id, revision=created.revision)
+    assert started is not None
+    paused = await harness.manager.pause(expected_goal_id=created.goal_id,
+        expected_control_revision=created.control_revision)
+    assert paused.revision == created.revision
+    resumed = await harness.manager.resume(expected_goal_id=paused.goal_id,
+        expected_control_revision=paused.control_revision)
+    assert resumed.revision == created.revision
+    assert resumed.control_revision > paused.control_revision > created.control_revision
+    before = harness.store.peek().to_dict()
+    effects = (harness.session.commit_count, len(harness.emitted), harness.notify_calls)
+    with pytest.raises(GoalOperationError, match="target has changed"):
+        await harness.manager.pause(expected_goal_id=created.goal_id,
+            expected_control_revision=created.control_revision)
+    assert harness.store.peek().to_dict() == before
+    assert (harness.session.commit_count, len(harness.emitted), harness.notify_calls) == effects
+    completed = await harness.manager.apply_assessment(goal_id=created.goal_id, revision=created.revision,
+        assessment=GoalAssessment(status=GoalAssessmentStatus.COMPLETE, evidence="Report exists"))
+    assert completed.status is GoalStatus.COMPLETED
+    assert completed.control_revision > resumed.control_revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["pause", "resume", "clear", "set"])
+async def test_wrong_control_target_has_zero_state_and_execution_effects(operation) -> None:
+    harness = ManagerHarness()
+    await harness.manager.set("Original")
+    before = harness.store.peek().to_dict()
+    effects = (harness.session.commit_count, len(harness.emitted), harness.notify_calls)
+    args = {"objective": "Replacement", "overwrite_confirmed": True} if operation == "set" else {}
+    with pytest.raises(GoalOperationError) as error:
+        await getattr(harness.manager, operation)(**args, expected_goal_id="other",
+            expected_control_revision=1)
+    assert error.value.code == "stale_goal"
+    assert harness.store.peek().to_dict() == before
+    assert (harness.session.commit_count, len(harness.emitted), harness.notify_calls) == effects
+    assert harness.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_condition_is_checked_after_waiting_for_existing_owner_lock() -> None:
+    harness = ManagerHarness(output_attached=False)
+    current = await harness.manager.set("Original")
+    await harness.manager._control_lock.acquire()
+    pending = asyncio.create_task(harness.manager.clear(expected_goal_id=current.goal_id,
+        expected_control_revision=current.control_revision))
+    await asyncio.sleep(0)
+    replacement = goal_schema.GoalRecord.create(session_id="session-1", objective="Replacement")
+    harness.store.save(replacement)
+    harness.manager._control_lock.release()
+    before_commits = harness.session.commit_count
+    with pytest.raises(GoalOperationError) as error:
+        await pending
+    assert error.value.code == "stale_goal"
+    assert harness.store.peek().goal_id == replacement.goal_id
+    assert harness.session.commit_count == before_commits
+    assert harness.cancel_calls == harness.emitted == []
 
 
 @pytest.mark.asyncio

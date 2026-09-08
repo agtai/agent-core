@@ -42,6 +42,24 @@ def _freeze_goal_clock(monkeypatch: pytest.MonkeyPatch, clock: dict[str, int]) -
     monkeypatch.setattr(goal_schema, "datetime", FrozenDateTime)
 
 
+def test_legacy_goal_defaults_control_revision_without_changing_attempt_generation() -> None:
+    raw = GoalRecord.create(session_id="session-1", objective="Report").to_dict()
+    raw.pop("control_revision")
+    restored = GoalRecord.from_dict(raw)
+    assert restored.control_revision == 1
+    assert restored.revision == raw["revision"]
+    restored.control_revision = 7
+    assert GoalRecord.from_dict(restored.to_dict()).control_revision == 7
+
+
+@pytest.mark.parametrize("revision", [0, -1, True, "1", None])
+def test_invalid_control_revision_is_not_a_usable_target(revision) -> None:
+    raw = GoalRecord.create(session_id="session-1", objective="Report").to_dict()
+    raw["control_revision"] = revision
+    with pytest.raises(ValueError, match="control revision"):
+        GoalRecord.from_dict(raw)
+
+
 def test_token_usage_accumulates_and_round_trips() -> None:
     usage = TokenUsage()
     usage.accumulate(input_tokens=100, output_tokens=50, cached_input_tokens=20)

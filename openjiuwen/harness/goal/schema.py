@@ -180,6 +180,9 @@ class GoalRecord:
     active_started_at: Optional[str] = None
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
+    # User controls have their own CAS identity. Pausing an in-flight attempt
+    # must not invalidate the attempt's execution revision.
+    control_revision: int = 1
 
     def touch(self, *, bump_revision: bool = False) -> None:
         self.updated_at = _utc_now_iso()
@@ -214,6 +217,7 @@ class GoalRecord:
             "objective": self.objective,
             "status": self.status.value,
             "revision": self.revision,
+            "control_revision": self.control_revision,
             "attempt_count": self.attempt_count,
             "token_usage": self.token_usage.to_dict(),
             "max_attempts": self.max_attempts,
@@ -238,6 +242,9 @@ class GoalRecord:
         except ValueError as exc:
             raise ValueError("invalid persisted GoalRecord status") from exc
         usage_data = data.get("token_usage")
+        control_revision = data.get("control_revision", 1)
+        if type(control_revision) is not int or control_revision < 1:
+            raise ValueError("invalid persisted Goal control revision")
         assessment_data = data.get("last_assessment")
         # Session ``update_dict`` treats nested ``None`` as key deletion. After
         # pause/complete, ``active_started_at`` may be absent rather than null.
@@ -262,6 +269,7 @@ class GoalRecord:
             objective=objective,
             status=status,
             revision=int(data.get("revision", 0)),
+            control_revision=control_revision,
             attempt_count=int(data.get("attempt_count", 0)),
             token_usage=TokenUsage.from_dict(usage_data) if isinstance(usage_data, dict) else TokenUsage(),
             max_attempts=_optional_positive_int(data.get("max_attempts"), "max_attempts"),
