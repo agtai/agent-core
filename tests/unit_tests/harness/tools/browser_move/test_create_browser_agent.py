@@ -29,8 +29,10 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
     CORE_BROWSER_TOOL_NAMES,
+    narrow_allowed_tools_for_browser_driver,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+    BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
     BrowserRuntimeRail,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
@@ -170,24 +172,38 @@ def test_browser_agent_prompt_enforces_convergent_browser_strategy() -> None:
     english = DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT["en"]
     chinese = DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT["cn"]
 
-    assert "direct search-results URL" in english
-    assert "browser_batch_interact" in english
-    assert "observable condition waits" in english
-    assert "navigate directly to that URL" in english
-    assert "Stop immediately" in english
+    assert "available browser tools" in english
     assert "one runtime-maintained <browser_working_context>" in english
     assert "A fresh browser capture occurs initially" in english
     assert "runtime directive requires replanning" in english
-    assert "直接构造搜索结果 URL" in chinese
-    assert "可观察条件" in chinese
-    assert "直接导航该 URL" in chinese
-    assert "立即结束" in chinese
+    assert "Prefer direct navigation" in english
+    assert "Prefer observable page conditions" in english
+    assert "only claim completion when the requested outcome is evidenced" in english
     assert "<browser_working_context>" in chinese
     assert "runtime 要求重新规划" in chinese
+    assert "优先直接导航" in chinese
+    assert "优先等待可观察页面条件" in chinese
+    assert "具体证据证明任务已完成" in chinese
+    # Task-only: no backend / strategy-tool coaching brands.
+    for banned in (
+        "Playwright",
+        "MCP",
+        "browser-use",
+        "browser_use",
+        "browser_batch_interact",
+        "browser_probe_",
+        "browser_custom_action",
+        "sidecar",
+        "BU ",
+    ):
+        assert banned not in english
+        assert banned not in chinese
+    assert "Playwright MCP" not in english
+    assert "Playwright" not in chinese
     assert "browser_run_code_unsafe" not in english
     assert "browser_run_code_unsafe" not in chinese
-    assert "makes a browser_run_code tool visible" in english
-    assert "工具可见" in chinese
+    assert "makes a browser_run_code tool visible" not in english
+    assert "工具可见" not in chinese
 
 
 def test_selected_capabilities_are_logged_and_forwarded_to_runtime(caplog) -> None:
@@ -205,12 +221,13 @@ def test_selected_capabilities_are_logged_and_forwarded_to_runtime(caplog) -> No
 
     del calls
     allowed_tool_names = mock_runtime_cls.call_args.kwargs["allowed_tool_names"]
+    # BU path: only registered catalog tools — pdf capability does not invent a ghost tool.
     assert "browser_click" in allowed_tool_names
-    assert "browser_pdf_save" in allowed_tool_names
-    assert "browser_mouse_click_xy" not in allowed_tool_names
+    assert "browser_pdf_save" not in allowed_tool_names
+    assert set(allowed_tool_names) <= set(BROWSER_CATALOG_RUNTIME_TOOL_NAMES)
     assert "requested=('pdf',)" in caplog.text
     assert "selected=('core', 'pdf')" in caplog.text
-    assert "browser_pdf_save" in caplog.text
+    assert "browser_click" in caplog.text
 
 
 def test_unknown_capability_error_lists_rejected_and_available_names() -> None:
@@ -228,7 +245,7 @@ def test_unknown_capability_error_lists_rejected_and_available_names() -> None:
     ) in message
 
 
-def test_default_factory_always_forwards_core_allowlist() -> None:
+def test_default_factory_forwards_registered_catalog_allowlist() -> None:
     calls, fake = _capture_create_deep_agent()
     ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
 
@@ -236,7 +253,17 @@ def test_default_factory_always_forwards_core_allowlist() -> None:
         create_browser_agent(_fake_model(), settings=_fake_settings())
 
     del calls
-    assert mock_runtime_cls.call_args.kwargs["allowed_tool_names"] == CORE_BROWSER_TOOL_NAMES
+    allowed = mock_runtime_cls.call_args.kwargs["allowed_tool_names"]
+    assert set(allowed) == set(BROWSER_CATALOG_RUNTIME_TOOL_NAMES)
+    assert set(allowed) <= set(CORE_BROWSER_TOOL_NAMES)
+    # Ghost / deferred CORE names must not appear on BU.
+    for deferred in (
+        "browser_drop",
+        "browser_find",
+        "browser_handle_dialog",
+        "browser_hover",
+    ):
+        assert deferred not in allowed
 
 
 @pytest.mark.parametrize(
@@ -246,7 +273,7 @@ def test_default_factory_always_forwards_core_allowlist() -> None:
         ("unsafe_dev", "browser_run_code_unsafe", "browser_run_code"),
     ],
 )
-def test_factory_exposes_only_selected_run_code_variant(
+def test_factory_does_not_advertise_unregistered_run_code_on_bu(
     capability: str,
     included: str,
     excluded: str,
@@ -263,8 +290,10 @@ def test_factory_exposes_only_selected_run_code_variant(
 
     del calls
     allowed = mock_runtime_cls.call_args.kwargs["allowed_tool_names"]
-    assert included in allowed
+    # Honest catalog: no local Tool for run_code on BU, so neither variant is allowed.
+    assert included not in allowed
     assert excluded not in allowed
+    assert set(allowed) <= set(BROWSER_CATALOG_RUNTIME_TOOL_NAMES)
 
 
 def test_default_wiring_main_agent_card_is_browser_agent() -> None:
@@ -338,8 +367,6 @@ def test_default_wiring_adds_browser_state_and_windows_large_tool_results() -> N
     # Pin the intended contract literally (not against the source constant) so a
     # regression like the plain "browser_snapshot" name is actually caught.
     assert config.tool_names == [
-        "browser_probe_interactives",
-        "browser_probe_cards",
         "browser_snapshot",
         "browser_evaluate",
     ]
@@ -442,7 +469,10 @@ def test_settings_forwarded_to_runtime_constructor() -> None:
         mcp_cfg=settings.mcp_cfg,
         guardrails=settings.guardrails,
         instance=settings.instance,
-        allowed_tool_names=CORE_BROWSER_TOOL_NAMES,
+        allowed_tool_names=narrow_allowed_tools_for_browser_driver(
+            CORE_BROWSER_TOOL_NAMES,
+            registered_catalog_tool_names=BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
+        ),
     )
 
 

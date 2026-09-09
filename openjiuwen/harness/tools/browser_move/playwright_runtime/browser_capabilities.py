@@ -33,6 +33,18 @@ CORE_BROWSER_TOOL_NAMES: tuple[str, ...] = (
     "browser_type",
 )
 
+# CORE names that are intentionally NOT registered on the BrowserDriver (BU) path
+# until Protocol/sidecar can honor them honestly. They remain in CORE_BROWSER_TOOL_NAMES
+# for the legacy MCP capability catalog, but must not appear in BU allowed_tools.
+BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "browser_drop",  # no distinct BrowserDriver.drop; use browser_drag
+        "browser_find",  # no honest find schema without a dedicated driver API
+        "browser_handle_dialog",  # BrowserDriver has no dialog API
+        "browser_hover",  # BrowserDriver has no hover API
+    }
+)
+
 ADVANCED_CODE_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code",)
 
 UNSAFE_DEV_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code_unsafe",)
@@ -132,7 +144,7 @@ class ResolvedBrowserCapabilities:
 DEFAULT_BROWSER_CAPABILITIES: tuple[BrowserCapability, ...] = (
     BrowserCapability(
         name=CORE_BROWSER_CAPABILITY_NAME,
-        description="Navigate, inspect, and interact with web pages using the standard Playwright browser tools.",
+        description="Navigate, inspect, and interact with web pages using the standard browser tools.",
         tool_names=CORE_BROWSER_TOOL_NAMES,
     ),
     BrowserCapability(
@@ -259,8 +271,24 @@ def resolve_browser_capabilities(
     )
 
 
+def narrow_allowed_tools_for_browser_driver(
+    allowed_tool_names: Iterable[str],
+    *,
+    registered_catalog_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    """Intersect capability allowlist with tools actually registered on BU.
+
+    Prevents ghost CORE names (and non-CORE capability tools that have no
+    local Tool card) from appearing in ``allowed_tools`` logs / runtime
+    allowlists when hands go through BrowserDriver.
+    """
+    registered = {str(name or "").strip() for name in registered_catalog_tool_names if str(name or "").strip()}
+    return _stable_unique(name for name in allowed_tool_names if str(name or "").strip() in registered)
+
+
 __all__ = [
     "ADVANCED_CODE_BROWSER_TOOL_NAMES",
+    "BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES",
     "CONFIG_BROWSER_TOOL_NAMES",
     "CORE_BROWSER_CAPABILITY_NAME",
     "CORE_BROWSER_TOOL_NAMES",
@@ -275,5 +303,6 @@ __all__ = [
     "VISION_BROWSER_TOOL_NAMES",
     "BrowserCapability",
     "ResolvedBrowserCapabilities",
+    "narrow_allowed_tools_for_browser_driver",
     "resolve_browser_capabilities",
 ]

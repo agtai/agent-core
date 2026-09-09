@@ -105,6 +105,7 @@ def test_reset_active_browser_runtimes_resets_all_live_instances() -> None:
 def test_before_invoke_calls_ensure_runtime_ready() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = MagicMock()
     runtime.service.allowed_tool_names = ("browser_click", "browser_pdf_save")
@@ -120,9 +121,28 @@ def test_before_invoke_calls_ensure_runtime_ready() -> None:
     )
 
 
+def test_before_invoke_skips_mcp_ability_on_browser_driver() -> None:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = True
+    runtime.service = MagicMock()
+    runtime.service.mcp_cfg = MagicMock()
+    runtime.service.allowed_tool_names = ("browser_click", "browser_navigate")
+    rail = BrowserRuntimeRail(runtime)
+    ctx = _make_ctx()
+    ctx.agent.ability_manager = MagicMock()
+
+    _run(rail.before_invoke(ctx))
+
+    runtime.ensure_runtime_ready.assert_called_once_with()
+    ctx.agent.ability_manager.add.assert_not_called()
+    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_not_called()
+
+
 def test_before_invoke_with_none_allowlist_defaults_to_core() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = MagicMock()
     runtime.service.allowed_tool_names = None
@@ -142,6 +162,7 @@ def test_before_invoke_with_none_allowlist_defaults_to_core() -> None:
 def test_before_invoke_removes_screenshot_for_non_multimodal_model() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = _playwright_mcp_config()
     runtime.service.allowed_tool_names = (
@@ -165,6 +186,7 @@ def test_before_invoke_removes_screenshot_for_non_multimodal_model() -> None:
 def test_before_invoke_builds_non_multimodal_allowlist_from_core() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = _playwright_mcp_config()
     runtime.service.allowed_tool_names = None
@@ -183,6 +205,7 @@ def test_before_invoke_builds_non_multimodal_allowlist_from_core() -> None:
 def test_pdf_allowlist_filters_active_browser_agent_schemas() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = _playwright_mcp_config()
     runtime.service.allowed_tool_names = resolve_browser_capabilities(["pdf"]).allowed_tool_names
@@ -218,6 +241,7 @@ def test_before_invoke_called_twice_delegates_twice() -> None:
     """Idempotency is BrowserAgentRuntime's responsibility; rail always delegates."""
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver.return_value = False
     runtime.service = MagicMock()
     runtime.service.mcp_cfg = MagicMock()
     runtime.service.allowed_tool_names = ("browser_click", "browser_pdf_save")
@@ -325,6 +349,28 @@ def test_before_tool_call_keeps_runtime_browser_navigate_name() -> None:
     _run(rail.before_tool_call(ctx))
 
     assert ctx.inputs.tool_name == "browser_navigate"
+
+
+def test_before_tool_call_keeps_catalog_click_name_on_browser_driver() -> None:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.service.allowed_tool_names = ("browser_navigate", "browser_click")
+    runtime.service.mcp_cfg.server_name = "playwright-official"
+    runtime.semantic_progress = {}
+    runtime._uses_browser_driver.return_value = True
+    runtime.export_page_state.return_value = {"url": "https://example.com"}
+    rail = BrowserRuntimeRail(runtime)
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        inputs=ToolCallInputs(
+            tool_call=ToolCall(id="click-1", type="function", name="browser_click", arguments="{}"),
+            tool_name="browser_click",
+            tool_args={"generation_id": "g1", "target_id": "t_g1_1"},
+        ),
+    )
+
+    _run(rail.before_tool_call(ctx))
+
+    assert ctx.inputs.tool_name == "browser_click"
 
 
 def test_before_tool_call_normalizes_bracketed_refs_in_json_arguments() -> None:

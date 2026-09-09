@@ -93,9 +93,9 @@ _BROWSER_REPLAN_DENIAL_LIMIT = 3
 _BROWSER_READ_ONLY_RECOVERY_LIMIT = 1
 _BROWSER_TASK_RESUME_LIMIT = 1
 _BROWSER_TERMINAL_SYNTHESIS_KEY = "terminal_synthesis_started"
-_BROWSER_RUNTIME_TOOL_NAMES = frozenset(
+# Runtime helpers are never rewritten to mcp_* (no MCP twin).
+_BROWSER_RUNTIME_HELPER_TOOL_NAMES = frozenset(
     {
-        "browser_navigate",
         "browser_batch_interact",
         "browser_probe_interactives",
         "browser_probe_cards",
@@ -105,6 +105,37 @@ _BROWSER_RUNTIME_TOOL_NAMES = frozenset(
         "browser_clear_cancel",
         "browser_runtime_health",
     }
+)
+# CORE catalog tools registered as local Tool instances on the BrowserDriver path.
+# Keep in sync with build_browser_runtime_tools() catalog registrations.
+BROWSER_CATALOG_RUNTIME_TOOL_NAMES = frozenset(
+    {
+        "browser_click",
+        "browser_close",
+        "browser_drag",
+        "browser_evaluate",
+        "browser_file_upload",
+        "browser_fill_form",
+        "browser_navigate",
+        "browser_navigate_back",
+        "browser_press_key",
+        "browser_select_option",
+        "browser_snapshot",
+        "browser_tabs",
+        "browser_take_screenshot",
+        "browser_type",
+    }
+)
+_BROWSER_CATALOG_RUNTIME_TOOL_NAMES = BROWSER_CATALOG_RUNTIME_TOOL_NAMES
+# Union used by rail allowlists / known-name checks.
+_BROWSER_RUNTIME_TOOL_NAMES = _BROWSER_RUNTIME_HELPER_TOOL_NAMES | _BROWSER_CATALOG_RUNTIME_TOOL_NAMES
+_EVALUATE_DUMP_SOURCE_MARKERS = (
+    "document.documentelement",
+    "document.body.innerhtml",
+    "document.body.outerhtml",
+    "document.documentelement.outerhtml",
+    "document.documentelement.innerhtml",
+    "document.all",
 )
 _ACTIVE_BROWSER_RUNTIMES: WeakSet[Any] = WeakSet()
 _BROWSER_PROGRESS_TAG_RE = re.compile(
@@ -1099,6 +1130,10 @@ class BrowserAgentRuntime:
     async def ensure_started(self) -> None:
         await self.ensure_runtime_ready()
         await self._service.ensure_started()
+        # BrowserDriver path: catalog tools are injected by create_browser_agent;
+        # probe/batch/custom_action helpers are demoted (internal APIs only).
+        if self._uses_browser_driver() is True:
+            return
         if self._browser_custom_action_tool is not None:
             return
         from .runtime_tools import (
@@ -2120,6 +2155,747 @@ class BrowserAgentRuntime:
             "page_state": self.export_page_state(),
         }
 
+    async def navigate_back(self) -> Dict[str, Any]:
+        """Navigate back via BrowserDriver (catalog ``browser_navigate_back``)."""
+        await self.ensure_runtime_ready()
+        driver = await self._ensure_browser_driver()
+        try:
+            nav = await driver.go_back()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_navigate_back failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        resolved_url = str(nav.url or "").strip()
+        resolved_title = str(nav.title or "").strip()
+        self._apply_document_changed(
+            changed=bool(nav.changed_document),
+            url=resolved_url,
+            title=resolved_title,
+        )
+        return {
+            "ok": True,
+            "url": resolved_url,
+            "title": resolved_title,
+            "changed_document": bool(nav.changed_document),
+            "page_state": self.export_page_state(),
+        }
+
+    async def _resolve_catalog_element_ref(
+        self,
+        *,
+        generation_id: str,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+        op: str = "click",
+    ) -> Any:
+        """Resolve PageState / locator inputs to a driver ``ElementRef``."""
+        from openjiuwen.harness.tools.browser_move.drivers.base import (
+            IndexRef,
+            NodeRef,
+            SelectorRef,
+            TextRef,
+        )
+
+        page_state = self._ensure_page_state()
+        effective_generation = str(generation_id or "").strip() or page_state.generation_id
+        page_state.validate_generation(effective_generation)
+
+        step: Dict[str, Any] = {"op": op}
+        if target_id:
+            step["target_id"] = str(target_id).strip()
+        if ref:
+            step["ref"] = str(ref).strip()
+        if selector:
+            step["selector"] = str(selector).strip()
+        if not any(step.get(key) for key in ("target_id", "ref", "selector")):
+            raise ValueError("exactly one of target_id, ref, or selector is required")
+
+        await self._resolve_batch_target(step, generation_id=effective_generation)
+        if step.get("_navigate_url"):
+            raise ValueError(
+                f"Target has primary_link={step['_navigate_url']}; "
+                "call browser_navigate with that URL instead of clicking it"
+            )
+
+        css = str(step.get("selector") or "").strip()
+        if css:
+            return SelectorRef(css=css)
+        if step.get("text") not in (None, ""):
+            return TextRef(
+                text=str(step.get("text")),
+                role=str(step["role"]) if step.get("role") else None,
+            )
+        if step.get("role") not in (None, "") and step.get("name") not in (None, ""):
+            return TextRef(text=str(step.get("name")), role=str(step.get("role")))
+
+        # Prefer native driver identity when materialize left bu_index / node ids.
+        resolved_target_id = str(step.get("resolved_target_id") or target_id or "").strip()
+        target = page_state.get_target(resolved_target_id) if resolved_target_id else None
+        locator = dict(target.locator) if target is not None else {}
+        bu_index = str(locator.get("bu_index") or "").strip()
+        driver_generation_raw = str(locator.get("driver_generation") or "").strip()
+        backend_node_id_raw = str(locator.get("backend_node_id") or "").strip()
+        if bu_index and driver_generation_raw:
+            return IndexRef(index=int(bu_index), driver_generation=int(driver_generation_raw))
+        if backend_node_id_raw:
+            frame_id = locator.get("frame_id")
+            return NodeRef(
+                backend_node_id=int(backend_node_id_raw),
+                frame_id=str(frame_id) if frame_id else None,
+            )
+        raise ValueError("unable to build ElementRef from resolved PageState target")
+
+    async def click(
+        self,
+        *,
+        generation_id: str,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+        button: str = "left",
+        click_count: int = 1,
+    ) -> Dict[str, Any]:
+        """Click an element via BrowserDriver (catalog ``browser_click``)."""
+        await self.ensure_runtime_ready()
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="click",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_click failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.click(
+                element_ref,
+                button=str(button or "left"),
+                click_count=max(1, int(click_count or 1)),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_click failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def type_text(
+        self,
+        *,
+        generation_id: str,
+        text: str,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+        clear: bool = True,
+        press_enter: bool = False,
+        sensitive: bool = False,
+    ) -> Dict[str, Any]:
+        """Type into an element via BrowserDriver (catalog ``browser_type``)."""
+        await self.ensure_runtime_ready()
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="type",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_type failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.type_text(
+                element_ref,
+                str(text or ""),
+                clear=bool(clear),
+                press_enter=bool(press_enter),
+                sensitive=bool(sensitive),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_type failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def press_key(self, *, keys: str) -> Dict[str, Any]:
+        """Press a key combination via BrowserDriver (catalog ``browser_press_key``)."""
+        await self.ensure_runtime_ready()
+        key = str(keys or "").strip()
+        if not key:
+            return {
+                "ok": False,
+                "error": "'key' is required",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.press_key(key)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_press_key failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def take_screenshot(self, *, full_page: bool = False) -> Dict[str, Any]:
+        """Capture a screenshot via BrowserDriver (catalog ``browser_take_screenshot``)."""
+        await self.ensure_runtime_ready()
+        driver = await self._ensure_browser_driver()
+        try:
+            b64 = await driver.screenshot(full_page=bool(full_page))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_take_screenshot failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        return {
+            "ok": True,
+            "screenshot_b64": b64,
+            "full_page": bool(full_page),
+            "page_state": self.export_page_state(),
+        }
+
+    async def tabs(
+        self,
+        *,
+        action: str = "list",
+        index: int | None = None,
+    ) -> Dict[str, Any]:
+        """List, select, or close tabs via BrowserDriver (catalog ``browser_tabs``)."""
+        await self.ensure_runtime_ready()
+        normalized = str(action or "list").strip().lower() or "list"
+        if normalized not in {"list", "select", "close"}:
+            return {
+                "ok": False,
+                "error": "action must be one of: list, select, close",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            tab_list = await driver.list_tabs()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_tabs failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+
+        def _tab_payload(tab: Any) -> Dict[str, Any]:
+            return {
+                "target_id": getattr(tab, "target_id", ""),
+                "url": getattr(tab, "url", ""),
+                "title": getattr(tab, "title", ""),
+                "active": bool(getattr(tab, "active", False)),
+            }
+
+        tabs_payload = [_tab_payload(tab) for tab in tab_list]
+        if normalized == "list":
+            return {
+                "ok": True,
+                "action": "list",
+                "tabs": tabs_payload,
+                "page_state": self.export_page_state(),
+            }
+
+        if index is None:
+            return {
+                "ok": False,
+                "error": f"action={normalized} requires integer index",
+                "tabs": tabs_payload,
+                "page_state": self.export_page_state(),
+            }
+        try:
+            tab_index = int(index)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "'index' must be an integer",
+                "tabs": tabs_payload,
+                "page_state": self.export_page_state(),
+            }
+        if tab_index < 0 or tab_index >= len(tab_list):
+            return {
+                "ok": False,
+                "error": f"tab index {tab_index} out of range (0..{max(0, len(tab_list) - 1)})",
+                "tabs": tabs_payload,
+                "page_state": self.export_page_state(),
+            }
+
+        selected = tab_list[tab_index]
+        try:
+            if normalized == "select":
+                act = await driver.switch_tab(selected)
+            else:
+                act = await driver.close_tab(selected)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_tabs failed: {exc}",
+                "tabs": tabs_payload,
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        refreshed: list[Dict[str, Any]] = tabs_payload
+        if act.ok:
+            try:
+                refreshed = [_tab_payload(tab) for tab in await driver.list_tabs()]
+            except Exception:
+                refreshed = tabs_payload
+        return {
+            "ok": bool(act.ok),
+            "action": normalized,
+            "index": tab_index,
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "tabs": refreshed,
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def close_page(self) -> Dict[str, Any]:
+        """Close the active tab via BrowserDriver (catalog ``browser_close``)."""
+        await self.ensure_runtime_ready()
+        driver = await self._ensure_browser_driver()
+        try:
+            tab_list = await driver.list_tabs()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_close failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        if not tab_list:
+            return {
+                "ok": False,
+                "error": "no open tabs to close",
+                "page_state": self.export_page_state(),
+            }
+        active = next((tab for tab in tab_list if getattr(tab, "active", False)), tab_list[0])
+        try:
+            act = await driver.close_tab(active)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_close failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "closed_target_id": getattr(active, "target_id", ""),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def select_option(
+        self,
+        *,
+        generation_id: str,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+        value: str | None = None,
+        label: str | None = None,
+    ) -> Dict[str, Any]:
+        """Select a native <select> option via BrowserDriver."""
+        await self.ensure_runtime_ready()
+        value_text = None if value is None else str(value)
+        label_text = None if label is None else str(label)
+        if (value_text is None or value_text == "") and (label_text is None or label_text == ""):
+            return {
+                "ok": False,
+                "error": "exactly one of value or label is required",
+                "page_state": self.export_page_state(),
+            }
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="select_option",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_select_option failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.select_option(
+                element_ref,
+                value=value_text if value_text not in (None, "") else None,
+                label=label_text if label_text not in (None, "") else None,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_select_option failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def evaluate(
+        self,
+        *,
+        source: str,
+        args: Any = None,
+        await_promise: bool = True,
+    ) -> Dict[str, Any]:
+        """Run a small page script via BrowserDriver (catalog ``browser_evaluate``)."""
+        await self.ensure_runtime_ready()
+        script = str(source or "").strip()
+        if not script:
+            return {
+                "ok": False,
+                "error": "'function' / source is required",
+                "page_state": self.export_page_state(),
+            }
+        lowered = script.lower().replace(" ", "")
+        if any(marker in lowered for marker in _EVALUATE_DUMP_SOURCE_MARKERS):
+            return {
+                "ok": False,
+                "error": (
+                    "browser_evaluate rejects full-document dumps; "
+                    "use browser_snapshot or a targeted expression instead"
+                ),
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            value = await driver.evaluate(
+                script,
+                args=args,
+                await_promise=bool(await_promise),
+                return_by_value=True,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_evaluate failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        # Bound model-facing payload size without inventing a parallel dump path.
+        if isinstance(value, str) and len(value) > 8000:
+            value = value[:8000] + "…[truncated]"
+        elif isinstance(value, (list, dict)):
+            try:
+                encoded = json.dumps(value, ensure_ascii=False, default=str)
+            except TypeError:
+                encoded = str(value)
+            if len(encoded) > 8000:
+                return {
+                    "ok": False,
+                    "error": (
+                        "browser_evaluate result too large; "
+                        "narrow the expression instead of dumping broad page content"
+                    ),
+                    "page_state": self.export_page_state(),
+                }
+        return {
+            "ok": True,
+            "value": value,
+            "page_state": self.export_page_state(),
+        }
+
+    async def drag(
+        self,
+        *,
+        generation_id: str,
+        source_target_id: str = "",
+        source_ref: str = "",
+        source_selector: str = "",
+        target_target_id: str = "",
+        target_ref: str = "",
+        target_selector: str = "",
+        steps: int = 10,
+    ) -> Dict[str, Any]:
+        """Drag from source to target via BrowserDriver (catalog ``browser_drag``)."""
+        await self.ensure_runtime_ready()
+        try:
+            source = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=source_target_id,
+                ref=source_ref,
+                selector=source_selector,
+                op="drag",
+            )
+            target = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_target_id,
+                ref=target_ref,
+                selector=target_selector,
+                op="drop",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_drag failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.drag(source, target, steps=max(1, int(steps or 10)))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_drag failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def file_upload(
+        self,
+        *,
+        generation_id: str,
+        paths: list[str] | tuple[str, ...],
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+    ) -> Dict[str, Any]:
+        """Upload files to an input via BrowserDriver (catalog ``browser_file_upload``)."""
+        await self.ensure_runtime_ready()
+        path_list = [str(path).strip() for path in (paths or []) if str(path).strip()]
+        if not path_list:
+            return {
+                "ok": False,
+                "error": "'paths' must contain at least one file path",
+                "page_state": self.export_page_state(),
+            }
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="file_upload",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_file_upload failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.upload_files(element_ref, path_list)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_file_upload failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "paths": path_list,
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def fill_form(
+        self,
+        *,
+        generation_id: str,
+        fields: list[Dict[str, Any]] | tuple[Dict[str, Any], ...],
+    ) -> Dict[str, Any]:
+        """Fill multiple form fields by composing type/select/set_checked."""
+        await self.ensure_runtime_ready()
+        if not isinstance(fields, (list, tuple)) or not fields:
+            return {
+                "ok": False,
+                "error": "'fields' must be a non-empty list",
+                "page_state": self.export_page_state(),
+            }
+        results: list[Dict[str, Any]] = []
+        for index, field in enumerate(fields):
+            if not isinstance(field, dict):
+                return {
+                    "ok": False,
+                    "error": f"fields[{index}] must be an object",
+                    "results": results,
+                    "page_state": self.export_page_state(),
+                }
+            field_type = str(field.get("type") or "textbox").strip().lower() or "textbox"
+            target_id = str(field.get("target_id") or "").strip()
+            ref = str(field.get("ref") or "").strip()
+            selector = str(field.get("selector") or "").strip()
+            value = field.get("value")
+            if field_type in {"textbox", "slider", "spinbutton", "searchbox"}:
+                step = await self.type_text(
+                    generation_id=generation_id,
+                    text="" if value is None else str(value),
+                    target_id=target_id,
+                    ref=ref,
+                    selector=selector,
+                    clear=True,
+                    press_enter=False,
+                    sensitive=bool(field.get("sensitive", False)),
+                )
+            elif field_type in {"combobox", "listbox", "select"}:
+                step = await self.select_option(
+                    generation_id=generation_id,
+                    target_id=target_id,
+                    ref=ref,
+                    selector=selector,
+                    value=None if value is None else str(value),
+                    label=str(field["label"]) if field.get("label") not in (None, "") else None,
+                )
+            elif field_type in {"checkbox", "radio", "switch"}:
+                try:
+                    element_ref = await self._resolve_catalog_element_ref(
+                        generation_id=generation_id,
+                        target_id=target_id,
+                        ref=ref,
+                        selector=selector,
+                        op="set_checked",
+                    )
+                except Exception as exc:
+                    step = {
+                        "ok": False,
+                        "error": f"browser_fill_form fields[{index}] failed: {exc}",
+                        "page_state": self.export_page_state(),
+                    }
+                else:
+                    checked = value if isinstance(value, bool) else str(value).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                        "checked",
+                    }
+                    driver = await self._ensure_browser_driver()
+                    try:
+                        act = await driver.set_checked(element_ref, checked)
+                    except Exception as exc:
+                        step = {
+                            "ok": False,
+                            "error": f"browser_fill_form fields[{index}] failed: {exc}",
+                            "page_state": self.export_page_state(),
+                        }
+                    else:
+                        self._apply_document_changed(changed=bool(act.document_changed))
+                        step = {
+                            "ok": bool(act.ok),
+                            "detail": act.detail,
+                            "changed_document": bool(act.document_changed),
+                            "error": None if act.ok else act.detail,
+                            "page_state": self.export_page_state(),
+                        }
+            else:
+                step = {
+                    "ok": False,
+                    "error": f"fields[{index}] unsupported type={field_type!r}",
+                    "page_state": self.export_page_state(),
+                }
+            results.append({"index": index, "type": field_type, **{k: v for k, v in step.items() if k != "page_state"}})
+            if not step.get("ok", False):
+                return {
+                    "ok": False,
+                    "error": step.get("error") or f"fields[{index}] failed",
+                    "results": results,
+                    "page_state": self.export_page_state(),
+                }
+        return {
+            "ok": True,
+            "results": results,
+            "page_state": self.export_page_state(),
+        }
+
+    async def snapshot(self, *, include_screenshot: bool = False) -> Dict[str, Any]:
+        """Observe the page via BrowserDriver (catalog ``browser_snapshot``)."""
+        await self.ensure_runtime_ready()
+        driver = await self._ensure_browser_driver()
+        try:
+            observation = await driver.observe(
+                include_dom=True,
+                include_screenshot=bool(include_screenshot),
+                cached=False,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_snapshot failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._observe_page_url(observation.url)
+        self._ensure_page_state().observe(title=observation.title)
+        self._register_observation_targets(observation)
+        if observation.ax_text:
+            self._register_snapshot_refs(observation.ax_text, replace=True)
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "url": observation.url,
+            "title": observation.title,
+            "ax_text": observation.ax_text or "",
+            "pixels_above": observation.pixels_above,
+            "pixels_below": observation.pixels_below,
+            "errors": list(observation.errors),
+            "page_state": self.export_page_state(),
+        }
+        if include_screenshot and observation.screenshot_b64:
+            payload["screenshot_b64"] = observation.screenshot_b64
+        return payload
+
     async def run_custom_action(
         self,
         *,
@@ -3104,8 +3880,19 @@ class BrowserRuntimeRail(AgentRail):
     def _canonicalize_tool_name(self, tool_name: str) -> str:
         canonical = canonicalize_playwright_tool_name(tool_name)
         normalized = canonical.strip().lower()
-        if not normalized.startswith("browser_") or normalized in _BROWSER_RUNTIME_TOOL_NAMES:
+        if not normalized.startswith("browser_"):
             return canonical
+        # Helpers never have an MCP twin.
+        if normalized in _BROWSER_RUNTIME_HELPER_TOOL_NAMES:
+            return canonical
+        # Catalog tools stay bare on BrowserDriver; MCP path rewrites to mcp_*.
+        # browser_navigate is always bare (B4 local Tool on both paths).
+        if normalized in _BROWSER_CATALOG_RUNTIME_TOOL_NAMES:
+            if normalized == "browser_navigate":
+                return canonical
+            uses_driver = getattr(self._runtime, "_uses_browser_driver", None)
+            if callable(uses_driver) and uses_driver() is True:
+                return canonical
         configured = set(self._runtime.service.allowed_tool_names or CORE_BROWSER_TOOL_NAMES)
         if normalized not in configured:
             return canonical
@@ -5257,6 +6044,10 @@ class BrowserRuntimeRail(AgentRail):
         return tuple(tool_name for tool_name in configured if tool_name not in _BROWSER_SCREENSHOT_TOOL_NAMES)
 
     async def _ensure_browser_mcp_ability(self, ctx: AgentCallbackContext) -> None:
+        # BrowserDriver path registers bare catalog Tools; do not attach MCP twins.
+        uses_driver = getattr(self._runtime, "_uses_browser_driver", None)
+        if callable(uses_driver) and uses_driver() is True:
+            return
         agent = getattr(ctx, "agent", None)
         ability_manager = getattr(agent, "ability_manager", None)
         if ability_manager is None:

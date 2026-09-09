@@ -49,12 +49,7 @@ _CLEAR_CANCEL_PARAMS: Dict[str, Any] = {
     "required": ["session_id"],
 }
 
-_NAVIGATE_DESC = (
-    "Navigate the browser to a URL. "
-    "Use this first when the task already contains a known URL "
-    "(instead of probing or custom_action on about:blank). "
-    "Returns the resulting page URL/title and PageState."
-)
+_NAVIGATE_DESC = "Navigate to a URL."
 _NAVIGATE_PARAMS: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -64,7 +59,7 @@ _NAVIGATE_PARAMS: Dict[str, Any] = {
         },
         "wait_until": {
             "type": "string",
-            "description": "Navigation wait condition forwarded to the driver. Default load.",
+            "description": "Navigation wait condition. Default load.",
         },
         "timeout_ms": {
             "type": "integer",
@@ -72,6 +67,246 @@ _NAVIGATE_PARAMS: Dict[str, Any] = {
         },
     },
     "required": ["url"],
+}
+
+_NAVIGATE_BACK_DESC = "Navigate back in browser history."
+_NAVIGATE_BACK_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+_ELEMENT_TARGET_PROPERTIES: Dict[str, Any] = {
+    "generation_id": {
+        "type": "string",
+        "description": "Current PageState generation_id for the element target.",
+    },
+    "target_id": {
+        "type": "string",
+        "description": "Generation-scoped target_id from PageState / probes.",
+    },
+    "ref": {
+        "type": "string",
+        "description": "Element ref from the current page observation.",
+    },
+    "selector": {
+        "type": "string",
+        "description": "CSS selector when a validated selector is already known.",
+    },
+}
+
+_CLICK_DESC = "Click an element."
+_CLICK_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+        "button": {
+            "type": "string",
+            "description": "Mouse button: left, right, or middle. Default left.",
+        },
+        "click_count": {
+            "type": "integer",
+            "description": "Number of clicks. Default 1.",
+        },
+    },
+    "required": ["generation_id"],
+}
+
+_TYPE_DESC = "Type text into an element."
+_TYPE_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+        "text": {
+            "type": "string",
+            "description": "Text to type into the element.",
+        },
+        "clear": {
+            "type": "boolean",
+            "description": "Clear existing content before typing. Default true.",
+        },
+        "press_enter": {
+            "type": "boolean",
+            "description": "Press Enter after typing. Default false.",
+        },
+        "sensitive": {
+            "type": "boolean",
+            "description": "Mark input as sensitive (e.g. password). Default false.",
+        },
+    },
+    "required": ["generation_id", "text"],
+}
+
+_PRESS_KEY_DESC = "Press a keyboard key or key combination."
+_PRESS_KEY_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "key": {
+            "type": "string",
+            "description": "Key or combination, e.g. Enter, Control+a, Escape.",
+        },
+    },
+    "required": ["key"],
+}
+
+_SCREENSHOT_DESC = "Take a screenshot of the current page."
+_SCREENSHOT_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "full_page": {
+            "type": "boolean",
+            "description": "Capture the full scrollable page. Default false.",
+        },
+    },
+    "required": [],
+}
+
+_TABS_DESC = "List, select, or close browser tabs."
+_TABS_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "description": "Tab action: list, select, or close. Default list.",
+            "enum": ["list", "select", "close"],
+        },
+        "index": {
+            "type": "integer",
+            "description": "Zero-based tab index for select/close.",
+        },
+    },
+    "required": [],
+}
+
+_CLOSE_DESC = "Close the active browser tab."
+_CLOSE_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+_SELECT_OPTION_DESC = "Select an option from a native select element."
+_SELECT_OPTION_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+        "value": {
+            "type": "string",
+            "description": "Option value attribute to select.",
+        },
+        "label": {
+            "type": "string",
+            "description": "Visible option label to select.",
+        },
+    },
+    "required": ["generation_id"],
+}
+
+_EVALUATE_DESC = "Evaluate a small JavaScript expression in the page. Do not dump the full document."
+_EVALUATE_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "function": {
+            "type": "string",
+            "description": "JavaScript source to evaluate (expression or function body).",
+        },
+        "args": {
+            "description": "Optional JSON-serializable argument passed to the script.",
+        },
+    },
+    "required": ["function"],
+}
+
+_DRAG_DESC = "Drag from a source element to a target element."
+_DRAG_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "generation_id": _ELEMENT_TARGET_PROPERTIES["generation_id"],
+        "source_target_id": {
+            "type": "string",
+            "description": "Source element target_id from PageState.",
+        },
+        "source_ref": {
+            "type": "string",
+            "description": "Source element ref.",
+        },
+        "source_selector": {
+            "type": "string",
+            "description": "Source CSS selector.",
+        },
+        "target_target_id": {
+            "type": "string",
+            "description": "Target element target_id from PageState.",
+        },
+        "target_ref": {
+            "type": "string",
+            "description": "Target element ref.",
+        },
+        "target_selector": {
+            "type": "string",
+            "description": "Target CSS selector.",
+        },
+        "steps": {
+            "type": "integer",
+            "description": "Intermediate drag steps. Default 10.",
+        },
+    },
+    "required": ["generation_id"],
+}
+
+_FILE_UPLOAD_DESC = "Upload one or more files to a file input element."
+_FILE_UPLOAD_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+        "paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Absolute or workspace-relative file paths to upload.",
+        },
+    },
+    "required": ["generation_id", "paths"],
+}
+
+_FILL_FORM_DESC = "Fill multiple form fields in one call (type / select / checkbox)."
+_FILL_FORM_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "generation_id": _ELEMENT_TARGET_PROPERTIES["generation_id"],
+        "fields": {
+            "type": "array",
+            "description": "Ordered field fill steps.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "Field type: textbox, combobox/select, checkbox/radio.",
+                    },
+                    "target_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "value": {},
+                    "label": {"type": "string"},
+                    "sensitive": {"type": "boolean"},
+                },
+                "required": [],
+            },
+        },
+    },
+    "required": ["generation_id", "fields"],
+}
+
+_SNAPSHOT_DESC = "Capture an accessibility/page observation of the current page."
+_SNAPSHOT_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "include_screenshot": {
+            "type": "boolean",
+            "description": "Include a screenshot in the observation. Default false.",
+        },
+    },
+    "required": [],
 }
 
 _CUSTOM_ACTION_DESC = (
@@ -579,6 +814,541 @@ class BrowserNavigateTool(Tool):
             yield None
 
 
+class BrowserNavigateBackTool(Tool):
+    """Navigate back via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_navigate_back",
+                description=_NAVIGATE_BACK_DESC,
+                input_params=_NAVIGATE_BACK_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del inputs, kwargs
+        try:
+            result = await self._runtime.navigate_back()
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+def _parse_generation_id(inputs: Dict[str, Any]) -> str | ToolOutput:
+    generation_id = str(inputs.get("generation_id") or "").strip()
+    if not generation_id:
+        return ToolOutput(success=False, error="'generation_id' is required")
+    return generation_id
+
+
+class BrowserClickTool(Tool):
+    """Click an element via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_click",
+                description=_CLICK_DESC,
+                input_params=_CLICK_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        click_count_raw = inputs.get("click_count", 1)
+        try:
+            click_count = int(click_count_raw if click_count_raw not in (None, "") else 1)
+        except (TypeError, ValueError):
+            return ToolOutput(success=False, error="'click_count' must be an integer")
+        try:
+            result = await self._runtime.click(
+                generation_id=generation_id,
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+                button=str(inputs.get("button") or "left").strip() or "left",
+                click_count=click_count,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserTypeTool(Tool):
+    """Type text into an element via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_type",
+                description=_TYPE_DESC,
+                input_params=_TYPE_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        clear_raw = inputs.get("clear", True)
+        if isinstance(clear_raw, str):
+            clear = clear_raw.strip().lower() not in {"0", "false", "no"}
+        else:
+            clear = bool(clear_raw)
+        press_enter_raw = inputs.get("press_enter", False)
+        if isinstance(press_enter_raw, str):
+            press_enter = press_enter_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            press_enter = bool(press_enter_raw)
+        sensitive_raw = inputs.get("sensitive", False)
+        if isinstance(sensitive_raw, str):
+            sensitive = sensitive_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            sensitive = bool(sensitive_raw)
+        try:
+            result = await self._runtime.type_text(
+                generation_id=generation_id,
+                text=str(inputs.get("text") or ""),
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+                clear=clear,
+                press_enter=press_enter,
+                sensitive=sensitive,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserPressKeyTool(Tool):
+    """Press a key via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_press_key",
+                description=_PRESS_KEY_DESC,
+                input_params=_PRESS_KEY_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        try:
+            result = await self._runtime.press_key(keys=str(inputs.get("key") or ""))
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserTakeScreenshotTool(Tool):
+    """Take a screenshot via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_take_screenshot",
+                description=_SCREENSHOT_DESC,
+                input_params=_SCREENSHOT_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        full_page_raw = inputs.get("full_page", False)
+        if isinstance(full_page_raw, str):
+            full_page = full_page_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            full_page = bool(full_page_raw)
+        try:
+            result = await self._runtime.take_screenshot(full_page=full_page)
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserTabsTool(Tool):
+    """List, select, or close tabs via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_tabs",
+                description=_TABS_DESC,
+                input_params=_TABS_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        index_raw = inputs.get("index")
+        index: int | None
+        if index_raw in (None, ""):
+            index = None
+        else:
+            try:
+                index = int(index_raw)
+            except (TypeError, ValueError):
+                return ToolOutput(success=False, error="'index' must be an integer")
+        try:
+            result = await self._runtime.tabs(
+                action=str(inputs.get("action") or "list"),
+                index=index,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserCloseTool(Tool):
+    """Close the active tab via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_close",
+                description=_CLOSE_DESC,
+                input_params=_CLOSE_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del inputs, kwargs
+        try:
+            result = await self._runtime.close_page()
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserSelectOptionTool(Tool):
+    """Select a native option via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_select_option",
+                description=_SELECT_OPTION_DESC,
+                input_params=_SELECT_OPTION_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        try:
+            result = await self._runtime.select_option(
+                generation_id=generation_id,
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+                value=None if inputs.get("value") in (None, "") else str(inputs.get("value")),
+                label=None if inputs.get("label") in (None, "") else str(inputs.get("label")),
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserEvaluateTool(Tool):
+    """Evaluate a small page script via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_evaluate",
+                description=_EVALUATE_DESC,
+                input_params=_EVALUATE_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        try:
+            result = await self._runtime.evaluate(
+                source=str(inputs.get("function") or inputs.get("source") or ""),
+                args=inputs.get("args"),
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserDragTool(Tool):
+    """Drag between two elements via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_drag",
+                description=_DRAG_DESC,
+                input_params=_DRAG_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        steps_raw = inputs.get("steps", 10)
+        try:
+            steps = int(steps_raw if steps_raw not in (None, "") else 10)
+        except (TypeError, ValueError):
+            return ToolOutput(success=False, error="'steps' must be an integer")
+        try:
+            result = await self._runtime.drag(
+                generation_id=generation_id,
+                source_target_id=str(inputs.get("source_target_id") or "").strip(),
+                source_ref=str(inputs.get("source_ref") or "").strip(),
+                source_selector=str(inputs.get("source_selector") or "").strip(),
+                target_target_id=str(inputs.get("target_target_id") or "").strip(),
+                target_ref=str(inputs.get("target_ref") or "").strip(),
+                target_selector=str(inputs.get("target_selector") or "").strip(),
+                steps=steps,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserFileUploadTool(Tool):
+    """Upload files via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_file_upload",
+                description=_FILE_UPLOAD_DESC,
+                input_params=_FILE_UPLOAD_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        paths_raw = inputs.get("paths")
+        if not isinstance(paths_raw, list):
+            return ToolOutput(success=False, error="'paths' must be a list of strings")
+        try:
+            result = await self._runtime.file_upload(
+                generation_id=generation_id,
+                paths=[str(path) for path in paths_raw],
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserFillFormTool(Tool):
+    """Fill multiple form fields via composed driver actions."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_fill_form",
+                description=_FILL_FORM_DESC,
+                input_params=_FILL_FORM_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        fields = inputs.get("fields")
+        if not isinstance(fields, list):
+            return ToolOutput(success=False, error="'fields' must be a list")
+        try:
+            result = await self._runtime.fill_form(generation_id=generation_id, fields=fields)
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserSnapshotTool(Tool):
+    """Capture a page observation via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_snapshot",
+                description=_SNAPSHOT_DESC,
+                input_params=_SNAPSHOT_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        include_raw = inputs.get("include_screenshot", False)
+        if isinstance(include_raw, str):
+            include_screenshot = include_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            include_screenshot = bool(include_raw)
+        try:
+            result = await self._runtime.snapshot(include_screenshot=include_screenshot)
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
 class BrowserCancelTool(Tool):
     """Cancel an in-progress browser task."""
 
@@ -908,20 +1678,29 @@ def build_browser_runtime_tools(
     runtime: "BrowserAgentRuntime",
     language: str = "cn",
 ) -> List[Tool]:
-    """Build browser helper tools backed by ``BrowserAgentRuntime``.
+    """Build model-facing browser tools backed by ``BrowserAgentRuntime``.
 
-    Includes first-class ``browser_navigate`` for the BrowserDriver (BU) path,
-    plus probes, batch interact, and other deterministic helpers.
+    On the BrowserDriver path this returns only registered CORE catalog tools
+    plus session-control exceptions (cancel / clear_cancel). Probe / batch /
+    custom_action helpers remain as internal runtime APIs and are not injected.
     """
 
     return [
         BrowserNavigateTool(runtime, language),
+        BrowserNavigateBackTool(runtime, language),
+        BrowserClickTool(runtime, language),
+        BrowserTypeTool(runtime, language),
+        BrowserPressKeyTool(runtime, language),
+        BrowserTakeScreenshotTool(runtime, language),
+        BrowserTabsTool(runtime, language),
+        BrowserCloseTool(runtime, language),
+        BrowserSelectOptionTool(runtime, language),
+        BrowserEvaluateTool(runtime, language),
+        BrowserDragTool(runtime, language),
+        BrowserFileUploadTool(runtime, language),
+        BrowserFillFormTool(runtime, language),
+        BrowserSnapshotTool(runtime, language),
+        # Non-CORE exceptions: session cancellation control for long-running tasks.
         BrowserCancelTool(runtime, language),
         BrowserClearCancelTool(runtime, language),
-        BrowserProbeInteractivesTool(runtime, language),
-        BrowserProbeCardsTool(runtime, language),
-        BrowserBatchInteractTool(runtime, language),
-        BrowserCustomActionTool(runtime, language),
-        BrowserListActionsTool(runtime, language),
-        BrowserRuntimeHealthTool(runtime, language),
     ]
