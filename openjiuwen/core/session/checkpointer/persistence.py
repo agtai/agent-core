@@ -329,6 +329,7 @@ class WorkflowStorage(BaseStorage):
     _UPDATE_BLOBS = "workflow_update_blobs"
     _UPDATE_BLOBS_DUMP_TYPE = "workflow_update_blobs_dump_type"
     _KEY_NUMS = 4
+    _RESUME_PROOF = "workflow_resume_proof"
 
     def _process_interactive_inputs(self, session: BaseSession, inputs: InteractiveInput) -> None:
         """Process interactive inputs and update workflow state."""
@@ -349,7 +350,7 @@ class WorkflowStorage(BaseStorage):
                 node_session.state().update({INTERACTIVE_INPUT: [value]})
         session.state().commit()
 
-    async def save(self, session: BaseSession):
+    async def save(self, session: BaseSession, *, graph_blob=None):
         """Save workflow state to KV store."""
         state = session.state().get_state(copied=False)
         workflow_id = session.workflow_id()
@@ -394,6 +395,16 @@ class WorkflowStorage(BaseStorage):
             has_operations = True
 
         if has_operations:
+            proof = ""
+            if graph_blob is not None and state_blob and updates_blob:
+                from openjiuwen.core.session.checkpointer.workflow_resume import checkpoint_proof
+                try:
+                    proof = checkpoint_proof(session_id, workflow_id, state_blob, updates_blob, graph_blob)
+                except (ValueError, TypeError):
+                    # Invalid graph bytes must not break legacy state saving.
+                    pass
+            await pipeline.set(build_key_with_namespace(
+                session_id, SESSION_NAMESPACE_WORKFLOW, workflow_id, self._RESUME_PROOF), proof)
             try:
                 await pipeline.execute()
                 session_logger.debug(
@@ -507,7 +518,8 @@ class WorkflowStorage(BaseStorage):
         # Use batch_delete for multiple keys
         deleted = await self._kv_store.batch_delete([
             state_dump_type_key, state_blob_key,
-            state_updates_dump_type_key, state_updates_blob_key
+            state_updates_dump_type_key, state_updates_blob_key,
+            build_key_with_namespace(session_id, SESSION_NAMESPACE_WORKFLOW, workflow_id, self._RESUME_PROOF),
         ])
         session_logger.debug(
             "Workflow checkpoint cleared",
@@ -743,6 +755,66 @@ class PersistenceCheckpointer(Checkpointer):
         self._workflow_storage = WorkflowStorage(kv_store)
         self._graph_state = GraphStore(kv_store)
 
+    async def prepare_workflow_resume(self, session, inputs, *, before_effect):
+        from openjiuwen.core.session.checkpointer.workflow_resume import (
+            WorkflowResumeError, checkpoint_proof, normalized_blob, prepare_snapshot, _sync_admit,
+        )
+        # This built-in store performs a single SELECT for all requested keys.
+        # An arbitrary BaseKVStore pipeline does not promise a consistent read.
+        if type(self._kv_store) is not DbBasedKVStore or self._kv_store.engine.dialect.name != "sqlite":
+            raise WorkflowResumeError("strict_resume_unsupported")
+        sid, wid = session.session_id(), session.workflow_id()
+        kv, storage, graph_store = self._kv_store, self._workflow_storage, self._graph_state
+        pipeline = kv.pipeline()
+        for suffix in (storage._STATE_BLOBS_DUMP_TYPE, storage._STATE_BLOBS,
+                       storage._UPDATE_BLOBS_DUMP_TYPE, storage._UPDATE_BLOBS, storage._RESUME_PROOF):
+            await pipeline.get(build_key_with_namespace(sid, SESSION_NAMESPACE_WORKFLOW, wid, suffix))
+        for suffix in (graph_store._DATA_TYPE, graph_store._DATA_VALUE):
+            await pipeline.get(build_key_with_namespace(sid, WORKFLOW_NAMESPACE_GRAPH, wid, suffix))
+        values = await pipeline.execute()
+
+        def require_owner():
+            if self._kv_store is not kv or self._workflow_storage is not storage or self._graph_state is not graph_store:
+                raise WorkflowResumeError("strict_resume_owner_mismatch")
+
+        require_owner()
+        try:
+            if len(values) != 7:
+                raise WorkflowResumeError("strict_resume_checkpoint_missing")
+            state_blob, updates_blob, graph_blob = values[:2], values[2:4], values[5:7]
+            proof = values[4].decode("utf-8") if isinstance(values[4], bytes) else values[4]
+            if not proof or proof != checkpoint_proof(sid, wid, state_blob, updates_blob, graph_blob):
+                raise WorkflowResumeError("strict_resume_checkpoint_unproven")
+            prepared = prepare_snapshot(session, inputs,
+                storage._serde.loads_typed(normalized_blob(state_blob)),
+                storage._serde.loads_typed(normalized_blob(updates_blob)),
+                graph_store._serde.loads_typed(normalized_blob(graph_blob)))
+        except WorkflowResumeError:
+            raise
+        except Exception as error:
+            raise WorkflowResumeError("strict_resume_checkpoint_invalid") from error
+        _sync_admit(before_effect)
+        require_owner()
+        prepared.apply(session)
+        return prepared
+
+    async def _save_workflow_checkpoint(self, session):
+        # Pair the workflow parts with the already-saved graph. A later change
+        # to either part invalidates strict recovery, while legacy recovery is
+        # unchanged when no graph proof can be obtained.
+        sid, wid = session.session_id(), session.workflow_id()
+        graph_blob = None
+        try:
+            pipeline = self._kv_store.pipeline()
+            for suffix in (self._graph_state._DATA_TYPE, self._graph_state._DATA_VALUE):
+                await pipeline.get(build_key_with_namespace(sid, WORKFLOW_NAMESPACE_GRAPH, wid, suffix))
+            values = await pipeline.execute()
+            if len(values) == 2 and all(value is not None for value in values):
+                graph_blob = values
+        except Exception:
+            pass
+        await self._workflow_storage.save(session, graph_blob=graph_blob)
+
     async def pre_agent_execute(self, session: BaseSession, inputs):
         """Prepare agent execution by recovering agent state."""
         session_logger.info(
@@ -870,7 +942,7 @@ class PersistenceCheckpointer(Checkpointer):
                 workflow_id=workflow_id,
                 metadata={"reason": "exception", "storage_type": "persistence"}
             )
-            await self._workflow_storage.save(session)
+            await self._save_workflow_checkpoint(session)
             raise exception
 
         if result.get(TASK_STATUS_INTERRUPT) is None:
@@ -891,7 +963,7 @@ class PersistenceCheckpointer(Checkpointer):
                 workflow_id=workflow_id,
                 metadata={"reason": "interaction_required", "storage_type": "persistence"}
             )
-            await self._workflow_storage.save(session)
+            await self._save_workflow_checkpoint(session)
 
     async def session_exists(self, session_id: str) -> bool:
         """

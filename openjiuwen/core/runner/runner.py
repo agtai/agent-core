@@ -57,6 +57,7 @@ from openjiuwen.core.workflow import (
 
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.runtime import TeamRuntimeManager
+    from openjiuwen.core.session.checkpointer.workflow_resume import WorkflowResumeGuard
 
 
 class _RunnerImpl(_TeamRunnerMixin):
@@ -362,7 +363,8 @@ class _RunnerImpl(_TeamRunnerMixin):
                            *,
                            session: Optional[str | WorkflowSession | AgentSession] = None,
                            context: ModelContext = None,
-                           envs: Optional[dict[str, Any]] = None):
+                           envs: Optional[dict[str, Any]] = None,
+                           resume_guard: Optional["WorkflowResumeGuard"] = None):
         """
         Execute a workflow with given inputs.
 
@@ -372,10 +374,13 @@ class _RunnerImpl(_TeamRunnerMixin):
             session: Existing session ID or Session instance for context persistence
             context: model context
             envs: Environment variables or configuration overrides,
+            resume_guard: Require a proven interrupted checkpoint and synchronous admission before restoration.
         """
         with self._root_task_group_scope():
             workflow_instance, workflow_session = await self._prepare_workflow(workflow, session)
-            return await workflow_instance.invoke(inputs, session=workflow_session, context=context)
+            from openjiuwen.core.session.checkpointer.workflow_resume import workflow_resume_scope
+            with workflow_resume_scope(workflow_instance, workflow_session, inputs, resume_guard):
+                return await workflow_instance.invoke(inputs, session=workflow_session, context=context)
 
     async def run_workflow_streaming(self,
                                      workflow: str | Workflow,
@@ -765,7 +770,8 @@ class Runner(_TeamRunnerClassMixin):
         *,
             session: Optional[str | WorkflowSession | AgentSession] = None,
         context: Optional[ModelContext] = None,
-        envs: Optional[dict[str, Any]] = None
+        envs: Optional[dict[str, Any]] = None,
+        resume_guard: Optional["WorkflowResumeGuard"] = None,
     ) -> Any:
         """
         Execute a workflow with given inputs.
@@ -776,13 +782,15 @@ class Runner(_TeamRunnerClassMixin):
             session: Existing session ID or Session instance for context persistence
             context: model context
             envs: Environment variables or configuration overrides
+            resume_guard: Require a proven interrupted checkpoint and synchronous admission before restoration.
         """
         return await GLOBAL_RUNNER.run_workflow(
             workflow=workflow,
             inputs=inputs,
             session=session,
             context=context,
-            envs=envs
+            envs=envs,
+            resume_guard=resume_guard,
         )
     
     @classmethod

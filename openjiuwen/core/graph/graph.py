@@ -316,6 +316,7 @@ class CompiledGraph(ExecutableGraph):
         is_main = False
         session_id = session.session_id()
         workflow_id = session.workflow_id()
+        strict_preparing = False
 
         if config is None:
             is_main = True
@@ -323,7 +324,17 @@ class CompiledGraph(ExecutableGraph):
 
         try:
             if is_main:
-                await self._checkpointer.pre_workflow_execute(session, inputs)
+                target = getattr(session, "_strict_resume_target", None)
+                if target is None:
+                    await self._checkpointer.pre_workflow_execute(session, inputs)
+                else:
+                    from openjiuwen.core.session.checkpointer.workflow_resume import PREPARED_WORKFLOW_RESUME
+                    strict_preparing = True
+                    target.validate(session, self._checkpointer)
+                    prepared = await self._checkpointer.prepare_workflow_resume(
+                        session, inputs, before_effect=lambda: target.admit(session, self._checkpointer))
+                    config[PREPARED_WORKFLOW_RESUME] = prepared
+                    strict_preparing = False
             if not isinstance(inputs, InteractiveInput):
                 session.state().commit_user_inputs(inputs)
 
@@ -347,7 +358,7 @@ class CompiledGraph(ExecutableGraph):
             elif exception is not None:
                 raise exception
         except asyncio.CancelledError:
-            if is_main:
+            if is_main and not strict_preparing:
                 await self._checkpointer.post_workflow_execute(session, {}, None)
             raise
 

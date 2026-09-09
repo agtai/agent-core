@@ -29,6 +29,43 @@ class InMemoryCheckpointer(Checkpointer):
         self._graph_store = InMemoryStore()
         self._session_to_workflow_ids = {}
 
+    async def prepare_workflow_resume(self, session, inputs, *, before_effect):
+        from openjiuwen.core.session.checkpointer.workflow_resume import (
+            WorkflowResumeError, checkpoint_proof, prepare_snapshot, _sync_admit,
+        )
+        sid, wid = session.session_id(), session.workflow_id()
+        storage, graph_store = self._workflow_stores.get(sid), self._graph_store
+        if storage is None:
+            raise WorkflowResumeError("strict_resume_checkpoint_missing")
+        state_blob, updates_blob = storage.state_blobs.get(wid), storage.state_updates_blobs.get(wid)
+        proof = storage.resume_proofs.get(wid)
+        original_graph = graph_store.store_ck.get(sid, {}).get(wid)
+        graph = await graph_store.get(sid, wid)
+
+        def require_unchanged():
+            if (self._workflow_stores.get(sid) is not storage or self._graph_store is not graph_store
+                    or storage.state_blobs.get(wid) is not state_blob
+                    or storage.state_updates_blobs.get(wid) is not updates_blob
+                    or storage.resume_proofs.get(wid) != proof
+                    or graph_store.store_ck.get(sid, {}).get(wid) is not original_graph):
+                raise WorkflowResumeError("strict_resume_checkpoint_changed")
+
+        require_unchanged()
+        try:
+            actual_proof = checkpoint_proof(sid, wid, state_blob, updates_blob, storage.serde.dumps_typed(graph))
+            if proof is None or proof != actual_proof:
+                raise WorkflowResumeError("strict_resume_checkpoint_unproven")
+            prepared = prepare_snapshot(session, inputs, storage.serde.loads_typed(state_blob),
+                                        storage.serde.loads_typed(updates_blob), graph)
+        except WorkflowResumeError:
+            raise
+        except Exception as error:
+            raise WorkflowResumeError("strict_resume_checkpoint_invalid") from error
+        _sync_admit(before_effect)
+        require_unchanged()
+        prepared.apply(session)
+        return prepared
+
     async def pre_workflow_execute(self, session: BaseSession, inputs: InteractiveInput):
         session_id = session.session_id()
         workflow_id = session.workflow_id()
@@ -120,7 +157,16 @@ class InMemoryCheckpointer(Checkpointer):
             workflow_id=workflow_id,
             metadata={"storage_type": "inmemory"}
         )
-        await workflow_store.save(session)
+        graph = self._graph_store.store_ck.get(session_id, {}).get(workflow_id)
+        graph_blob = None
+        if graph is not None:
+            try:
+                graph_blob = workflow_store.serde.dumps_typed(graph)
+            except Exception:
+                # Legacy in-memory graphs can contain non-serializable values.
+                # Preserve their existing recovery without asserting a proof.
+                pass
+        await workflow_store.save(session, graph_blob=graph_blob)
         workflow_ids.add(workflow_id)
         session_logger.info(
             f"Succeed to save workflow checkpoint on {reason}",
@@ -452,8 +498,9 @@ class WorkflowStorage(Storage):
             str,
             tuple[str, bytes]
         ] = {}
+        self.resume_proofs = {}
 
-    async def save(self, session: BaseSession):
+    async def save(self, session: BaseSession, *, graph_blob=None):
         workflow_id = session.workflow_id()
         state = session.state().get_state(copied=False)
         state_blob = self.serde.dumps_typed(state)
@@ -464,6 +511,11 @@ class WorkflowStorage(Storage):
         updates_blob = self.serde.dumps_typed(updates)
         if updates_blob:
             self.state_updates_blobs[workflow_id] = updates_blob
+        self.resume_proofs.pop(workflow_id, None)
+        if graph_blob is not None and state_blob and updates_blob:
+            from openjiuwen.core.session.checkpointer.workflow_resume import checkpoint_proof
+            self.resume_proofs[workflow_id] = checkpoint_proof(
+                session.session_id(), workflow_id, state_blob, updates_blob, graph_blob)
 
     async def recover(self, session: BaseSession, inputs: InteractiveInput = None):
         workflow_id = session.workflow_id()
@@ -495,6 +547,7 @@ class WorkflowStorage(Storage):
     async def clear(self, workflow_id: str):
         self.state_blobs.pop(workflow_id, None)
         self.state_updates_blobs.pop(workflow_id, None)
+        self.resume_proofs.pop(workflow_id, None)
 
     async def exists(self, session: BaseSession) -> bool:
         state_blob = self.state_blobs.get(session.workflow_id())

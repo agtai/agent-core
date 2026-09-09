@@ -236,3 +236,55 @@ when pause/stop/finalize starts. Warm resume of the same owner reopens admission
 replacement or removal of that owner never revives its old inputs.
 Legacy `interact_agent_team` still reports publication rather than this stronger
 receipt. Tool permission approval remains on its existing separate API.
+
+### Strict workflow continuation
+
+`Runner.run_workflow` accepts an optional guard for continuation of an existing
+interrupted workflow:
+
+```python
+from openjiuwen.core.workflow import WorkflowResumeGuard, WorkflowResumeError
+
+result = await Runner.run_workflow(
+    workflow,
+    interactive_input,
+    session=session_id,
+    resume_guard=WorkflowResumeGuard(before_effect=check_current_authority),
+)
+```
+
+Strict mode requires `InteractiveInput` containing answers for every interrupted
+root node. It checks the exact session and workflow scope, the selected live
+workflow/checkpointer owner, and a pairing checksum over the stored workflow
+state, updates and graph snapshot. The existing checkpointer saves that checksum
+alongside its workflow checkpoint. Mere session existence is insufficient.
+Missing, changed, damaged or unproven parts fail before restoring state, injecting
+answers or executing nodes; they never fall back to the start node. The prepared
+graph snapshot is passed directly to the original Pregel loop without a second
+storage read.
+
+Supported providers are `InMemoryCheckpointer` and `PersistenceCheckpointer`
+using the built-in SQLite `DbBasedKVStore`; SQLite reads all proof parts in one
+query. Other stores/providers, raw inputs, partial answers and nested
+loop/subworkflow interruptions are unsupported in strict mode. Answering a
+parent node does not authorize its interrupted child graph. Checkpoints saved
+by older SDK versions have no pairing proof and remain usable through the
+unchanged legacy path without `resume_guard`.
+
+The synchronous callback runs after checkpoint I/O and validation, immediately
+before session restoration and answer injection, with no intervening await. It
+must return `None` or raise; its original exception propagates. Other return
+values, including `False` and `True`, fail with
+`strict_resume_guard_result_invalid`; awaitables are also rejected. Cancellation
+while proof is pending leaves the checkpoint available. `WorkflowResumeError`
+is a `ValueError` with a machine-readable `code` such as
+`strict_resume_checkpoint_missing`, `strict_resume_checkpoint_unproven`,
+`strict_resume_owner_mismatch`, `strict_resume_inputs_unsupported` or
+`strict_resume_unsupported`.
+
+The caller continues to own run/revision/replay checks, current authorization,
+and serialization of calls against each workflow/session. This API does not
+add a scheduler, concurrent-run lock or cross-process owner restoration. The
+checksum detects checkpoint pairing errors; the trusted callback supplies
+authorization. Normal start and legacy resume calls without a guard retain
+their existing semantics.

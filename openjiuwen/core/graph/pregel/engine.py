@@ -38,7 +38,11 @@ class PregelLoop:
         self.executor = TaskExecutorPool(self.config)
         self.max_step = self.config[RECURSION_LIMIT]
         state = None
-        if self.config.get(SESSION_ID) and self.config.get(NS) and self.saver:
+        from openjiuwen.core.session.checkpointer.workflow_resume import PREPARED_WORKFLOW_RESUME
+        prepared = self.config.pop(PREPARED_WORKFLOW_RESUME, None)
+        if prepared is not None:
+            state = prepared.consume_graph(self.config[SESSION_ID], self.config[NS])
+        elif self.config.get(SESSION_ID) and self.config.get(NS) and self.saver:
             state = await self.saver.get(self.config[SESSION_ID], self.config[NS])
         if self._is_resume(state):
             # Restore barrier channel

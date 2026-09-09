@@ -10,6 +10,10 @@ from openjiuwen.core.workflow.base import (
 
 )
 from openjiuwen.core.workflow.workflow import Workflow
+from openjiuwen.core.session.checkpointer.workflow_resume import (
+    WorkflowResumeGuard as WorkflowResumeGuard,
+    WorkflowResumeError as WorkflowResumeError,
+)
 
 from openjiuwen.core.workflow.workflow_config import (
     WorkflowConfig,
@@ -83,6 +87,8 @@ _WORKFLOW_CLASSES = [
     "WorkflowOutput",
     "WorkflowChunk",
     "WorkflowExecutionState",
+    "WorkflowResumeGuard",
+    "WorkflowResumeError",
     "execute_single_component"
 ]
 

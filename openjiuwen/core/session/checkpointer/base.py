@@ -12,6 +12,11 @@ from openjiuwen.core.session.session import BaseSession
 
 
 class Checkpointer(ABC):
+    async def prepare_workflow_resume(self, session: BaseSession, inputs: InteractiveInput, *, before_effect):
+        """Opt-in exact recovery; custom providers must prove all checkpoint parts."""
+        from openjiuwen.core.session.checkpointer.workflow_resume import WorkflowResumeError
+        raise WorkflowResumeError("strict_resume_unsupported")
+
     @staticmethod
     def get_thread_id(session: BaseSession) -> str:
         return ":".join([session.session_id(), session.workflow_id()])

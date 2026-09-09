@@ -1,6 +1,7 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 import asyncio
+from copy import deepcopy
 import uuid
 from abc import ABCMeta
 from contextlib import asynccontextmanager
@@ -337,8 +338,16 @@ class Workflow(metaclass=_WorkflowMeta):
         Returns:
             WorkflowOutput containing results and metadata
         """
+        from openjiuwen.core.session.checkpointer.workflow_resume import (
+            get_workflow_resume_target, WorkflowResumeError,
+        )
+        resume_target = get_workflow_resume_target(self, session, inputs)
         if kwargs.get("is_sub"):
+            if resume_target is not None:
+                raise WorkflowResumeError("strict_resume_owner_mismatch")
             return await self._sub_invoke(inputs, session, context, **kwargs)
+        if resume_target is not None:
+            inputs = deepcopy(resume_target.inputs)
         self._validate_session(session)
         self._validate_inputs(inputs, **kwargs)
         self._install_asyncio_exception_handler()
@@ -350,6 +359,9 @@ class Workflow(metaclass=_WorkflowMeta):
             inputs=inputs,
         )
         workflow_session = self._create_workflow_session(session, stream_modes=[BaseStreamMode.OUTPUT], is_sub=False)
+        if resume_target is not None:
+            resume_target.checkpointer = workflow_session.checkpointer()
+            workflow_session._strict_resume_target = resume_target
 
         async def _invoke_task():
             chunks = []
