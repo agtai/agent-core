@@ -8,6 +8,9 @@ from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import build_error
 from openjiuwen.core.common.logging import llm_logger, LogEventType
 from openjiuwen.core.foundation.llm.call_scope import LlmCallScope
+from openjiuwen.core.foundation.llm.model_call_guard import (
+    _guard_client_inference, _model_call_target, _ModelCallGuardTimeout,
+)
 from openjiuwen.core.foundation.llm.model_clients import create_model_client
 from openjiuwen.core.foundation.llm.schema.message import BaseMessage, AssistantMessage, UserMessage
 from openjiuwen.core.foundation.llm.schema.message_chunk import AssistantMessageChunk
@@ -68,7 +71,7 @@ class Model:
             "model_client_config": model_client_config,
         }
 
-        fn = self._client.invoke
+        fn = _guard_client_inference(self._client, self._client.invoke)
         fn = _fw.emit_before(LLMCallEvents.LLM_INVOKE_INPUT, extra_kwargs=_extra)(fn)
         fn = _fw.transform_io(
             input_event=LLMCallEvents.LLM_INVOKE_INPUT,
@@ -77,7 +80,7 @@ class Model:
         fn = _fw.emit_after(LLMCallEvents.LLM_INVOKE_OUTPUT, extra_kwargs=_extra)(fn)
         self._client.invoke = fn
 
-        fn = self._client.stream
+        fn = _guard_client_inference(self._client, self._client.stream, stream=True)
         fn = _fw.emit_before(LLMCallEvents.LLM_STREAM_INPUT, extra_kwargs=_extra)(fn)
         fn = _fw.transform_io(
             input_event=LLMCallEvents.LLM_STREAM_INPUT,
@@ -126,7 +129,7 @@ class Model:
         # the client's own LLM_OUTPUT trigger, output event, error event) so
         # observers can attribute what they receive to this call and not to
         # another one running concurrently. See ``call_scope``.
-        with LlmCallScope():
+        with LlmCallScope(), _model_call_target(self, self._client):
             return await self._client.invoke(
                 messages=messages,
                 stop=stop,
@@ -203,12 +206,17 @@ class Model:
                 next_timeout = first_chunk_timeout if chunk_count == 0 else idle_timeout
 
                 try:
-                    if next_timeout is None:
-                        chunk = await stream_iterator.__anext__()
-                    else:
-                        chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=next_timeout)
+                    # Do not hold a ContextVar token across a public yield: the
+                    # next frame may be driven or closed by a different task.
+                    with _model_call_target(self, self._client):
+                        if next_timeout is None:
+                            chunk = await stream_iterator.__anext__()
+                        else:
+                            chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=next_timeout)
                 except StopAsyncIteration:
                     break
+                except _ModelCallGuardTimeout as exc:
+                    raise exc.error from None
                 except asyncio.TimeoutError as exc:
                     close = getattr(stream_iterator, "aclose", None) or getattr(stream_iterable, "aclose", None)
                     if callable(close):
