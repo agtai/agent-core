@@ -3066,6 +3066,7 @@ class DeepAgent(BaseAgent):
             raise RuntimeError("goal_manager_not_started")
         if "prepare_output" in controls:
             raise ValueError("DeepAgent owns Goal output preparation")
+        on_output_ready = controls.pop("on_output_ready", None)
         stream = None
         finishing_lease = None
 
@@ -3084,6 +3085,8 @@ class DeepAgent(BaseAgent):
             if stream is None and lease is not None and lease.finishing:
                 finishing_lease = lease
                 raise OutputFinishing()
+            if on_output_ready is not None:
+                on_output_ready(lease.token, stream is not None)
 
         async with self._interaction_send_lock:
             while True:
@@ -3111,7 +3114,7 @@ class DeepAgent(BaseAgent):
                         cleanup.result()
                     raise
 
-    async def attach_output(self) -> Optional[InteractionOutputStream]:
+    async def attach_output(self, *, on_output_ready=None) -> Optional[InteractionOutputStream]:
         """Claim the sole output reader for this interaction.
 
         Returns ``None`` when another consumer already holds the lease.
@@ -3119,6 +3122,11 @@ class DeepAgent(BaseAgent):
         If an ACTIVE goal exists, missing goal work is ensured even when this
         call does not obtain the lease, so an already-attached reader continues
         to receive goal progress (session switch / concurrent attach_goal).
+
+        The optional synchronous host callback receives the opaque lease token
+        and whether this call acquired it, under the control lock and before
+        scheduling. It can reject a disconnected owner by raising. A finishing
+        existing lease is not announced as available for new work.
         """
         if not self._interaction_started or self._interaction_phase is InteractionPhase.TERMINATED:
             raise RuntimeError("interaction_terminated")
@@ -3126,6 +3134,18 @@ class DeepAgent(BaseAgent):
         async with self._interaction_send_lock:
             async with self._interaction_control_lock:
                 stream = await self._attach_output_locked()
+                lease = self._interaction_output.current_lease()
+                try:
+                    if on_output_ready is not None:
+                        if lease is None or lease.finishing:
+                            raise RuntimeError("interaction_output_unavailable")
+                        on_output_ready(lease.token, stream is not None)
+                except BaseException:
+                    if stream is not None:
+                        # No work has been admitted by this attachment. Preserve
+                        # the old queue and active round on host rejection.
+                        await self._interaction_output.detach(lease.token)
+                    raise
                 if self.goal_manager is not None:
                     record = self._load_goal_record_locked()
                     if record is not None and record.status is GoalStatus.ACTIVE:

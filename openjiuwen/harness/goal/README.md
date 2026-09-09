@@ -43,6 +43,16 @@ already finishing, the call waits for its buffered output to drain and then
 revalidates admission before acquiring a new lease. No Goal control lock is held
 during that wait. Cancelling the waiting command does not cancel the old reader.
 
+`attach_output`, `set_goal` and `resume_goal` accept an optional synchronous
+`on_output_ready(token, acquired)` host callback. The opaque token identifies
+the actual existing or newly acquired output lease; `acquired` is false when an
+older reader will consume the new work. It runs under the interaction control
+lock before scheduling, after Goal admission checks for Goal commands. A host
+can retain its actual reader here or raise if that reader is already closing.
+A rejected/stale Goal or a finishing old lease never invokes the callback. A
+new lease is released if the callback fails, preserving unrelated queued work.
+The callback must not await, block, reacquire SDK locks or mutate Goal state.
+
 Do not attach output before validating a Goal command: ordinary `attach_output`
 may ensure active Goal work, and ordinary stream close discards queued work.
 On failure after acquisition, the new APIs wait for their own lease to be

@@ -48,6 +48,84 @@ def effects(owner):
 
 
 @pytest.mark.asyncio
+async def test_output_ready_observes_exact_borrowed_lease_before_goal_effects(owner):
+    agent, _, _ = owner
+    notices = []
+    def ready(token, acquired):
+        assert agent._interaction_control_lock.locked()
+        assert agent.goal_manager.peek() is None
+        assert not agent._event_manager.has_pending_work()
+        notices.append((token, acquired))
+    stream = await agent.attach_output(on_output_ready=ready)
+    record, borrowed = await agent.set_goal("Retained objective", on_output_ready=ready)
+    assert borrowed is None and record.objective == "Retained objective"
+    assert notices == [(agent._interaction_output.current_token(), True),
+                       (agent._interaction_output.current_token(), False)]
+    await stream.close(abort_active_round=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attached", [False, True])
+async def test_output_ready_rejection_preserves_goal_queue_and_old_reader(owner, attached):
+    agent, _, _ = owner
+    stream = await agent.attach_output() if attached else None
+    user = RoundWorkItem.user(request_id="user", inputs={"query": "Keep this work"})
+    agent._event_manager.push_user(user)
+    before = effects(owner)
+    with pytest.raises(PermissionError, match="owner disconnected"):
+        await agent.set_goal("Must not start", on_output_ready=Mock(side_effect=PermissionError("owner disconnected")))
+    assert effects(owner) == before
+    assert agent._event_manager.next_work() is user
+    if stream is not None:
+        await agent._interaction_output.emit("preserved")
+        assert await anext(stream) == "preserved"
+        await stream.close(abort_active_round=False)
+
+
+@pytest.mark.asyncio
+async def test_stale_goal_never_notifies_output_owner(owner):
+    agent, _, _ = owner
+    record, stream = await agent.set_goal("Original")
+    ready = Mock()
+    before = effects(owner)
+    with pytest.raises(GoalOperationError):
+        await agent.resume_goal(expected_goal_id=record.goal_id,
+            expected_control_revision=record.control_revision + 1, on_output_ready=ready)
+    ready.assert_not_called()
+    assert effects(owner) == before
+    await stream.close(abort_active_round=False)
+
+
+@pytest.mark.asyncio
+async def test_attach_output_ready_failure_does_not_discard_work_or_keep_new_lease(owner):
+    agent, _, _ = owner
+    user = RoundWorkItem.user(request_id="user", inputs={"query": "Keep this work"})
+    agent._event_manager.push_user(user)
+    before = effects(owner)
+    with pytest.raises(PermissionError):
+        await agent.attach_output(on_output_ready=Mock(side_effect=PermissionError("closed")))
+    assert effects(owner) == before
+    assert agent._event_manager.next_work() is user
+
+
+@pytest.mark.asyncio
+async def test_finishing_attach_cannot_ensure_goal_work_without_host_admission(owner):
+    agent, _, _ = owner
+    record, stream = await agent.set_goal("Active goal")
+    assert agent._event_manager.next_work().context["goal_id"] == record.goal_id
+    await agent._interaction_output.finish_current()
+    before = effects(owner)
+    ready = Mock(side_effect=PermissionError("owner closing"))
+    with pytest.raises(RuntimeError, match="output_unavailable"):
+        await agent.attach_output(on_output_ready=ready)
+    assert effects(owner) == before
+    assert not agent._event_manager.has_pending_work()
+    ready.assert_not_called()
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
 async def test_set_consumes_real_output_and_replacement_keeps_original_consumer(owner):
     agent, _, _ = owner
     created, stream = await agent.set_goal("First objective")
@@ -200,16 +278,19 @@ async def test_new_goal_waits_for_finishing_reader_without_losing_either_stream(
     await agent._interaction_output.emit({"text": "last ordinary response"})
     await agent._interaction_output.finish_current()
     before = effects(owner)
-    pending = asyncio.create_task(agent.set_goal("New goal"))
+    ready = Mock()
+    pending = asyncio.create_task(agent.set_goal("New goal", on_output_ready=ready))
     await asyncio.sleep(0)
     assert not pending.done()
     assert effects(owner) == before
+    ready.assert_not_called()
     assert not agent._event_manager.has_pending_work()
     assert await anext(old) == {"text": "last ordinary response"}
     with pytest.raises(StopAsyncIteration):
         await anext(old)
     created, stream = await asyncio.wait_for(pending, 1)
     assert stream is not None
+    ready.assert_called_once_with(agent._interaction_output.current_token(), True)
     assert agent._event_manager.next_work().context["goal_id"] == created.goal_id
     await agent._interaction_output.emit({"text": "new goal response"})
     assert await anext(stream) == {"text": "new goal response"}
