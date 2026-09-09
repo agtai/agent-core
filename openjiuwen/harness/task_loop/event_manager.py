@@ -47,7 +47,21 @@ class EventManager:
         logger.debug("[EventManager] goal work queued: goal_id=%s revision=%s", goal_id, revision)
         return True
 
-    def next_work(self) -> Optional[RoundWorkItem]:
+    def push_resume(self, work: RoundWorkItem) -> None:
+        if not work.is_input_continuation:
+            raise ValueError("push_resume requires an input continuation")
+        queue = self._goal_queue if work.kind == "goal" else self._user_queue
+        queue.appendleft(work)
+
+    def next_work(self, *, input_only: bool = False) -> Optional[RoundWorkItem]:
+        if input_only:
+            for queue in (self._user_queue, self._goal_queue):
+                for work in queue:
+                    if work.is_input_continuation:
+                        queue.remove(work)
+                        self._dequeued = work
+                        return work
+            return None
         if self._user_queue:
             self._dequeued = self._user_queue.popleft()
             return self._dequeued
@@ -61,11 +75,13 @@ class EventManager:
             self._dequeued = None
         self._active = work
 
-    def mark_finished(self, work: RoundWorkItem) -> None:
-        if self._active == work:
+    def mark_finished(self, work: RoundWorkItem, *, keep_pending: bool = False) -> None:
+        if self._active == work and not keep_pending:
             self._active = None
 
-    def has_pending_work(self) -> bool:
+    def has_pending_work(self, *, input_only: bool = False) -> bool:
+        if input_only:
+            return any(work.is_input_continuation for work in (*self._user_queue, *self._goal_queue))
         return bool(self._user_queue or self._goal_queue)
 
     def has_pending_user_work(self) -> bool:
@@ -116,6 +132,7 @@ class EventManager:
             same_session = work.context.get("session_id") == session_id
             same_goal = goal_id is None or work.context.get("goal_id") == goal_id
             if same_session and same_goal:
+                self._reject_discarded(work)
                 continue
             kept.append(work)
         self._goal_queue = kept
@@ -135,8 +152,23 @@ class EventManager:
         The durable GoalRecord deliberately survives.  A later GOAL send
         recreates its next work item after a frontend has attached again.
         """
+        for work in (*self._user_queue, *self._goal_queue):
+            self._reject_discarded(work)
         self._user_queue.clear()
         self._goal_queue.clear()
+
+    @staticmethod
+    def _reject_discarded(work, error=None):
+        if work.is_input_continuation:
+            from openjiuwen.core.session.interaction.interactive_input import AgentInputError
+            work.query._reject_claim(error if error is not None else AgentInputError("pending_input_invalidated"))
+
+    def discard_input_work(self, error=None) -> None:
+        for queue in (self._user_queue, self._goal_queue):
+            for work in list(queue):
+                if work.is_input_continuation:
+                    queue.remove(work)
+                    self._reject_discarded(work, error)
 
     @property
     def active_work(self) -> Optional[RoundWorkItem]:

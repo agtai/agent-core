@@ -40,7 +40,7 @@ from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackEvent,
     TaskIterationInputs,
 )
-from openjiuwen.harness.schema.interaction import _source_metadata_for_run
+from openjiuwen.harness.schema.interaction import _source_metadata_for_run, _execution_origin_for_run
 
 if TYPE_CHECKING:
     from openjiuwen.harness.deep_agent import (
@@ -144,6 +144,13 @@ class TaskLoopEventExecutor(TaskExecutor):
             goal_id=context_fields.get("goal_id") if is_goal and isinstance(context_fields, dict) else None,
             revision=context_fields.get("revision") if is_goal and isinstance(context_fields, dict) else None,
         )
+        request_id = extra.get("_interaction_request_id") if isinstance(extra, dict) else None
+        active = agent.active_round
+        if active is not None and active.task_id == task_id and not is_goal:
+            request_id = active.work.request_id
+        origin = _execution_origin_for_run(
+            task_run_context, session_id=cid, kind="goal" if is_goal else "user", request_id=request_id,
+        )
         if source is not None:
             session = session.with_source_metadata(source)
 
@@ -236,7 +243,7 @@ class TaskLoopEventExecutor(TaskExecutor):
         after_fired = False
         try:
             result = await agent.react_agent.invoke(
-                effective, session, _streaming=True
+                effective, session, _streaming=True, _execution_origin=origin
             )
 
             # Mark completed in TaskPlan (skip for interrupt)

@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import copy
+import asyncio
+import inspect
 import json
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -15,7 +18,7 @@ from openjiuwen.core.foundation.llm import AssistantMessage
 from openjiuwen.core.foundation.llm.schema.tool_call import ToolCall
 from openjiuwen.core.session.agent import Session
 from openjiuwen.core.session.interaction.interaction import InteractionOutput
-from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+from openjiuwen.core.session.interaction.interactive_input import InteractiveInput, AgentInputError
 from openjiuwen.core.session.stream.base import OutputSchema
 from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
 from openjiuwen.core.single_agent.interrupt.response import (
@@ -27,6 +30,7 @@ from openjiuwen.core.single_agent.interrupt.state import (
     ToolInterruptEntry,
     ToolInterruptionState,
     RESUME_START_ITERATION_KEY, INTERRUPT_AUTO_CONFIRM_KEY,
+    copy_execution_origin,
 )
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, InvokeInputs
 
@@ -55,6 +59,79 @@ class ToolInterruptHandler:
     def __init__(self, agent: 'ReActAgent'):
         self._agent = agent
         self._key = INTERRUPTION_KEY
+        self._claim_reserved = False
+
+    def preflight_exact(self, user_input: InteractiveInput, session: Optional[Session], *, expected_origin=None):
+        """Read the real pending owner without clearing it or admitting answers."""
+        state = self.load(session)
+        if not isinstance(state, ToolInterruptionState) or not state.pending_token:
+            raise AgentInputError("pending_input_missing")
+        if state.pending_token != user_input.expected_pending_token:
+            raise AgentInputError("pending_token_mismatch")
+        if user_input.claimed:
+            raise AgentInputError("pending_input_already_claimed")
+        if state.execution_origin is not None:
+            if state.execution_origin["session_id"] != session.get_session_id():
+                raise AgentInputError("pending_scope_mismatch")
+        if expected_origin is not None and state.execution_origin != expected_origin:
+            raise AgentInputError("pending_origin_mismatch")
+        pending_ids = {key for entry in state.interrupted_tools.values() for key in entry.interrupt_requests}
+        if (user_input.raw_inputs is not None or not user_input.user_inputs
+                or not set(user_input.user_inputs).issubset(pending_ids)
+                or any(value is None for value in user_input.user_inputs.values())):
+            raise AgentInputError("pending_answer_ids_invalid")
+        for entry in state.interrupted_tools.values():
+            if entry.is_sub_agent:
+                self._child_pending_token(entry)
+        return state
+
+    @staticmethod
+    def _child_pending_token(entry):
+        tokens = {getattr(request, "pending_token", None) for request in entry.interrupt_requests.values()}
+        if len(tokens) != 1 or None in tokens:
+            raise AgentInputError("pending_child_token_invalid")
+        token = next(iter(tokens))
+        try:
+            InteractiveInput(expected_pending_token=token)
+        except AgentInputError as error:
+            raise AgentInputError("pending_child_token_invalid") from error
+        return token
+
+    def claim_exact(self, user_input, session, prepared_state):
+        """Final synchronous compare/authorize/clear on the existing handler."""
+        if self._claim_reserved:
+            raise AgentInputError("pending_claim_in_progress")
+        self._claim_reserved = True
+        try:
+            def validate():
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
+                live = self.preflight_exact(user_input, session, expected_origin=prepared_state.execution_origin)
+                if live != prepared_state:
+                    raise AgentInputError("pending_state_changed")
+                return live
+
+            validate()
+            for callback in (user_input._control.sdk_before_effect, user_input.before_effect):
+                if callback is None:
+                    continue
+                result = callback()
+                if inspect.isawaitable(result):
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                    raise AgentInputError("input_guard_async_unsupported")
+                if result is not None:
+                    raise AgentInputError("input_guard_result_invalid")
+            claimed = validate()
+            if user_input._control.sdk_before_effect is not None:
+                user_input._control.sdk_before_effect()
+            self.clear(session)
+            claimed.pending_token = None
+            user_input._accept_claim()
+            return claimed
+        finally:
+            self._claim_reserved = False
 
     def build_interrupt_state(
             self,
@@ -127,7 +204,7 @@ class ToolInterruptHandler:
     def save(self, state: ToolInterruptionState, session: Optional[Session]) -> None:
         """Save tool interruption state to session."""
         if session:
-            session.update_state({self._key: state})
+            session.update_state({self._key: state.model_copy(deep=True)})
 
     def load(self, session: Optional[Session]) -> Optional[ToolInterruptionState]:
         """Load tool interruption state from session."""
@@ -239,6 +316,7 @@ class ToolInterruptHandler:
     @staticmethod
     def build_interrupt_result(
             payloads: list = None,
+            *, pending_token: str | None = None,
     ) -> Dict[str, object]:
         """Build interrupt result from payloads.
 
@@ -250,8 +328,12 @@ class ToolInterruptHandler:
         state_outputs = []
 
         if payloads:
-            for idx, (inner_id, payload) in enumerate(payloads):
+            for idx, (inner_id, payload) in enumerate(copy.deepcopy(payloads)):
                 interrupt_ids.append(inner_id)
+                value = payload.payload.value if isinstance(payload, OutputSchema) else payload
+                if isinstance(value, ToolCallInterruptRequest):
+                    value.pending_token = pending_token
+                    value.metadata.pop("pending_token", None)
                 if isinstance(payload, OutputSchema):
                     state_outputs.append(payload)
                 else:
@@ -270,6 +352,7 @@ class ToolInterruptHandler:
             "result_type": "interrupt",
             "state": state_outputs,
             "interrupt_ids": interrupt_ids,
+            "pending_token": pending_token,
         }
 
     async def commit_interrupt(
@@ -279,11 +362,16 @@ class ToolInterruptHandler:
             session: Optional[Session],
             invoke_inputs: InvokeInputs,
             sub_agent_outputs: list = None,
+            *, execution_origin=None,
     ) -> Dict[str, object]:
         """Persist tool interruption state and return interrupt dict."""
         await self._agent.context_engine.save_contexts(session)
+        if execution_origin is not None:
+            state.execution_origin = copy_execution_origin(execution_origin)
+        if state.pending_token is None:
+            state.pending_token = uuid.uuid4().hex
         self.save(state, session)
-        result = self.build_interrupt_result(sub_agent_outputs)
+        result = self.build_interrupt_result(sub_agent_outputs, pending_token=state.pending_token)
         invoke_inputs.result = result
         return result
 
@@ -313,6 +401,9 @@ class ToolInterruptHandler:
         Returns interrupt dict if still waiting, or None to continue ReAct loop.
         """
         state = resume_ctx.state
+        # Executing any answer consumes this generation, even when some tools
+        # interrupt again. Pure result re-emission does not enter this method.
+        state.pending_token = None
         user_input = resume_ctx.user_input
         ctx = resume_ctx.ctx
         context = resume_ctx.context
@@ -328,10 +419,24 @@ class ToolInterruptHandler:
         ctx.extra.update({key: user_input for key in resume_user_input_keys})
 
         tools_to_execute = []
+        unaddressed_children = {}
+        child_payloads = []
         for outer_id, entry in state.interrupted_tools.items():
             tc = copy.deepcopy(entry.tool_call)
             if entry.is_sub_agent:
-                tc = self._build_sub_agent_resume_tool_call(tc, user_input)
+                child_input = user_input
+                if isinstance(user_input, InteractiveInput) and user_input.expected_pending_token is not None:
+                    answers = {key: copy.deepcopy(value) for key, value in user_input.user_inputs.items()
+                               if key in entry.interrupt_requests}
+                    if not answers:
+                        # A partial parent answer leaves this child untouched.
+                        unaddressed_children[outer_id] = entry
+                        child_payloads.extend((key, request) for key, request in entry.interrupt_requests.items())
+                        continue
+                    child_input = InteractiveInput(expected_pending_token=self._child_pending_token(entry))
+                    for key, value in answers.items():
+                        child_input.update(key, value)
+                tc = self._build_sub_agent_resume_tool_call(tc, child_input)
             tools_to_execute.append(tc)
 
         try:
@@ -348,6 +453,12 @@ class ToolInterruptHandler:
             results, tools_to_execute
         )
 
+        new_interrupted_tools.update(unaddressed_children)
+        sub_agent_outputs.extend(child_payloads)
+        for entry in unaddressed_children.values():
+            for key, request in entry.interrupt_requests.items():
+                if request.auto_confirm_key:
+                    auto_confirm_mapping[key] = request.auto_confirm_key
         state.interrupted_tools = new_interrupted_tools
         state.auto_confirm_mapping = auto_confirm_mapping
 

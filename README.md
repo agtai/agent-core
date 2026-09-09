@@ -288,3 +288,87 @@ add a scheduler, concurrent-run lock or cross-process owner restoration. The
 checksum detects checkpoint pairing errors; the trusted callback supplies
 authorization. Normal start and legacy resume calls without a guard retain
 their existing semantics.
+
+### Exact Agent human input and original Deep work
+
+An Agent tool interruption now publishes a fresh `pending_token` in the interrupt
+result and every canonical `ToolCallInterruptRequest`. Typed payloads and their
+serialized dictionaries carry the same field. Tokens are independent of provider
+tool-call IDs. Re-emitting a pending result preserves its token; any successful
+partial reply rotates the token for remaining interruptions.
+
+```python
+from openjiuwen.core.session import InteractiveInput
+from openjiuwen.core.single_agent.interrupt.response import AgentInputError
+from openjiuwen.harness.schema.interaction import SendInputRequest
+
+reply = InteractiveInput(
+    expected_pending_token=pending_token,
+    prepare_effect=prepare_original_work_authority,  # optional sync/async
+    before_effect=check_current_authority,          # optional synchronous
+)
+reply.update(pending_input_id, validated_answer)
+receipt = await deep_agent.send_input(SendInputRequest(
+    request_id="reply-control-request", inputs={"query": reply},
+))
+# {"accepted": True, "pending_token": pending_token}
+```
+
+Exact input requires a nonempty answer-ID subset of the actual pending IDs; raw
+input fallback, unrelated IDs, stale tokens and missing owners fail before
+consumption. Existing asynchronous preparation runs while pending state remains
+stored. `prepare_effect` runs last among asynchronous preparation steps. Then the
+original handler synchronously rechecks token/origin, invokes `before_effect`,
+rechecks and claims the pending state, with no intervening await. Both callbacks
+must return `None` or raise; only `prepare_effect` may await. Their original
+exceptions propagate. Rejection or preparation cancellation does not append an
+abort/answer history marker. Callbacks and the private receipt Future are never
+serialized; trusted in-process copies retain their shared control.
+
+`DeepAgent.peek_pending_input()` synchronously returns a deep copy of
+`{pending_token, execution_origin, pending_ids}` or `None`. It reads only the
+existing session, creates no owner and reveals no tool arguments. This is a
+trusted control-plane snapshot: `execution_origin` can contain private context
+and must not be forwarded as public output. Its SDK-built fields are `kind`
+(`user`/`goal`), original `request_id` (always `None` for Goal), actual `session_id`
+and the original bounded JSON `run_context`. The origin envelope has room for
+SDK fields around an existing legal 64 KiB context. Only the existing explicit
+`extra.source_metadata` map is projected into output.
+
+Deep exact continuation uses that original origin, never the reply request as a
+new work identity. A supplied reply context must match; omitting it uses the
+saved context. The original controller/coordinator and, for Goal, the original
+attempt/report sink remain in use. The existing interaction supervisor creates
+a new actual `ActiveInteractionRound.task_id` for the continuation and stamps it
+on output. This is the executed interaction-round identity; legacy and strict
+single-round resumes do not imply a new Core TaskStore record. Claim does not
+increment the Goal attempt count. Its success/error is assessed by the retained
+Goal rail, including the existing blocked outcome on execution failure.
+
+Pending managed User/Goal work with an explicit source binding keeps its current
+output reader. Its original queue accepts only exact continuation while pending;
+ordinary user inputs remain queued until claim or explicit invalidation. Goal
+automatic attempts cannot bypass this wait. Abort, stop, Goal clear/replacement
+and output cancellation invalidate the corresponding managed pending owner and
+settle unclaimed replies. Cancelling a `send_input` observer only stops that
+observer: an already queued owner still claims or rejects the same private
+receipt. A receipt is produced only after real claim, never merely after enqueue,
+and does not prove tool execution or business completion. A later execution
+failure does not restore the consumed token.
+
+Nested Agent replies use each child's canonical token saved in the parent's
+pending state. Missing/mixed child tokens reject before parent claim. The parent
+callback runs once; each original child owner rechecks its own saved token before
+its effects. A child independently replaced since publication may reject after
+the parent has already claimed. The parent receipt still proves only parent
+claim, and is not rolled back or presented as successful completion of the whole
+nested task. No cross-owner atomic claim or cross-process restoration is added.
+
+`AgentInputError.code` identifies rejections such as `pending_token_mismatch`,
+`pending_input_missing`, `pending_answer_ids_invalid`, `pending_origin_mismatch`,
+`pending_goal_changed`, `pending_owner_unavailable`, `pending_input_invalidated`,
+`pending_child_token_invalid` and `input_guard_result_invalid`. Calls without an
+exact token retain legacy behavior and `DeepAgent.send_input` returns `None`.
+Older states without token/origin are not repaired on read. Unbound legacy inputs
+keep their former reader lifetime and may retain non-JSON runtime context; when
+that context cannot be frozen, no strict origin is fabricated.

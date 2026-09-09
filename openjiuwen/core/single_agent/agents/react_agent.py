@@ -16,6 +16,7 @@ import inspect
 import json
 import time
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
 
 from pydantic import Field, BaseModel
@@ -54,6 +55,7 @@ from openjiuwen.core.single_agent.kv_cache import kv_cache_hooks
 from openjiuwen.core.foundation.tool import ToolInfo
 from openjiuwen.core.session import with_session
 from openjiuwen.core.session.agent import Session, create_agent_session
+from openjiuwen.core.session.interaction.interactive_input import InteractiveInput, AgentInputError
 from openjiuwen.core.session.stream import OutputSchema
 from openjiuwen.core.session.stream.base import StreamMode
 from openjiuwen.core.single_agent.base import BaseAgent
@@ -64,6 +66,7 @@ from openjiuwen.core.single_agent.interrupt.state import (
     ToolInterruptionState,
     INTERRUPTION_KEY
 )
+from openjiuwen.core.single_agent.interrupt.state import copy_execution_origin
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackEvent,
     AgentCallbackContext,
@@ -1660,6 +1663,7 @@ class ReActAgent(BaseAgent):
             session: Optional[Session],
             invoke_inputs: InvokeInputs,
             sub_agent_outputs: list = None,
+            *, execution_origin=None,
     ) -> Dict[str, Any]:
         """Persist interruption state and return the interrupt result dict.
 
@@ -1667,7 +1671,7 @@ class ReActAgent(BaseAgent):
         """
         if isinstance(interrupt, ToolInterruptionState):
             return await self._hitl_handler.commit_interrupt(
-                interrupt, context, session, invoke_inputs, sub_agent_outputs
+                interrupt, context, session, invoke_inputs, sub_agent_outputs, execution_origin=execution_origin
             )
 
         pending_entry = interrupt.interrupted_workflows[interrupt.pending_workflow_id]
@@ -1884,8 +1888,41 @@ class ReActAgent(BaseAgent):
         return await self._inner_invoke(session=session, inputs=inputs, query=query, conversation_id=conversation_id,
                                         need_cleanup=need_cleanup, **kwargs)
 
+    @asynccontextmanager
+    async def _input_lifecycle(self, ctx, exact_input, is_claimed):
+        if exact_input is None:
+            async with ctx.lifecycle(AgentCallbackEvent.BEFORE_INVOKE, AgentCallbackEvent.AFTER_INVOKE):
+                yield
+            return
+        saved_inputs = ctx.inputs
+        await ctx.fire(AgentCallbackEvent.BEFORE_INVOKE)
+        error = None
+        try:
+            yield
+        except BaseException as caught:
+            error = caught
+            ctx.exception = caught
+            raise
+        finally:
+            ctx.inputs = saved_inputs
+            # Failed preparation is not a conversation turn. In particular,
+            # after-invoke memory rails must not append rejected reply history.
+            if is_claimed():
+                try:
+                    await ctx.fire(AgentCallbackEvent.AFTER_INVOKE)
+                except Exception:
+                    if error is None:
+                        raise
+                    logger.exception("AFTER_INVOKE failed after claimed input error")
+
     @with_session()
     async def _inner_invoke(self, session, inputs, query, need_cleanup, conversation_id, **kwargs):
+        exact_input = (copy.deepcopy(query) if isinstance(query, InteractiveInput)
+                       and query.expected_pending_token is not None else None)
+        if exact_input is not None:
+            query = exact_input
+        exact_claimed = False
+        execution_origin = copy_execution_origin(kwargs.get("_execution_origin"))
         invoke_inputs = InvokeInputs(query=query, conversation_id=conversation_id)
         ctx = AgentCallbackContext(agent=self, inputs=invoke_inputs, session=session)
         abort_persisted = False
@@ -1910,8 +1947,12 @@ class ReActAgent(BaseAgent):
                 ctx.extra["_input_parts"] = list(inputs["_input_parts"])
 
         try:
-            async with ctx.lifecycle(AgentCallbackEvent.BEFORE_INVOKE, AgentCallbackEvent.AFTER_INVOKE):
+            exact_state = (self._hitl_handler.preflight_exact(
+                exact_input, session, expected_origin=execution_origin) if exact_input is not None else None)
+            async with self._input_lifecycle(ctx, exact_input, lambda: exact_claimed):
                 user_input = ctx.inputs.query
+                if exact_input is not None and user_input is not exact_input:
+                    raise AgentInputError("pending_input_replaced")
                 # A continuation round carries no new query: it picks the
                 # preserved context of a paused round back up in place.
                 resume_continuation = bool(ctx.extra.get("_resume_continuation"))
@@ -1923,12 +1964,12 @@ class ReActAgent(BaseAgent):
                 # that window into something a slow-start report can name.
                 prep_started_at = time.monotonic()
 
-                hitl_state = self._hitl_handler.load(session)
+                hitl_state = exact_state if exact_input is not None else self._hitl_handler.load(session)
                 interruption_state = hitl_state or self._load_interruption_state(session)
                 if interruption_state is not None:
-                    if hitl_state is not None:
+                    if hitl_state is not None and exact_input is None:
                         self._hitl_handler.clear(session)
-                    else:
+                    elif hitl_state is None:
                         self._clear_interruption_state(session)
                     # Restore original query so MemoryRail.after_invoke writes the right UserMessage
                     ctx.extra["_original_query"] = interruption_state.original_query
@@ -1975,6 +2016,10 @@ class ReActAgent(BaseAgent):
                     is_tool_interruption = isinstance(interruption_state, ToolInterruptionState)
                     
                     if is_tool_interruption:
+                        if exact_input is not None:
+                            await exact_input._prepare_claim()
+                            interruption_state = self._hitl_handler.claim_exact(exact_input, session, exact_state)
+                            exact_claimed = True
                         # Tool Interrupt: not write UserMessage, recovery input is passed to Rail via ctx.extra
                         await self._handle_resume(
                             interruption_state, user_input, ctx, context, session, invoke_inputs=invoke_inputs
@@ -2082,7 +2127,7 @@ class ReActAgent(BaseAgent):
                         )
                         if hitl_interrupt:
                             await self._commit_interrupt(hitl_interrupt, context, session, invoke_inputs,
-                                                         sub_agent_outputs)
+                                                         sub_agent_outputs, execution_origin=execution_origin)
                             break
 
                         workflow_interrupt = self._after_execute_tool_call(
@@ -2112,7 +2157,10 @@ class ReActAgent(BaseAgent):
 
             # after_invoke rails have fired; return result (possibly adapted by rails via ctx.extra)
             return ctx.extra.get("invoke_result", invoke_inputs.result)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if exact_input is not None and not exact_claimed:
+                exact_input._reject_claim(error)
+                raise
             # 外部取消（非工具级 CancelledError）。工具级 CancelledError
             # 在 AbilityManager.execute 中会被转成 ToolMessage，不会传播到这里。
             if stream_lifecycle_owner:
@@ -2123,7 +2171,10 @@ class ReActAgent(BaseAgent):
                 commit_session=commit_on_abort,
             )
             raise  # Re-raise to propagate cancellation signal
-        except Exception:
+        except Exception as error:
+            if exact_input is not None and not exact_claimed:
+                exact_input._reject_claim(error)
+                raise
             # A model/rail/context failure may happen after the current turn has
             # already been appended to the in-memory context. Preserve the same
             # safe prefix used for cancellation instead of falling back to the
@@ -2138,10 +2189,11 @@ class ReActAgent(BaseAgent):
             raise  # Preserve the original ReAct failure for the caller
         finally:
             if need_cleanup and not stream_lifecycle_owner:
-                if not abort_persisted:
+                unclaimed = exact_input is not None and not exact_claimed
+                if not abort_persisted and not unclaimed:
                     await self.context_engine.save_contexts(session)
                 await session.close_stream()
-                if not abort_persisted:
+                if not abort_persisted and not unclaimed:
                     await session.commit()
 
     async def write_invoke_result_to_stream(
@@ -2242,6 +2294,12 @@ class ReActAgent(BaseAgent):
     @with_session()
     async def _inner_stream(self, session, inputs, need_cleanup):
         abort_persisted = False
+        query = inputs.get("query") if isinstance(inputs, dict) else inputs
+        exact_input = query if isinstance(query, InteractiveInput) and query.expected_pending_token is not None else None
+        was_claimed = exact_input.claimed if exact_input is not None else False
+
+        def rejected_exact():
+            return exact_input is not None and (was_claimed or not exact_input.claimed)
 
         async def stream_process():
             nonlocal abort_persisted
@@ -2260,6 +2318,8 @@ class ReActAgent(BaseAgent):
                         final_result, session
                     )
             except asyncio.CancelledError:
+                if rejected_exact():
+                    raise
                 abort_persisted = await self._handle_context_abort(
                     session,
                     marker="[Request cancelled by user]",
@@ -2267,6 +2327,8 @@ class ReActAgent(BaseAgent):
                 )
                 raise
             except Exception as e:
+                if rejected_exact():
+                    raise
                 logger.error("ReActAgent stream error: %s", e, exc_info=True)
                 abort_persisted = await self._handle_context_abort(
                     session,
@@ -2278,11 +2340,11 @@ class ReActAgent(BaseAgent):
                     error_result, session
                 )
             finally:
-                if need_cleanup and not abort_persisted:
+                if need_cleanup and not abort_persisted and not rejected_exact():
                     await self.context_engine.save_contexts(session)
                 if self.is_agent_session:
                     await session.close_stream()
-                    if not abort_persisted:
+                    if not abort_persisted and not rejected_exact():
                         await session.commit()
 
         if self.is_agent_session:

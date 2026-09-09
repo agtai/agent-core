@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -40,6 +41,31 @@ def _source_metadata_for_run(
                   source_request_id=request_id, source_run_kind=run_kind,
                   source_goal_id=goal_id, source_goal_revision=revision)
     return _copy_json_mapping(source, max_bytes=4096)
+
+
+def _execution_origin_for_run(run_context, *, session_id, kind, request_id=None):
+    """Freeze identities from the actual SDK work/task, before mutable rails."""
+    from openjiuwen.core.single_agent.interrupt.state import copy_execution_origin
+
+    extra = run_context.get("extra", {}) if isinstance(run_context, dict) else getattr(run_context, "extra", {})
+    source = extra.get("source_metadata", {}) if isinstance(extra, dict) else {}
+    managed = isinstance(source, dict) and bool(source.get("source_binding_id"))
+    try:
+        context = dataclasses.asdict(run_context) if dataclasses.is_dataclass(run_context) else copy.deepcopy(run_context)
+        if context is not None:
+            reason = context.get("reason")
+            if isinstance(reason, Enum):
+                context["reason"] = reason.value
+            if isinstance(context.get("extra"), dict):
+                context["extra"].pop("_interaction_request_id", None)
+        return copy_execution_origin(dict(kind=kind, request_id=request_id if kind == "user" else None,
+                                          session_id=session_id, run_context=context))
+    except (ValueError, TypeError, RecursionError):
+        if managed:
+            raise
+        # Legacy callers may carry process-local objects in RunContext.extra.
+        # They keep their original path, without manufacturing a strict origin.
+        return None
 
 
 class InteractionPhase(str, Enum):
@@ -82,6 +108,7 @@ class RoundWorkItem:
     inputs: Dict[str, object]
     context: Dict[str, object] = field(default_factory=dict)
     is_follow_up: bool = False
+    is_input_continuation: bool = False
 
     @classmethod
     def user(
@@ -125,6 +152,18 @@ class RoundWorkItem:
             context=context,
         )
 
+    @classmethod
+    def continuation(cls, *, query, origin):
+        """Continue the original work; the reply request supplies no new identity."""
+        context = copy.deepcopy(origin["run_context"])
+        inputs = {"query": query, "conversation_id": origin["session_id"],
+                  "run": {"kind": "goal" if origin["kind"] == "goal" else "normal", "context": context}}
+        work_context = {"reset_loop": False}
+        if origin["kind"] == "goal":
+            work_context = {**(context.get("extra") or {}), **context, "reset_loop": False}
+        return cls(kind=origin["kind"], request_id=origin["request_id"], inputs=copy.deepcopy(inputs),
+                   context=work_context, is_input_continuation=True)
+
     @property
     def query(self) -> object:
         """The task-loop query; intentionally derived from ``inputs`` only."""
@@ -137,7 +176,8 @@ class RoundWorkItem:
     def output_source_metadata(self, *, task_id: str, session_id: str):
         """Return this work's public provenance, independently of its reader."""
         run = self.inputs.get("run") or {}
-        context = self.context if self.kind == "goal" else run.get("context", {})
+        context = (self.context if self.kind == "goal" and not self.is_input_continuation
+                   else run.get("context", {}))
         return _source_metadata_for_run(
             context, session_id=session_id, task_id=task_id, run_kind=self.kind,
             request_id=self.request_id,

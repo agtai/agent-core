@@ -44,7 +44,8 @@ from openjiuwen.core.foundation.llm import BaseMessage, SystemMessage
 from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.session.agent import Session
-from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+from openjiuwen.core.session.interaction.interactive_input import InteractiveInput, AgentInputError
+from openjiuwen.core.single_agent.interrupt.state import INTERRUPTION_KEY, ToolInterruptionState
 from openjiuwen.core.session.stream.base import StreamMode
 from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAgentConfig
 from openjiuwen.core.single_agent.base import BaseAgent
@@ -105,6 +106,7 @@ from openjiuwen.harness.schema.interaction import (
     RoundOutcome,
     RoundWorkItem,
     SendInputRequest,
+    _execution_origin_for_run,
 )
 from openjiuwen.harness.task_loop.event_manager import EventManager
 
@@ -1909,7 +1911,7 @@ class DeepAgent(BaseAgent):
         self._registered_rails.append(rail)
 
     async def _run_single_round_invoke(
-        self, ctx: AgentCallbackContext, session: Optional[Session]
+        self, ctx: AgentCallbackContext, session: Optional[Session], *, execution_origin=None
     ) -> Dict[str, Any]:
         """Invoke inner ReActAgent exactly once."""
         modified = ctx.inputs
@@ -1928,6 +1930,7 @@ class DeepAgent(BaseAgent):
         return await self._react_agent.invoke(
             self._to_effective_inputs(modified),
             session,
+            **({"_execution_origin": execution_origin} if execution_origin is not None else {}),
         )
 
     async def _setup_task_loop(
@@ -2774,6 +2777,13 @@ class DeepAgent(BaseAgent):
             session: Current session (unused).
         """
         _ = session
+        if self._invalidate_pending_input():
+            active = self._active_interaction_round
+            if active is not None and active.work.is_input_continuation and not active.work.query.claimed:
+                active.work.query._reject_claim(AgentInputError("pending_input_invalidated"))
+                task = self._interaction_round_task
+                if task is not None and task is not asyncio.current_task() and not task.done():
+                    task.cancel()
         coordinator = self._loop_coordinator
         controller = self._loop_controller
         if coordinator is not None and controller is not None:
@@ -2813,7 +2823,13 @@ class DeepAgent(BaseAgent):
             source = work.output_source_metadata(task_id=task_id, session_id=session.get_session_id())
             if source is not None:
                 session = session.with_source_metadata(source)
-            coordinator, controller = await self.prepare_interaction_task_loop(session)
+            if work.is_input_continuation:
+                self._validate_input_continuation(_execution_origin_for_run(
+                    work.inputs["run"]["context"], session_id=session.get_session_id(),
+                    kind=work.kind, request_id=work.request_id))
+                coordinator, controller = self._loop_coordinator, self._loop_controller
+            else:
+                coordinator, controller = await self.prepare_interaction_task_loop(session)
             if work.reset_loop:
                 coordinator.reset()
                 state = self.load_state(session)
@@ -2821,26 +2837,49 @@ class DeepAgent(BaseAgent):
                 self.save_state(session, state)
 
             inputs = copy.deepcopy(work.inputs)
-            if work.kind == "goal":
+            if work.kind == "goal" and not work.is_input_continuation:
                 inputs["run"] = {
                     "kind": "goal",
                     "context": copy.deepcopy(work.context),
                 }
             invoke_inputs = self._normalize_inputs(inputs)
+            is_resume_input = self._is_resume_input(invoke_inputs)
             if invoke_inputs.run_context is not None:
                 # The scheduler task predates this request. Carry the SDK's
                 # actual request identity through its existing task metadata.
                 invoke_inputs.run_context.extra["_interaction_request_id"] = work.request_id
-            is_resume_input = self._is_resume_input(invoke_inputs)
+            origin = (_execution_origin_for_run(invoke_inputs.run_context, session_id=session.get_session_id(),
+                                                kind=work.kind, request_id=work.request_id)
+                      if work.is_input_continuation else None)
             ctx = AgentCallbackContext(
                 agent=self, inputs=invoke_inputs, session=session
             )
-            async with ctx.lifecycle(
-                AgentCallbackEvent.BEFORE_INVOKE,
-                AgentCallbackEvent.AFTER_INVOKE,
-            ):
+            lifecycle = (self._react_agent._input_lifecycle(ctx, work.query, lambda: work.query.claimed)
+                         if work.is_input_continuation else ctx.lifecycle(
+                             AgentCallbackEvent.BEFORE_INVOKE, AgentCallbackEvent.AFTER_INVOKE))
+            async with lifecycle:
                 if is_resume_input:
-                    result = await self._run_single_round_invoke(ctx, session)
+                    if work.is_input_continuation:
+                        effective = ctx.inputs
+                        if (not isinstance(effective, InvokeInputs) or not isinstance(effective.query, InteractiveInput)
+                                or effective.query._control is not work.query._control):
+                            raise AgentInputError("pending_input_replaced")
+                    try:
+                        result = await self._run_single_round_invoke(ctx, session, execution_origin=origin)
+                    except Exception as error:
+                        if (work.is_input_continuation and work.query.claimed and work.kind == "goal"
+                                and self._task_completion_rail is not None):
+                            invoke_inputs.result = {"result_type": "error", "error": str(error)}
+                            ctx.inputs, ctx.exception = invoke_inputs, error
+                            with suppress(Exception):
+                                await self._task_completion_rail.after_task_iteration(ctx)
+                        raise
+                    if work.is_input_continuation and work.kind == "goal" and self._task_completion_rail is not None:
+                        # Finish the retained attempt/report sink. BEFORE_TASK_ITERATION
+                        # would begin/reset it and must not run a second time.
+                        invoke_inputs.result = result
+                        ctx.inputs = invoke_inputs
+                        await self._task_completion_rail.after_task_iteration(ctx)
                 else:
                     await controller.submit_round(
                         session,
@@ -2874,6 +2913,8 @@ class DeepAgent(BaseAgent):
             self.clear_state(session)
             return RoundOutcome(next_work=next_work)
         except Exception:
+            if work.is_input_continuation and not work.query.claimed:
+                raise
             logger.exception("[DeepAgent] interaction round execution failed")
             return RoundOutcome(
                 error_code="round_execution_error",
@@ -3163,7 +3204,62 @@ class DeepAgent(BaseAgent):
                         self._notify_work()
                 return stream
 
-    async def send_input(self, request: SendInputRequest) -> None:
+    def peek_pending_input(self) -> Optional[Dict[str, object]]:
+        """Return an isolated snapshot of the existing pending owner, without restoration."""
+        session = self._interaction_session
+        state = session.get_state(INTERRUPTION_KEY) if session is not None else None
+        if not isinstance(state, ToolInterruptionState) or not state.pending_token:
+            return None
+        return copy.deepcopy({"pending_token": state.pending_token, "execution_origin": state.execution_origin,
+                              "pending_ids": list(dict.fromkeys(key for entry in state.interrupted_tools.values()
+                                                                 for key in entry.interrupt_requests))})
+
+    def _managed_pending_input(self):
+        pending = self.peek_pending_input()
+        origin = pending and pending["execution_origin"]
+        context = origin and origin["run_context"]
+        source = (context or {}).get("extra", {}).get("source_metadata", {})
+        if origin and isinstance(source, dict) and source.get("source_binding_id"):
+            return pending
+        return None
+
+    def _validate_input_continuation(self, origin, *, output_token=None):
+        if (not self._interaction_started or self._interaction_phase is InteractionPhase.TERMINATED
+                or self._interaction_session is None or self._react_agent is None
+                or self._loop_controller is None or self._loop_coordinator is None
+                or self._bound_session_id != origin["session_id"]
+                or self._interaction_session.get_session_id() != origin["session_id"]):
+            raise AgentInputError("pending_owner_unavailable")
+        if not self.has_output_stream() or (output_token is not None
+                and self._interaction_output.current_token() != output_token):
+            raise AgentInputError("pending_output_unavailable")
+        if origin["kind"] == "goal":
+            context = origin["run_context"] or {}
+            fields = {**(context.get("extra") or {}), **context}
+            goal = self.goal_manager.peek() if self.goal_manager is not None else None
+            if (goal is None or goal.status is not GoalStatus.ACTIVE or goal.goal_id != fields.get("goal_id")
+                    or goal.revision != fields.get("revision")):
+                raise AgentInputError("pending_goal_changed")
+
+    def _invalidate_pending_input(self, *, expected_run_kind=None, expected_goal_id=None, expected_revision=None):
+        pending = self._managed_pending_input()
+        if pending is None:
+            return False
+        origin = pending["execution_origin"]
+        context = origin["run_context"] or {}
+        fields = {**(context.get("extra") or {}), **context}
+        if ((expected_run_kind is not None and origin["kind"] != expected_run_kind)
+                or (expected_goal_id is not None and fields.get("goal_id") != expected_goal_id)
+                or (expected_revision is not None and fields.get("revision") != expected_revision)):
+            return False
+        self._interaction_session.update_state({INTERRUPTION_KEY: None})
+        self._event_manager.discard_input_work()
+        if self._active_interaction_round is None and self._event_manager.active_work is not None:
+            self._event_manager.mark_finished(self._event_manager.active_work)
+        self._notify_work()
+        return True
+
+    async def send_input(self, request: SendInputRequest) -> Optional[Dict[str, object]]:
         """Dispatch user text or interrupt-resume input.
 
         Hosts that need to read output must call ``attach_output`` first (or
@@ -3175,9 +3271,12 @@ class DeepAgent(BaseAgent):
             raise RuntimeError("interaction_terminated")
 
         async with self._interaction_send_lock:
-            await self._send_user(request)
+            receipt = await self._send_user(request)
+        # Cancellation abandons only this observer. The original queued owner
+        # still claims or rejects the same private carrier exactly once.
+        return await asyncio.shield(receipt) if receipt is not None else None
 
-    async def _send_user(self, request: SendInputRequest) -> None:
+    async def _send_user(self, request: SendInputRequest) -> Optional[asyncio.Future]:
         inputs = request.inputs
         if not isinstance(inputs, dict):
             raise ValueError(
@@ -3194,9 +3293,49 @@ class DeepAgent(BaseAgent):
                 "or InteractiveInput"
             )
 
+        if is_resume_input and query.expected_pending_token is not None:
+            async with self._interaction_control_lock:
+                if self._react_agent is None or self._interaction_session is None:
+                    raise AgentInputError("pending_owner_unavailable")
+                state = self._react_agent._hitl_handler.preflight_exact(query, self._interaction_session)
+                origin = state.execution_origin
+                if origin is None:
+                    raise AgentInputError("pending_origin_missing")
+                self._validate_input_continuation(origin)
+                if inputs.get("conversation_id") not in (None, origin["session_id"]):
+                    raise AgentInputError("pending_scope_mismatch")
+                if "run" in inputs:
+                    supplied = self._normalize_inputs(inputs)
+                    candidate = _execution_origin_for_run(supplied.run_context, session_id=origin["session_id"],
+                        kind="goal" if supplied.run_kind is RunKind.GOAL else "user", request_id=origin["request_id"])
+                    if candidate != origin:
+                        raise AgentInputError("pending_origin_mismatch")
+                output_token = self._interaction_output.current_token()
+                work = RoundWorkItem.continuation(query=query, origin=origin)
+                source = work.output_source_metadata(task_id="0" * 32, session_id=origin["session_id"])
+                if source is not None:
+                    self._interaction_session.with_source_metadata(source)
+                receipt = query._begin_claim_receipt()
+
+                def guard_owner():
+                    if self._interaction_control_lock.locked():
+                        raise AgentInputError("pending_control_busy")
+                    self._validate_input_continuation(origin, output_token=output_token)
+                    active = self._active_interaction_round
+                    if active is None or active.work is not work:
+                        raise AgentInputError("pending_owner_changed")
+
+                query._control.sdk_before_effect = guard_owner
+                self._event_manager.push_resume(work)
+                self._notify_work()
+                return receipt
+
         # Validate opt-in and the final projection before enqueue/wakeup. The
         # real round uses a fixed 32-character UUID task id generated by the SDK.
-        self._normalize_inputs(inputs)
+        normalized = self._normalize_inputs(inputs)
+        if not is_resume_input and self._interaction_session is not None:
+            _execution_origin_for_run(normalized.run_context,
+                session_id=self._interaction_session.get_session_id(), kind="user", request_id=request.request_id)
         source = RoundWorkItem.user(request_id=request.request_id, inputs=inputs).output_source_metadata(
             task_id="0" * 32,
             session_id=(self._interaction_session.get_session_id()
@@ -3227,7 +3366,8 @@ class DeepAgent(BaseAgent):
             except ValueError as exc:
                 raise ValueError(f"unsupported input dispatch mode: {request.mode}") from exc
 
-            if mode is InputDispatchMode.STEER and self._active_interaction_round is not None:
+            if (mode is InputDispatchMode.STEER and self._active_interaction_round is not None
+                    and self._managed_pending_input() is None):
                 if loop is None:
                     raise RuntimeError("active interaction round cannot accept steer without loop_controller")
                 loop.enqueue_steer(str(inputs["query"]))
@@ -3308,7 +3448,7 @@ class DeepAgent(BaseAgent):
         (or close the output stream with ``abort_active_round=True``).
         """
         active = self._active_interaction_round
-        if active is None:
+        if active is None and self._managed_pending_input() is None:
             return False
         await self._cancel_active_round(reason=reason)
         return True
@@ -3335,6 +3475,8 @@ class DeepAgent(BaseAgent):
            still draining LLM I/O, continue without waiting and let cancel
            finish in the background.
         """
+        self._invalidate_pending_input(expected_run_kind=expected_run_kind, expected_goal_id=expected_goal_id,
+                                       expected_revision=expected_revision)
         active = self._active_interaction_round
         if active is None:
             return
@@ -3410,15 +3552,16 @@ class DeepAgent(BaseAgent):
                     await self._interaction_wakeup.wait()
                     continue
 
-                work = self._event_manager.next_work()
+                parked = self._managed_pending_input() is not None
+                work = self._event_manager.next_work(input_only=parked)
                 if work is None:
                     await self._promote_loop_follow_ups()
-                    work = self._event_manager.next_work()
+                    work = self._event_manager.next_work(input_only=parked)
                 if work is None:
                     await self._close_idle_output_if_finished()
                     self._interaction_phase = InteractionPhase.IDLE
                     self._interaction_wakeup.clear()
-                    if self._event_manager.has_pending_work():
+                    if self._event_manager.has_pending_work(input_only=parked):
                         continue
                     await self._interaction_wakeup.wait()
                     continue
@@ -3430,9 +3573,11 @@ class DeepAgent(BaseAgent):
                         await asyncio.wait_for(self._interaction_round_forwarded.wait(), timeout=2.0)
                 self._interaction_round_task = None
                 self._interaction_round_forwarded = None
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            self._event_manager.discard_input_work(error)
             logger.debug("[DeepAgent] supervisor cancelled")
-        except Exception:
+        except Exception as error:
+            self._event_manager.discard_input_work(error)
             logger.exception("[DeepAgent] supervisor failed")
             self._interaction_phase = InteractionPhase.IDLE
 
@@ -3468,6 +3613,8 @@ class DeepAgent(BaseAgent):
         queued before the host can observe an idle completion.  Callers must
         treat a True result as both "keep open" and "goal work ensured".
         """
+        if self._managed_pending_input() is not None:
+            return True
         if self._event_manager.has_pending_work() or self._active_interaction_round is not None:
             return True
         record = self._load_goal_record_locked()
@@ -3523,9 +3670,11 @@ class DeepAgent(BaseAgent):
         source = None
         try:
             if session is None or not self._interaction_output.has_consumer():
+                if work.is_input_continuation:
+                    raise AgentInputError("pending_output_unavailable")
                 return
             source = work.output_source_metadata(task_id=task_id, session_id=session.get_session_id())
-            if work.kind == "goal":
+            if work.kind == "goal" and not work.is_input_continuation:
                 if self.goal_manager is None:
                     return
                 started = await self.goal_manager.begin_attempt(
@@ -3549,9 +3698,14 @@ class DeepAgent(BaseAgent):
                         source_metadata=source,
                     )
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if work.is_input_continuation:
+                work.query._reject_claim(error)
             logger.info("[DeepAgent] round cancelled")
-        except Exception:
+        except Exception as error:
+            if work.is_input_continuation and not work.query.claimed:
+                work.query._reject_claim(error)
+                return
             logger.exception("[DeepAgent] round execution failed")
             self._emit_interaction_event(
                 InteractionEvent.execution_error(
@@ -3561,7 +3715,9 @@ class DeepAgent(BaseAgent):
                 )
             )
         finally:
-            self._event_manager.mark_finished(work)
+            if work.is_input_continuation and not work.query.claimed:
+                work.query._reject_claim(AgentInputError("pending_owner_finished_without_claim"))
+            self._event_manager.mark_finished(work, keep_pending=self._managed_pending_input() is not None)
             if session is not None:
                 emitted = await self._emit_round_boundary(session)
                 if not emitted:

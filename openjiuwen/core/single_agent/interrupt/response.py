@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
+from openjiuwen.core.session.interaction.interactive_input import AgentInputError as AgentInputError
+
 
 class InterruptRequest(BaseModel):
     """Request for user interruption/confirmation."""
@@ -32,6 +34,7 @@ class ToolCallInterruptRequest(InterruptRequest):
     tool_call_id: str = ""
     tool_args: Any = None
     index: Optional[int] = None
+    pending_token: str | None = None
 
     @classmethod
     def from_tool_call(
