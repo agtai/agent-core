@@ -10,6 +10,22 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from openjiuwen.core.session.agent import _copy_json_mapping
+
+
+def _copy_goal_run_context(context):
+    if context is None:
+        return None
+    snapshot = _copy_json_mapping(context)
+    if "source_metadata" in snapshot or "_interaction_request_id" in snapshot:
+        raise ValueError("source metadata must explicitly use extra.source_metadata")
+    if "extra" in snapshot and type(snapshot["extra"]) is not dict:
+        raise ValueError("run context extra must be an object")
+    extra = snapshot.get("extra", {})
+    if "source_metadata" in extra:
+        _copy_json_mapping(extra["source_metadata"], max_bytes=4096)
+    return snapshot
+
 
 class GoalStatus(str, Enum):
     ACTIVE = "active"
@@ -183,6 +199,10 @@ class GoalRecord:
     # User controls have their own CAS identity. Pausing an in-flight attempt
     # must not invalidate the attempt's execution revision.
     control_revision: int = 1
+    run_context: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        self.run_context = _copy_goal_run_context(self.run_context)
 
     def touch(self, *, bump_revision: bool = False) -> None:
         self.updated_at = _utc_now_iso()
@@ -218,6 +238,7 @@ class GoalRecord:
             "status": self.status.value,
             "revision": self.revision,
             "control_revision": self.control_revision,
+            "run_context": copy.deepcopy(self.run_context),
             "attempt_count": self.attempt_count,
             "token_usage": self.token_usage.to_dict(),
             "max_attempts": self.max_attempts,
@@ -270,6 +291,7 @@ class GoalRecord:
             status=status,
             revision=int(data.get("revision", 0)),
             control_revision=control_revision,
+            run_context=data.get("run_context"),
             attempt_count=int(data.get("attempt_count", 0)),
             token_usage=TokenUsage.from_dict(usage_data) if isinstance(usage_data, dict) else TokenUsage(),
             max_attempts=_optional_positive_int(data.get("max_attempts"), "max_attempts"),
@@ -292,6 +314,7 @@ class GoalRecord:
         objective: str,
         max_attempts: Optional[int] = None,
         token_budget: Optional[int] = None,
+        run_context: Optional[Dict[str, Any]] = None,
     ) -> "GoalRecord":
         now = _utc_now_iso()
         return cls(
@@ -300,6 +323,7 @@ class GoalRecord:
             objective=objective,
             max_attempts=max_attempts,
             token_budget=token_budget,
+            run_context=run_context,
             active_started_at=now,
             created_at=now,
             updated_at=now,

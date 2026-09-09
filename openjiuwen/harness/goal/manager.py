@@ -108,7 +108,9 @@ class GoalManager:
         expected_control_revision: int | None = None,
         before_effect: Callable[[], Awaitable[None] | None] | None = None,
         prepare_output: Callable[[], Awaitable[None]] | None = None,
+        run_context: dict | None = None,
     ) -> GoalRecord:
+        run_context = self._copy_run_context(run_context, operation="set")
         normalized = objective.strip()
         if not normalized:
             raise GoalOperationError(
@@ -141,6 +143,15 @@ class GoalManager:
                     goal=existing,
                 )
 
+            record = GoalRecord.create(
+                session_id=self._store.session_id,
+                objective=normalized,
+                token_budget=token_budget,
+                max_attempts=max_attempts,
+                run_context=run_context,
+            )
+            self._validate_source_projection(record, operation="set")
+
             # The interaction owner may acquire output only after admission.
             # Attaching output beforehand can schedule an unrelated active Goal.
             if prepare_output is not None:
@@ -152,12 +163,6 @@ class GoalManager:
                     goal_id=existing.goal_id,
                 )
 
-            record = GoalRecord.create(
-                session_id=self._store.session_id,
-                objective=normalized,
-                token_budget=token_budget,
-                max_attempts=max_attempts,
-            )
             self._store.save(record)
             await self._commit_store_locked()
 
@@ -176,6 +181,36 @@ class GoalManager:
                 )
 
             return record.copy_for_response()
+
+    @staticmethod
+    def _copy_run_context(context, *, operation):
+        if context is None:
+            return None
+        from openjiuwen.harness.goal.schema import _copy_goal_run_context
+
+        try:
+            return _copy_goal_run_context(context)
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise GoalOperationError(operation=operation, code="invalid_run_context",
+                                     message="goal run context must be bounded JSON") from exc
+
+    def _validate_source_projection(self, record, *, operation, context=None, revision=None):
+        from openjiuwen.harness.schema.interaction import _source_metadata_for_run
+
+        selected_context = record.run_context if context is None else context
+        selected_revision = record.revision if revision is None else revision
+        try:
+            _source_metadata_for_run(selected_context, session_id=self._store.session_id,
+                                     task_id="0" * 32, run_kind="goal", goal_id=record.goal_id,
+                                     revision=selected_revision)
+            # A Session store can additionally account for its static labels;
+            # the public GoalStore protocol does not require this capability.
+            preflight = getattr(self._store, "_validate_run_context", None)
+            if callable(preflight):
+                preflight(selected_context, goal_id=record.goal_id, revision=selected_revision)
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise GoalOperationError(operation=operation, code="invalid_run_context",
+                                     message="goal output source metadata exceeds its bounds") from exc
 
     @staticmethod
     async def _admit_control(before_effect):
@@ -236,18 +271,31 @@ class GoalManager:
     async def resume(self, *, expected_goal_id: str | None = None,
                      expected_control_revision: int | None = None,
                      before_effect: Callable[[], Awaitable[None] | None] | None = None,
-                     prepare_output: Callable[[], Awaitable[None]] | None = None) -> Optional[GoalRecord]:
+                     prepare_output: Callable[[], Awaitable[None]] | None = None,
+                     run_context: dict | None = None) -> Optional[GoalRecord]:
+        run_context = self._copy_run_context(run_context, operation="resume")
         async with self._control_lock:
             await self._admit_control(before_effect)
             record = self._read_control_target(
                 "resume", expected_goal_id, expected_control_revision, strict=prepare_output is not None)
             if record is None:
                 return None
+            context_changed = run_context is not None and run_context != record.run_context
+            in_flight = self._has_in_flight_goal_attempt(record)
+            if context_changed and (record.status is GoalStatus.ACTIVE or in_flight):
+                raise GoalOperationError(operation="resume", code="run_context_conflict",
+                                         message="cannot replace an active goal run context", goal=record)
+            if record.status in (GoalStatus.ACTIVE, GoalStatus.PAUSED, GoalStatus.BLOCKED):
+                next_revision = record.revision + int(record.status is not GoalStatus.ACTIVE and not in_flight)
+                self._validate_source_projection(record, operation="resume", context=run_context,
+                                                 revision=next_revision)
             if prepare_output is not None and record.status in (GoalStatus.ACTIVE, GoalStatus.PAUSED, GoalStatus.BLOCKED):
                 await prepare_output()
                 if record.status is GoalStatus.ACTIVE and self._has_output_stream():
                     self._ensure_goal_work_locked(record)
             if record.status in (GoalStatus.PAUSED, GoalStatus.BLOCKED):
+                if context_changed:
+                    record.run_context = run_context
                 # While paused, hosts freeze on time_used_seconds. If an attempt
                 # kept running, active_started_at still tracks that segment—
                 # fold it into time_used here so becoming ACTIVE jumps the
@@ -401,6 +449,7 @@ class GoalManager:
             goal_id=record.goal_id,
             revision=record.revision,
             session_id=record.session_id,
+            run_context=record.run_context,
         )
         queued = self._event_manager.push_goal(work)
         if queued:

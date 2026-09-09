@@ -83,6 +83,50 @@ class FakeSession:
         self._state.update(data)
 
 
+@pytest.mark.asyncio
+async def test_executor_reconstructs_source_from_task_metadata_not_scheduler_session():
+    from openjiuwen.core.session.agent import Session
+    from openjiuwen.core.session.stream import OutputSchema
+    from openjiuwen.core.single_agent.rail.base import RunContext, RunKind
+
+    agent = _make_agent()
+    deps, manager = _make_deps()
+    session = Session(session_id="actual-session", source_metadata={"source_binding_id": "old-reader"})
+    context = RunContext(session_id="actual-session", extra={
+        "private_permission": "do-not-project", "goal_id": "goal-1", "revision": 2,
+        "_interaction_request_id": "HOST_SPOOF",
+        "source_metadata": {"source_binding_id": "new-work", "source_task_id": "forged"},
+    })
+    await manager.add_task(CoreTask(task_id="actual-task", session_id="actual-session",
+                                   task_type=DEEP_TASK_TYPE, description="query", status=CoreTaskStatus.SUBMITTED,
+                                   metadata={"run_kind": RunKind.GOAL, "run_context": context}))
+
+    async def invoke(inputs, selected_session, **kwargs):
+        assert inputs["run_context"].extra["private_permission"] == "do-not-project"
+        assert selected_session._inner is session._inner
+        await selected_session.write_stream(OutputSchema(type="llm_output", index=0, payload={"content": "answer"}))
+        return {"output": "answer"}
+
+    agent.react_agent.invoke = invoke
+    executor = TaskLoopEventExecutor(deps, agent)
+    results = [chunk async for chunk in executor.execute_ability("actual-task", session)]
+    iterator = session.stream_iterator()
+    output = await anext(iterator)
+    assert output.payload["source_binding_id"] == "new-work"
+    assert output.payload["source_task_id"] == "actual-task"
+    assert output.payload["source_session_id"] == "actual-session"
+    assert output.payload["source_request_id"] is None
+    assert "private_permission" not in repr(output)
+    assert results[0].payload.metadata["source_binding_id"] == "new-work"
+    assert results[0].payload.metadata["task_id"] == "actual-task"
+    assert results[0].payload.metadata["source_request_id"] is None
+    # TaskScheduler writes the returned controller chunk through its original
+    # Session after the executor generator yields.
+    await session.write_stream(results[0])
+    assert (await anext(iterator)).payload.metadata["source_binding_id"] == "new-work"
+    await iterator.aclose()
+
+
 class FakeReactAgent:
     """Tracks invoke calls."""
 

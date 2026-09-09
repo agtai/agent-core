@@ -40,6 +40,7 @@ from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackEvent,
     TaskIterationInputs,
 )
+from openjiuwen.harness.schema.interaction import _source_metadata_for_run
 
 if TYPE_CHECKING:
     from openjiuwen.harness.deep_agent import (
@@ -130,6 +131,21 @@ class TaskLoopEventExecutor(TaskExecutor):
             is_follow_up = bool(meta.get("is_follow_up", False))
             task_run_kind = meta.get("run_kind")
             task_run_context = meta.get("run_context")
+
+        extra = (task_run_context.get("extra", {}) if isinstance(task_run_context, dict)
+                 else getattr(task_run_context, "extra", {}))
+        context_fields = ({**extra, **task_run_context}
+                          if isinstance(extra, dict) and isinstance(task_run_context, dict) else extra)
+        is_goal = getattr(task_run_kind, "value", task_run_kind) == "goal"
+        source = _source_metadata_for_run(
+            task_run_context, session_id=cid, task_id=task_id,
+            run_kind="goal" if is_goal else "user",
+            request_id=extra.get("_interaction_request_id") if not is_goal and isinstance(extra, dict) else None,
+            goal_id=context_fields.get("goal_id") if is_goal and isinstance(context_fields, dict) else None,
+            revision=context_fields.get("revision") if is_goal and isinstance(context_fields, dict) else None,
+        )
+        if source is not None:
+            session = session.with_source_metadata(source)
 
         coordinator = agent.loop_coordinator
         iteration = (
@@ -259,7 +275,7 @@ class TaskLoopEventExecutor(TaskExecutor):
             payload = ControllerOutputPayload(
                 type=EventType.TASK_COMPLETION,
                 data=[JsonDataFrame(data=result)],
-                metadata={"task_id": task_id},
+                metadata={**(source or {}), "task_id": task_id},
             )
             yield ControllerOutputChunk(
                 index=0,
@@ -304,7 +320,7 @@ class TaskLoopEventExecutor(TaskExecutor):
             payload = ControllerOutputPayload(
                 type=EventType.TASK_FAILED,
                 data=[TextDataFrame(text=str(exc))],
-                metadata={"task_id": task_id},
+                metadata={**(source or {}), "task_id": task_id},
             )
             yield ControllerOutputChunk(
                 index=0,

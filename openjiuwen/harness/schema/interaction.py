@@ -25,6 +25,23 @@ if TYPE_CHECKING:
 _OUTPUT_END = object()
 
 
+def _source_metadata_for_run(
+    run_context, *, session_id, task_id, run_kind, request_id=None, goal_id=None, revision=None,
+):
+    """Project only an explicitly public source map, then stamp SDK identities."""
+    extra = (run_context.get("extra", {}) if isinstance(run_context, dict)
+             else getattr(run_context, "extra", {}))
+    if not isinstance(extra, dict) or "source_metadata" not in extra:
+        return None
+    from openjiuwen.core.session.agent import _copy_json_mapping
+
+    source = _copy_json_mapping(extra["source_metadata"], max_bytes=4096)
+    source.update(source_session_id=session_id, source_task_id=task_id,
+                  source_request_id=request_id, source_run_kind=run_kind,
+                  source_goal_id=goal_id, source_goal_revision=revision)
+    return _copy_json_mapping(source, max_bytes=4096)
+
+
 class InteractionPhase(str, Enum):
     """Internal lifecycle phase of one session-scoped interaction loop."""
 
@@ -92,18 +109,20 @@ class RoundWorkItem:
         goal_id: str,
         revision: int,
         session_id: str,
+        run_context: Optional[Dict[str, object]] = None,
     ) -> "RoundWorkItem":
         """Build a goal work item wholly owned by openjiuwen."""
+        context = copy.deepcopy(run_context or {})
+        extra = context.get("extra")
+        if isinstance(extra, dict):
+            for reserved in ("goal_id", "revision", "session_id", "reset_loop"):
+                extra.pop(reserved, None)
+        context.update(goal_id=goal_id, revision=revision, session_id=session_id, reset_loop=True)
         return cls(
             kind="goal",
             request_id=None,
             inputs=copy.deepcopy(inputs),
-            context={
-                "goal_id": goal_id,
-                "revision": revision,
-                "session_id": session_id,
-                "reset_loop": True,
-            },
+            context=context,
         )
 
     @property
@@ -114,6 +133,17 @@ class RoundWorkItem:
     @property
     def reset_loop(self) -> bool:
         return bool(self.context.get("reset_loop", True))
+
+    def output_source_metadata(self, *, task_id: str, session_id: str):
+        """Return this work's public provenance, independently of its reader."""
+        run = self.inputs.get("run") or {}
+        context = self.context if self.kind == "goal" else run.get("context", {})
+        return _source_metadata_for_run(
+            context, session_id=session_id, task_id=task_id, run_kind=self.kind,
+            request_id=self.request_id,
+            goal_id=self.context.get("goal_id") if self.kind == "goal" else None,
+            revision=self.context.get("revision") if self.kind == "goal" else None,
+        )
 
 
 @dataclass
@@ -159,9 +189,12 @@ class InteractionEvent:
 
     @classmethod
     def goal_updated(cls, goal: Optional[Dict[str, object]]) -> InteractionEvent:
+        snapshot = copy.deepcopy(goal)
+        if snapshot is not None:
+            snapshot.pop("run_context", None)
         return cls(
             type=InteractionEventType.GOAL_UPDATED,
-            payload={"goal": copy.deepcopy(goal)},
+            payload={"goal": snapshot},
         )
 
     @classmethod
@@ -171,10 +204,15 @@ class InteractionEvent:
         code: str,
         message: str,
         goal: Optional[Dict[str, object]] = None,
+        source_metadata: Optional[Dict[str, object]] = None,
     ) -> InteractionEvent:
         payload: Dict[str, object] = {"code": code, "message": message}
         if goal is not None:
             payload["goal"] = copy.deepcopy(goal)
+            payload["goal"].pop("run_context", None)
+        if source_metadata is not None:
+            # Source labels must not replace the actual error contract.
+            payload = {**copy.deepcopy(source_metadata), **payload}
         return cls(type=InteractionEventType.EXECUTION_ERROR, payload=payload)
 
 

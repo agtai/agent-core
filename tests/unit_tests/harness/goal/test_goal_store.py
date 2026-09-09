@@ -46,6 +46,30 @@ class MergeSession:
         self._state.update(value)
 
 
+@pytest.mark.parametrize("context", ["{broken", "null", "[]", '{"extra":{"x":NaN}}', {"x": object()},
+    {"source_metadata": {"private_marker": "PRIVATE"}},
+    {"extra": {"source_metadata": {"public_label": "x" * 4000}}}])
+@pytest.mark.parametrize("operation", ["peek", "load"])
+def test_corrupt_run_context_never_repairs_into_unbound_execution(context, operation):
+    session = FakeSession()
+    raw = GoalRecord.create(session_id=session.get_session_id(), objective="goal").to_dict()
+    raw["run_context"] = context
+    session.update_state({SESSION_GOAL_RECORD_KEY: raw})
+    session.update_state = Mock(side_effect=AssertionError("must preserve corrupt binding"))
+    with pytest.raises(GoalOperationError, match="run context"):
+        getattr(SessionGoalStore(session), operation)()
+    session.update_state.assert_not_called()
+
+
+@pytest.mark.parametrize("context", [None, {"extra": {"binding": "old", "optional": None}}])
+def test_legacy_context_is_readable_without_migration(context):
+    session = FakeSession()
+    raw = GoalRecord.create(session_id=session.get_session_id(), objective="goal").to_dict()
+    raw["run_context"] = context
+    session.update_state({SESSION_GOAL_RECORD_KEY: raw})
+    assert SessionGoalStore(session).peek().run_context == context
+
+
 @pytest.mark.parametrize("raw", ["not-a-record", {"goal_id": "g"},
     GoalRecord.create(session_id="other", objective="private").to_dict()])
 def test_peek_rejects_invalid_or_wrong_session_state_without_repair(raw) -> None:

@@ -1,5 +1,8 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+import copy
+import json
+import math
 import uuid
 from typing import (
     Any,
@@ -28,7 +31,65 @@ if TYPE_CHECKING:
     from openjiuwen.core.single_agent import AgentCard
 
 
+def _copy_json_mapping(value: Any, *, max_bytes: int = 65536) -> dict[str, Any]:
+    """Snapshot bounded JSON without coercing keys, objects, or nonfinite numbers."""
+    if type(value) is not dict:
+        raise ValueError("context must be a JSON object")
+    remaining = 4096
+
+    def check(item, depth=0):
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > 32:
+            raise ValueError("context exceeds structural bounds")
+        if item is None or type(item) in (bool, int):
+            return
+        if type(item) is float and math.isfinite(item):
+            return
+        if type(item) is str and len(item) <= max_bytes:
+            return
+        if type(item) is dict:
+            for key, child in item.items():
+                if type(key) is not str or len(key) > max_bytes:
+                    raise ValueError("context keys must be bounded strings")
+                check(child, depth + 1)
+            return
+        if type(item) is list:
+            for child in item:
+                check(child, depth + 1)
+            return
+        raise ValueError("context contains a non-JSON or oversized value")
+
+    check(value)
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError("context exceeds serialized size bound")
+    return json.loads(encoded)
+
+
 class Session:
+    def __getattr__(self, name):
+        # Resolve methods on the view normally; only its missing state comes
+        # from the owner, including runtime caches installed after view creation.
+        owner = object.__getattribute__(self, "__dict__").get("_source_owner")
+        if owner is not None:
+            return getattr(owner, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name, value):
+        owner = object.__getattribute__(self, "__dict__").get("_source_owner")
+        if owner is not None and name not in ("_source_owner", "_source_metadata"):
+            setattr(owner, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        owner = object.__getattribute__(self, "__dict__").get("_source_owner")
+        if owner is not None and name not in ("_source_owner", "_source_metadata"):
+            delattr(owner, name)
+        else:
+            object.__delattr__(self, name)
+
     def __init__(self,
                  session_id: str = None,
                  envs: dict[str, Any] = None,
@@ -56,6 +117,7 @@ class Session:
         self._interaction = None
         self._close_stream_on_post_run = close_stream_on_post_run
         self._source_metadata = source_metadata or {}
+        self._source_owner = None
         self._parent_session_id = (
             parent_session_id.strip()
             if isinstance(parent_session_id, str) and parent_session_id.strip()
@@ -65,6 +127,20 @@ class Session:
 
     def get_session_id(self) -> str:
         return self._session_id
+
+    def with_source_metadata(self, metadata: dict[str, Any]) -> "Session":
+        """Return a provenance view sharing this Session's state and writer.
+
+        The JSON metadata is copied (4 KiB maximum). Views do not own pre/post
+        run or stream closure, and cannot change the provider cache identity.
+        Existing views and already-emitted chunks never share mutable metadata.
+        """
+        source = _copy_json_mapping(metadata, max_bytes=4096)
+        view = object.__new__(type(self))
+        view._source_metadata = _copy_json_mapping(
+            {**self._source_metadata, **source}, max_bytes=4096)
+        view._source_owner = self._source_owner or self
+        return view
 
     def get_parent_session_id(self) -> str | None:
         """Return the optional product Session that owns this child Session."""
@@ -122,6 +198,8 @@ class Session:
         Swarmflow workers, use their runtime session id as ``cache_id`` and may
         point at an explicit product-session parent.
         """
+        if self._source_owner is not None:
+            return self._source_owner.get_cache_identity()
         if self._team_cache_scope is not None:
             team_id, agent_id = self._team_cache_scope
             return KVCacheIdentity(
@@ -202,6 +280,9 @@ class Session:
         ).stream_output()
 
     async def pre_run(self, **kwargs):
+        if self._source_owner is not None:
+            await self._source_owner.pre_run(**kwargs)
+            return self
         if self._pre_run_done:
             return self
         from openjiuwen.core.runner.callback import trigger
@@ -222,11 +303,15 @@ class Session:
         full session cleanup (checkpointer). Use this when
         the caller (e.g. Runner) manages the session lifecycle.
         """
+        if self._source_owner is not None:
+            return
         await self._inner.stream_writer_manager().stream_emitter().close()
         from openjiuwen.core.runner.runner import Runner
         await Runner.callback_framework.unregister_event(event=self._session_id + "write_stream")
 
     async def post_run(self):
+        if self._source_owner is not None:
+            return self
         if self._post_run_done:
             return self
         if self._close_stream_on_post_run:
@@ -250,16 +335,35 @@ class Session:
     def _tag_stream_payload(self, data: Union[dict, OutputSchema]):
         if not self._source_metadata:
             return data
+        source = copy.deepcopy(self._source_metadata)
         if isinstance(data, dict):
-            return {**data, **self._source_metadata}
+            if {"type", "index", "payload"}.issubset(data):
+                return self._tag_stream_payload(OutputSchema.model_validate(data))
+            return {**data, **source}
         if isinstance(data, OutputSchema):
             payload = data.payload
-            if isinstance(payload, dict):
-                payload = {**payload, **self._source_metadata}
+            # Preserve controller protocol models instead of wrapping them in
+            # {value: ...}, which loses their type/data/metadata contract.
+            from openjiuwen.core.controller.schema.controller_output import ControllerOutputPayload
+
+            if isinstance(payload, ControllerOutputPayload):
+                # A controller writes executor-produced chunks through its
+                # original Session. Per-task labels beat those static defaults;
+                # an explicit source view remains authoritative for its writes.
+                metadata = (source | (payload.metadata or {}) if self._source_owner is None
+                            else (payload.metadata or {}) | source)
+                payload = payload.model_copy(update={"metadata": metadata})
+            elif isinstance(payload, dict):
+                if data.type == "controller_output":
+                    metadata = (source | (payload.get("metadata") or {}) if self._source_owner is None
+                                else (payload.get("metadata") or {}) | source)
+                    payload = {**payload, "metadata": metadata}
+                else:
+                    payload = {**payload, **source}
             else:
                 payload = {
                     "value": payload,
-                    **self._source_metadata,
+                    **source,
                 }
             return data.model_copy(update={"payload": payload})
         return data

@@ -37,6 +37,29 @@ Initialize the agent with the given configuration. Sets up the inner `ReActAgent
 
 **DeepAgent**: `self`, for method chaining.
 
+### async methods set_goal and resume_goal
+
+```python
+record, output = await agent.set_goal(objective, run_context=context, **controls)
+record, output = await agent.resume_goal(run_context=context, **controls)
+```
+
+These interaction entry points use the existing Goal manager, control CAS and
+single output lease. `run_context` is an optional bounded JSON dictionary saved
+with the Goal and copied into each actual task-loop attempt. It reaches rails
+through `RunContext`; the SDK's Goal/session/attempt identities take precedence.
+An omitted/null resume context preserves the binding. Only an idle paused or
+blocked Goal can install a changed context; a running attempt rejects changes
+with `GoalOperationError.code == "run_context_conflict"` before output admission.
+
+For public output correlation, explicitly supply `context["extra"]["source_metadata"]`.
+The SDK adds actual source request/task/session/Goal identities without copying
+the rest of the private context. The returned output can still belong to an
+earlier reader. `Session.with_source_metadata()` supplies immutable source views
+of the same state/writer at the real execution boundary; controller source labels
+remain in `payload.metadata` and preserve its typed payload. See the harness
+Goal README for bounds, persisted compatibility and the full source contract.
+
 ### async method invoke
 
 ```python

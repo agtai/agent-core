@@ -92,6 +92,245 @@ class ManagerHarness:
         self.notify_calls += 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context,accepted", [
+    (None, True),
+    ({"extra": {"source_metadata": {"source_binding_id": "bound"}}}, True),
+    ({"extra": {"source_metadata": {"public_label": "x" * 4000}}}, False),
+])
+async def test_public_goal_store_protocol_needs_no_private_preflight(context, accepted):
+    class ProtocolOnlyStore:
+        session_id = "custom-store-session"
+
+        def __init__(self):
+            self.record = None
+            self.commits = self.writes = 0
+
+        def load(self):
+            return self.record.copy_for_response() if self.record is not None else None
+
+        peek = load
+
+        def save(self, record):
+            self.record = record.copy_for_response()
+            self.writes += 1
+
+        def clear(self):
+            self.record = None
+
+        async def commit(self):
+            self.commits += 1
+
+    h = ManagerHarness(output_attached=False)
+    store = ProtocolOnlyStore()
+    h.manager._store = store
+    if not accepted:
+        with pytest.raises(GoalOperationError) as rejected:
+            await h.manager.set("custom store", run_context=context)
+        assert rejected.value.code == "invalid_run_context"
+        assert store.writes == store.commits == 0 and store.peek() is None
+        return
+    record = await h.manager.set("custom store", run_context=context)
+    assert record.run_context == context
+    await h.manager.pause()
+    resumed = await h.manager.resume()
+    assert resumed.status is GoalStatus.ACTIVE
+    assert resumed.run_context == context
+    assert store.writes == store.commits == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [
+    {"source_metadata": {"private_marker": "PRIVATE"}, "_interaction_request_id": "HOST_SPOOF"},
+    {"source_metadata": {"private_marker": "PRIVATE"},
+     "extra": {"source_metadata": {"source_binding_id": "public"}}},
+    {"extra": {"source_metadata": {"public_label": "x" * 4000}}},
+])
+async def test_goal_source_rejects_before_output_store_or_queue(context):
+    h = ManagerHarness()
+    prepared = []
+
+    async def prepare_output():
+        prepared.append(True)
+
+    with pytest.raises(GoalOperationError) as rejected:
+        await h.manager.set("goal", run_context=context, prepare_output=prepare_output)
+    assert rejected.value.code == "invalid_run_context"
+    assert prepared == []
+    assert h.store.peek() is None
+    assert h.session.commit_count == h.notify_calls == 0
+    assert h.emitted == []
+    assert not h.events.has_pending_work()
+
+
+@pytest.mark.asyncio
+async def test_resume_source_size_rejects_before_output_and_preserves_binding():
+    h = ManagerHarness()
+    await h.manager.set("goal", run_context={"extra": {"source_metadata": {"source_binding_id": "old"}}})
+    record = await h.manager.pause()
+    before = (h.session.commit_count, h.notify_calls, list(h.emitted), record.to_dict())
+    prepared = []
+
+    async def prepare_output():
+        prepared.append(True)
+
+    with pytest.raises(GoalOperationError) as rejected:
+        await h.manager.resume(expected_goal_id=record.goal_id,
+                               expected_control_revision=record.control_revision,
+                               run_context={"extra": {"source_metadata": {"public_label": "x" * 4000}}},
+                               prepare_output=prepare_output)
+    assert rejected.value.code == "invalid_run_context"
+    assert prepared == []
+    assert before == (h.session.commit_count, h.notify_calls, h.emitted, h.store.peek().to_dict())
+    assert not h.events.has_pending_work()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id,static_labels", [
+    ("s" * 4100, {}), ("session", {"static_label": "x" * 4000}),
+], ids=["actual-session-too-long", "static-session-labels-too-large"])
+async def test_goal_source_budget_includes_actual_session_and_static_labels(session_id, static_labels):
+    from openjiuwen.core.session.agent import Session
+    from unittest.mock import AsyncMock
+
+    h = ManagerHarness()
+    session = Session(session_id=session_id, source_metadata=static_labels)
+    session.commit = AsyncMock()
+    h.manager._store = SessionGoalStore(session)
+    prepare = AsyncMock()
+    with pytest.raises(GoalOperationError) as rejected:
+        await h.manager.set("goal", run_context={"extra": {"source_metadata": {"source_binding_id": "bound"}}},
+                            prepare_output=prepare)
+    assert rejected.value.code == "invalid_run_context"
+    prepare.assert_not_called()
+    session.commit.assert_not_called()
+    assert session.get_state(SESSION_GOAL_RECORD_KEY) is None
+    assert h.notify_calls == 0 and not h.events.has_pending_work()
+
+
+@pytest.mark.asyncio
+async def test_complete_source_projection_at_bound_executes_and_survives_continuation():
+    import json
+    from openjiuwen.harness.schema.interaction import _source_metadata_for_run
+
+    h = ManagerHarness()
+    base = {"public_label": ""}
+    projected = _source_metadata_for_run({"extra": {"source_metadata": base}},
+                                        session_id=h.store.session_id, task_id="0" * 32,
+                                        run_kind="goal", goal_id="0" * 12, revision=1)
+    base["public_label"] = "x" * (4096 - len(json.dumps(projected, separators=(",", ":")).encode()))
+    record = await h.manager.set("goal", run_context={"extra": {"source_metadata": base}})
+    work = h.events.next_work()
+    source = work.output_source_metadata(task_id="1" * 32, session_id=h.store.session_id)
+    assert len(json.dumps(source, separators=(",", ":")).encode()) == 4096
+    h.events.mark_started(work)
+    await h.manager.begin_attempt(goal_id=record.goal_id, revision=record.revision)
+    h.events.mark_finished(work)
+    await h.manager.apply_assessment(goal_id=record.goal_id, revision=record.revision,
+                                    assessment=GoalAssessment(status=GoalAssessmentStatus.CONTINUE, evidence="more"))
+    continued = h.events.next_work()
+    assert continued is not None
+    assert continued.output_source_metadata(task_id="2" * 32, session_id=h.store.session_id)["public_label"] == base["public_label"]
+    h.events.mark_started(continued)
+    h.events.mark_finished(continued)
+    # Idle resume can increase the serialized revision width. Validate the
+    # proposed generation, not just the stored one that still fits exactly.
+    current = h.store.peek()
+    current.revision = 9
+    h.store.save(current)
+    paused = await h.manager.pause()
+    prepared = []
+
+    async def prepare_output():
+        prepared.append(True)
+
+    with pytest.raises(GoalOperationError) as rejected:
+        await h.manager.resume(expected_goal_id=paused.goal_id,
+                               expected_control_revision=paused.control_revision,
+                               prepare_output=prepare_output)
+    assert rejected.value.code == "invalid_run_context"
+    assert prepared == []
+    assert h.store.peek().to_dict() == paused.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_goal_run_context_survives_store_and_continuation_without_aliases() -> None:
+    h = ManagerHarness()
+    context = {"extra": {"binding": {"model": "native", "optional": None}}}
+    record = await h.manager.set("bound goal", run_context=context)
+    context["extra"]["binding"]["model"] = "changed"
+    record.run_context["extra"]["binding"]["model"] = "response changed"
+    stored = h.store.peek()
+    assert stored.run_context == {"extra": {"binding": {"model": "native", "optional": None}}}
+    work = h.events.next_work()
+    assert work.context["extra"]["binding"] == {"model": "native", "optional": None}
+    h.events.mark_started(work)
+    h.events.mark_finished(work)
+    await h.manager.apply_assessment(
+        goal_id=stored.goal_id, revision=stored.revision,
+        assessment=GoalAssessment(status=GoalAssessmentStatus.CONTINUE, evidence="continue"),
+    )
+    assert h.events.next_work().context["extra"]["binding"]["model"] == "native"
+
+
+@pytest.mark.asyncio
+async def test_goal_updates_never_project_private_run_context():
+    h = ManagerHarness()
+    record = await h.manager.set("goal", run_context={"extra": {"permission_secret": "private"}})
+    assert record.to_dict()["run_context"]["extra"]["permission_secret"] == "private"
+    assert "run_context" not in h.emitted[-1].payload["goal"]
+    assert "permission_secret" not in repr(h.emitted)
+
+
+@pytest.mark.asyncio
+async def test_idle_resume_replaces_context_but_running_resume_rejects_before_output() -> None:
+    h = ManagerHarness()
+    original = await h.manager.set("goal", run_context={"extra": {"old_permission": "yes"}})
+    work = h.events.next_work()
+    h.events.mark_started(work)
+    paused = await h.manager.pause()
+    effects = (h.session.commit_count, h.notify_calls, len(h.emitted))
+    prepared = []
+
+    async def prepare_output():
+        prepared.append(True)
+
+    with pytest.raises(GoalOperationError, match="run context") as rejected:
+        await h.manager.resume(
+            expected_goal_id=paused.goal_id, expected_control_revision=paused.control_revision,
+            run_context={"extra": {"binding": "new"}}, prepare_output=prepare_output,
+        )
+    assert rejected.value.code == "run_context_conflict"
+    assert prepared == []
+    assert effects == (h.session.commit_count, h.notify_calls, len(h.emitted))
+    h.events.mark_finished(work)
+    resumed = await h.manager.resume(
+        expected_goal_id=paused.goal_id, expected_control_revision=paused.control_revision,
+        run_context={"extra": {"binding": "new", "optional": None}},
+    )
+    assert resumed.run_context == {"extra": {"binding": "new", "optional": None}}
+    assert h.store.peek().run_context == resumed.run_context
+    next_work = h.events.next_work()
+    assert "old_permission" not in next_work.context["extra"]
+    assert next_work.context["goal_id"] == original.goal_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", [{"x": object()}, {"x": float("nan")}, {1: "x"}, {"x": "x" * 65537}])
+async def test_invalid_goal_run_context_has_zero_admission_effects(context) -> None:
+    h = ManagerHarness()
+    prepared = []
+
+    async def prepare_output():
+        prepared.append(True)
+
+    with pytest.raises(GoalOperationError) as rejected:
+        await h.manager.set("goal", run_context=context, prepare_output=prepare_output)
+    assert rejected.value.code == "invalid_run_context"
+    assert h.store.peek() is None
+    assert (h.session.commit_count, h.notify_calls, h.emitted, prepared) == (0, 0, [], [])
+
+
 def test_read_only_manager_peek_preserves_corrupt_state_with_zero_execution_effects() -> None:
     harness = ManagerHarness(output_attached=False)
     harness.session.update_state({SESSION_GOAL_RECORD_KEY: "corrupt"})

@@ -27,6 +27,86 @@ from openjiuwen.harness.tools.worktree.session import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("context,request_id", [
+    ({"source_metadata": {"private_marker": "PRIVATE"}}, "request"),
+    ({"extra": {"source_metadata": {"public_label": "x" * 4000}}}, "request"),
+    ({"extra": {"source_metadata": {"source_binding_id": "binding"}}}, "x" * 4100),
+], ids=["private-alias", "final-map-too-large", "request-id-too-large"])
+async def test_user_source_rejects_before_queue_or_wakeup(monkeypatch, context, request_id):
+    from openjiuwen.core.session.agent import Session
+
+    agent = DeepAgent(AgentCard(name="source-admission", description="test"))
+    agent._interaction_started = True
+    agent._interaction_session = Session(session_id="session")
+    notify = MagicMock()
+    monkeypatch.setattr(agent, "_notify_work", notify)
+    with pytest.raises(ValueError):
+        await agent.send_input(SendInputRequest(request_id=request_id,
+                               inputs={"query": "hello", "run": {"context": context}}))
+    assert not agent._event_manager.has_pending_work()
+    notify.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["source_metadata", "_interaction_request_id"])
+def test_normalize_rejects_reserved_top_level_source_aliases(field):
+    agent = DeepAgent(AgentCard(name="source-normalize", description="test"))
+    with pytest.raises(ValueError):
+        agent._normalize_inputs({"query": "hello", "run": {"context": {field: "private"}}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "user"])
+async def test_bound_goal_round_keeps_private_context_and_tags_only_public_source(monkeypatch, kind):
+    from openjiuwen.core.session.agent import Session
+
+    agent = DeepAgent(AgentCard(name="bound-round", description="test"))
+    session = Session(session_id="actual-session")
+    work = RoundWorkItem.goal(
+        inputs={"query": "continue"}, goal_id="actual-goal", revision=7,
+        session_id="actual-session", run_context={
+            "session_id": "forged", "goal_id": "forged", "revision": 99,
+            "extra": {"goal_id": "forged", "revision": 99, "private_permission": "secret",
+                      "_interaction_request_id": "HOST_SPOOF",
+                      "source_metadata": {"source_binding_id": "binding-1", "source_request_id": "forged",
+                                          "source_task_id": "forged", "source_goal_id": "forged"}},
+        })
+    if kind == "user":
+        work = RoundWorkItem.user(request_id="actual-request", inputs={"query": "continue",
+                                  "run": {"context": work.context}})
+    controller = MagicMock()
+    controller.submit_round = AsyncMock()
+    controller.wait_round_completion = AsyncMock(return_value={"output": "answer"})
+    coordinator = MagicMock()
+    monkeypatch.setattr(agent, "prepare_interaction_task_loop", AsyncMock(return_value=(coordinator, controller)))
+    monkeypatch.setattr(agent, "load_state", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(agent, "save_state", MagicMock())
+    monkeypatch.setattr(agent, "clear_state", MagicMock())
+    monkeypatch.setattr(agent, "_build_interaction_next_work", MagicMock(return_value=None))
+
+    async def write_result(result, selected_session):
+        from openjiuwen.core.session.stream import OutputSchema
+        await selected_session.write_stream(OutputSchema(type="answer", index=0, payload=result))
+
+    monkeypatch.setattr(agent, "_write_round_result_to_stream", write_result)
+    outcome = await agent.run_one_round(work, "actual-task", session)
+    assert outcome.error_code is None
+    context = controller.submit_round.await_args.kwargs["run_context"]
+    assert context.session_id == "actual-session"
+    assert context.extra["goal_id"] == "actual-goal"
+    assert context.extra["revision"] == 7
+    assert context.extra["private_permission"] == "secret"
+    assert context.extra["_interaction_request_id"] == ("actual-request" if kind == "user" else None)
+    iterator = session.stream_iterator()
+    output = await anext(iterator)
+    assert output.payload["source_binding_id"] == "binding-1"
+    assert output.payload["source_request_id"] == ("actual-request" if kind == "user" else None)
+    assert output.payload["source_task_id"] == "actual-task"
+    assert output.payload["source_goal_id"] == ("actual-goal" if kind == "goal" else None)
+    assert "private_permission" not in repr(output)
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
 async def test_start_initializes_context_before_scheduler_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
