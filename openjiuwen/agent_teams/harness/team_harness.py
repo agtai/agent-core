@@ -72,6 +72,15 @@ class TeamHarness:
         self._active_agent_session: Optional[Any] = None
         self._native_session_id: Optional[str] = None
         self._bg_controller: Optional[Any] = None
+        # One controller belongs to the leader runtime, including when the
+        # embedder uses Runner's default streaming arguments. Worker/avatar
+        # harnesses do not own workflow runs and need no controller.
+        from openjiuwen.agent_teams.schema.team import TeamRole
+
+        if role is TeamRole.LEADER:
+            from openjiuwen.agent_teams.runtime.background_task_controller import BackgroundTaskController
+
+            self.set_background_task_controller(BackgroundTaskController())
 
     # ------------------------------------------------------------------
     # Construction
@@ -474,6 +483,11 @@ class TeamHarness:
         if self._native is not None:
             await memory_manager.load_and_inject(self._native, query=query)
 
+    @property
+    def background_task_controller(self) -> Any:
+        """Return the existing run controller without constructing a runtime."""
+        return self._bg_controller
+
     def set_background_task_controller(self, controller: Any) -> None:
         """Attach the embedder's background task controller (pause/resume surface).
 
@@ -481,7 +495,14 @@ class TeamHarness:
         (``start`` re-pushes it to the freshly built native); also pushed to the
         current native immediately so a controller attached after start takes
         effect without waiting for the next cycle.
+
+        Replacing a controller with active or paused runs would orphan their
+        input/control authority and is rejected. Reattaching it is idempotent.
         """
+        if controller is self._bg_controller:
+            return
+        if self._bg_controller is not None and self._bg_controller.has_owned_runs():
+            raise ValueError("cannot replace a background controller while it owns runs")
         self._bg_controller = controller
         if self._native is not None:
             self._native.background_task_controller = controller

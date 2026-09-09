@@ -34,7 +34,10 @@ override it without standing up a real LLM.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.interaction.payload import DeliverResult
 
 from openjiuwen.agent_teams.kv_cache import kv_cache_hooks
 from openjiuwen.agent_teams.schema.team import TeamRole
@@ -140,6 +143,7 @@ class TeamWorkerBackend(AgentBackend):
         # Stateful agent_session / human_session manager, built on first use so a
         # workflow that only uses single-shot agent() never pays for it.
         self._session_mgr: Any = None
+        self._human_reply_admission: Callable[[], bool] | None = None
 
     async def run(self, prompt: str, opts: dict, schema_json: dict | None) -> AgentResult:
         member_name = self._next_member_name(opts)
@@ -225,7 +229,16 @@ class TeamWorkerBackend(AgentBackend):
                 on_human_prompt=self._on_human_prompt,
                 on_human_replied=self._on_human_replied,
             )
+            if self._human_reply_admission is not None:
+                self._session_mgr.bind_human_reply_admission(self._human_reply_admission)
         return self._session_mgr
+
+    def bind_human_reply_admission(self, admitted: Callable[[], bool]) -> None:
+        """Keep this backend bound to its original pool/run lifecycle owner."""
+        if self._human_reply_admission is None:
+            self._human_reply_admission = admitted
+            if self._session_mgr is not None:
+                self._session_mgr.bind_human_reply_admission(admitted)
 
     async def open_session(self, *, kind: str, instructions: str | None, opts: dict) -> str:
         """Open a stateful session (see :class:`AvatarSessionManager`)."""
@@ -245,6 +258,33 @@ class TeamWorkerBackend(AgentBackend):
         return await self._sessions().send_turn(
             session_id, prompt, opts, schema_json, history=history, correlation_id=correlation_id
         )
+
+    @property
+    def human_reply_scope(self) -> tuple[str | None, str, str | None]:
+        """Identity of this existing workflow run, without opening a session."""
+        return self._session_id, self._team_name, self._run_id
+
+    def reply_swarmflow_human(
+        self,
+        *,
+        session_id: str,
+        team_name: str,
+        run_id: str,
+        correlation_id: str,
+        answer: str,
+        before_effect: Callable[[], None] | None = None,
+    ) -> "DeliverResult":
+        """Receive raw input through the existing avatar manager only."""
+        from openjiuwen.agent_teams.interaction.payload import DeliverResult
+
+        if self.human_reply_scope != (session_id, team_name, run_id):
+            return DeliverResult.failure("unknown_run")
+        manager = self._session_mgr  # Deliberately never call lazy _sessions().
+        if manager is None or manager.human_reply_scope != self.human_reply_scope:
+            return DeliverResult.failure("no_pending_human_reply")
+        if manager.submit_human_reply(correlation_id, answer, before_effect=before_effect):
+            return DeliverResult.success(None)
+        return DeliverResult.failure("no_pending_human_reply")
 
     async def close_session(self, session_id: str) -> None:
         """Close one open session (no-op when no session was ever opened)."""

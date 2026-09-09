@@ -18,6 +18,7 @@ import shutil
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Optional,
 )
 
@@ -165,13 +166,22 @@ class TeamRuntimeManager:
             team_db_state,
             pool_entry is not None,
         )
-        return await self._apply_action(
+        activation = await self._apply_action(
             action,
             spec=spec,
             team_session=team_session,
             pool_entry=pool_entry,
             inputs=inputs,
         )
+        if action.kind not in _REJECT_KINDS and activation.agent is not None:
+            self.bind_swarmflow_human_reply_admission(activation.agent)
+        return activation
+
+    def bind_swarmflow_human_reply_admission(self, agent) -> None:
+        """Bind existing run consumers to this pool; never construct an owner."""
+        controller = getattr(getattr(agent, "harness", None), "background_task_controller", None)
+        if controller is not None:
+            controller.bind_human_reply_admission(self._pool.make_human_reply_admission)
 
     async def finalize(
         self,
@@ -204,6 +214,8 @@ class TeamRuntimeManager:
                 session_id,
             )
             return
+        entry.closing = True
+        self.bind_swarmflow_human_reply_admission(entry.agent)
         agent = entry.agent
         try:
             shutdown_requested = await agent.is_shutdown_requested()
@@ -346,10 +358,47 @@ class TeamRuntimeManager:
                 session_id,
             )
             return False
+        entry.closing = True
+        self.bind_swarmflow_human_reply_admission(entry.agent)
         await entry.agent.pause_coordination()
         entry.state = RuntimeState.PAUSED
         team_logger.info("pause: team {} session {} paused", team_name, session_id)
         return True
+
+    async def reply_swarmflow_human(
+        self,
+        *,
+        session_id: str,
+        team_name: str,
+        run_id: str,
+        correlation_id: str,
+        answer: str,
+        before_effect: Callable[[], None] | None = None,
+    ) -> DeliverResult:
+        """Resolve an exact existing human wait, without restore or bus fallback.
+
+        All owner checks and consumption after the pool lookup are synchronous
+        on the runtime's event loop. The controller and avatar retain their own
+        run/Future authority; no second registry or scheduler is introduced.
+        """
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (session_id, team_name, run_id, correlation_id)):
+            return DeliverResult.failure("missing_target")
+        if not isinstance(answer, str):
+            return DeliverResult.failure("invalid_answer")
+        entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
+        if entry is None:
+            return DeliverResult.failure("not_active")
+        if entry.closing or entry.state is not RuntimeState.RUNNING or entry.interact_gate.closed:
+            return DeliverResult.failure("gate_closed")
+        harness = entry.agent.harness
+        controller = getattr(harness, "background_task_controller", None)
+        if controller is None:
+            return DeliverResult.failure("no_background_controller")
+        return controller.reply_swarmflow_human(
+            session_id=session_id, team_name=team_name, run_id=run_id,
+            correlation_id=correlation_id, answer=answer, before_effect=before_effect,
+        )
 
     async def interact(
         self,
@@ -481,6 +530,8 @@ class TeamRuntimeManager:
         answer: str,
     ) -> DeliverResult:
         """Publish a swarmflow human reply on the run's dedicated reply topic."""
+        if getattr(entry, "closing", False):
+            return DeliverResult.failure("gate_closed")
         from openjiuwen.agent_teams.schema.events import (
             EventMessage,
             TeamEvent,
@@ -655,6 +706,8 @@ class TeamRuntimeManager:
                 session_id,
             )
             return False
+        entry.closing = True
+        self.bind_swarmflow_human_reply_admission(entry.agent)
         try:
             await entry.agent.stop_coordination()
         except Exception as exc:
@@ -1035,6 +1088,7 @@ class TeamRuntimeManager:
             await self._pre_run_with_inputs(team_session, inputs)
             pool_entry.state = RuntimeState.RUNNING
             await pool_entry.interact_gate.reset()
+            pool_entry.closing = False
             return TeamRuntimeActivation(agent=pool_entry.agent, session=team_session, action=action)
 
         # Cold paths — no pool entry. ``activate`` has already torn down

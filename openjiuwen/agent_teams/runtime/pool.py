@@ -26,7 +26,7 @@ from dataclasses import (
     field,
 )
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from openjiuwen.agent_teams.runtime.gate import InteractGate
 
@@ -50,6 +50,8 @@ class ActiveTeam:
     current_session_id: str
     state: RuntimeState = RuntimeState.RUNNING
     interact_gate: InteractGate = field(default_factory=InteractGate)
+    # Fence exact human receipts before asynchronous pause/stop/finalize starts.
+    closing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,24 @@ class TeamRuntimePool:
         """Return the entry for ``team_name`` or ``None``."""
         async with self._lock:
             return self._teams.get(team_name)
+
+    def make_human_reply_admission(self, session_id: str | None, team_name: str) -> Callable[[], bool]:
+        """Bind a synchronous input guard to this exact existing pool owner.
+
+        Called and checked on the pool's event loop. The captured identity must
+        still occupy the slot; replacing a team cannot revive an old run. Warm
+        resume of the same entry observes its reopened lifecycle/gate directly.
+        """
+        owner = self._teams.get(team_name)
+
+        def admitted() -> bool:
+            return (
+                owner is not None and self._teams.get(team_name) is owner
+                and owner.current_session_id == session_id and not owner.closing
+                and owner.state is RuntimeState.RUNNING and not owner.interact_gate.closed
+            )
+
+        return admitted
 
     async def has_active(self, team_name: str) -> bool:
         """Check whether the pool currently holds an entry for ``team_name``."""

@@ -23,6 +23,7 @@ no process-global state: every session is an instance-scoped row, cleaned up on
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -96,6 +97,8 @@ class _SessionState:
     turn_future: asyncio.Future | None = None
     last_finished: dict | None = None
     failed: bool = False
+    closing: bool = False
+    human_future: asyncio.Future | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one turn at a time
 
 
@@ -151,6 +154,9 @@ class AvatarSessionManager:
         # inbound reply arrives on the dedicated messager topic (subscribed lazily
         # on the first human session) and is routed by ``_on_reply_event``.
         self._pending_human: dict[str, asyncio.Future] = {}
+        self._consuming_human: set[str] = set()
+        self._closing = False
+        self._human_reply_admission: Callable[[], bool] | None = None
         self._on_human_prompt = on_human_prompt
         self._on_human_replied = on_human_replied
         self._human_timeout = human_timeout if human_timeout is not None else _DEFAULT_HUMAN_TIMEOUT
@@ -167,6 +173,8 @@ class AvatarSessionManager:
 
     async def open_session(self, *, kind: str, instructions: str | None, opts: dict) -> str:
         """Mint a member identity, build the avatar harness, and start it."""
+        if self._closing:
+            raise BackendError("avatar session manager is closing")
         base = self._human_base_spec if kind == "human" else self._worker_base_spec
         if base is None:
             raise BackendError(f"no base spec available for {kind!r} sessions")
@@ -233,6 +241,8 @@ class AvatarSessionManager:
         if state is None:
             raise BackendError(f"unknown session {session_id!r}")
         async with state.lock:
+            if self._closing or state.closing or self._sessions.get(session_id) is not state:
+                raise BackendError(f"session {session_id!r} is closing")
             if state.kind == "human":
                 return await self._human_turn(state, prompt, opts, schema_json, correlation_id)
             return await self._agent_turn(state, prompt, schema_json)
@@ -242,6 +252,12 @@ class AvatarSessionManager:
         state = self._sessions.get(session_id)
         if state is None:
             return
+        # A human turn holds state.lock while waiting for input. Fence/cancel
+        # that wait before acquiring the lock, so closing cannot accept a reply
+        # or deadlock behind a person who is no longer expected to answer.
+        state.closing = True
+        if state.human_future is not None and not state.human_future.done():
+            state.human_future.cancel()
         async with state.lock:
             if self._sessions.get(session_id) is not state:
                 return
@@ -272,6 +288,7 @@ class AvatarSessionManager:
 
     async def aclose(self) -> None:
         """Cancel pending human waits, unsubscribe, and dispose every session."""
+        self._closing = True
         for fut in list(self._pending_human.values()):
             if not fut.done():
                 fut.cancel()
@@ -302,6 +319,7 @@ class AvatarSessionManager:
         ``aclose`` on the run's unwind; an aborted-but-not-disposed harness is
         harmless — resume rebuilds fresh avatars, and journal-hit turns build none.
         """
+        self._closing = True
         for fut in list(self._pending_human.values()):
             if not fut.done():
                 fut.cancel()
@@ -317,24 +335,56 @@ class AvatarSessionManager:
         if failed:
             raise BackendError(f"avatar abort unconfirmed: {', '.join(failed)}")
 
-    def submit_human_reply(self, correlation_id: str, answer: str) -> bool:
+    @property
+    def human_reply_scope(self) -> tuple[str | None, str, str | None]:
+        """Identity of the original owner of this run's pending human inputs."""
+        return self._session_id, self._team_name, self._run_id
+
+    def bind_human_reply_admission(self, admitted: Callable[[], bool]) -> None:
+        """Bind once to the original live pool/run authority for both transports."""
+        if self._human_reply_admission is None:
+            self._human_reply_admission = admitted
+
+    def submit_human_reply(
+        self, correlation_id: str, answer: str, *, before_effect: Callable[[], None] | None = None,
+    ) -> bool:
         """Resolve a pending human turn with the person's raw reply.
 
         The inbound seam: whatever transport carries a real person's answer
         (messager round-trip from ``interact_agent_team``) calls this with the
         ``correlation_id`` from the outbound prompt. An unknown / already-resolved
-        correlation is rejected (returns ``False``) — an illegal id from an
-        external caller is dropped, not applied to some other turn.
+        correlation is rejected (returns ``False``). Both exact Runner delivery
+        and legacy messager delivery consume here. All operations are synchronous
+        on the owning event loop. A reservation also fences a callback attempting
+        reentrant consumption through the legacy path. Callback exceptions leave
+        the same Future pending and propagate unchanged.
         """
         fut = self._pending_human.get(correlation_id)
-        if fut is None or fut.done():
+        if self._closing or fut is None or fut.done() or correlation_id in self._consuming_human:
             team_logger.warning(
                 "[swarmflow] rejected human reply for unknown/closed correlation_id %r",
                 correlation_id,
             )
             return False
-        fut.set_result(answer)
-        return True
+        try:
+            if fut.get_loop() is not asyncio.get_running_loop():
+                return False
+        except RuntimeError:
+            return False
+        if self._human_reply_admission is not None and not self._human_reply_admission():
+            return False
+        self._consuming_human.add(correlation_id)
+        try:
+            if before_effect is not None:
+                callback_result = before_effect()
+                if inspect.isawaitable(callback_result):
+                    if inspect.iscoroutine(callback_result):
+                        callback_result.close()
+                    raise TypeError("before_effect must be synchronous")
+            fut.set_result(answer)
+            return True
+        finally:
+            self._consuming_human.discard(correlation_id)
 
     # ------------------------------------------------------------------
     # Avatar lifecycle
@@ -554,10 +604,13 @@ class AvatarSessionManager:
         person's reply carries it back. It is stable across a resume, so a reply
         issued for an interrupted-then-resumed turn still matches.
         """
+        if self._closing or state.closing:
+            raise BackendError("human input owner is closing")
         corr = correlation_id or f"{state.member_name}:{state.turns_executed}"
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_human[corr] = fut
+        state.human_future = fut
         if self._on_human_prompt is not None:
             try:
                 self._on_human_prompt(state.member_name, corr, prompt)
@@ -575,6 +628,8 @@ class AvatarSessionManager:
             return None
         finally:
             self._pending_human.pop(corr, None)
+            if state.human_future is fut:
+                state.human_future = None
         if self._on_human_replied is not None:
             try:
                 self._on_human_replied(state.member_name, corr, raw)

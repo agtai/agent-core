@@ -189,3 +189,50 @@ The optional synchronous callback requests cancellation of that exact execution.
 The original task retains its result/exception. NativeHarness async tools and
 the Live Voice Work adapter use this same primitive. Async-tool control receipts
 expose `execution_settled`; an acknowledged cancel is not proof of termination.
+
+### Exact Swarmflow human input receipt
+
+Each leader `TeamHarness` owns one `BackgroundTaskController` by default, so
+ordinary `Runner.run_agent_team_streaming(...)` calls need no extra controller
+argument. The same controller survives warm resume and native rebuilds;
+worker/avatar harnesses do not create one. An explicit controller can replace
+the empty default, but replacement is rejected while the original owns active
+or paused runs. Reattaching the same controller is idempotent.
+
+For an already-running team, use:
+
+```python
+receipt = await Runner.reply_swarmflow_human(
+    session_id=session_id,
+    team_name=team_name,
+    run_id=run_id,
+    correlation_id=correlation_id,
+    answer=raw_answer,
+    before_effect=check_reply_authority,  # optional synchronous callback
+)
+```
+
+All four target identifiers must be nonempty strings and must match the existing
+team, session, run and pending human turn exactly. The SDK preserves the raw
+string answer, including whitespace. It never activates or restores a missing
+owner, creates an avatar session, or falls back to message publication.
+
+`receipt.ok` proves that the original pending human-input Future received the
+answer. It does not prove avatar formatting, tool execution or workflow business
+completion. The existing `DeliverResult` carries no message ID for this path.
+Failures use `missing_target`, `invalid_answer`, `not_active`, `gate_closed`,
+`no_background_controller`, `unknown_run`, `ambiguous_run`, `run_closed` or
+`no_pending_human_reply`. Retry after a successful receipt is rejected.
+
+The optional callback runs synchronously on the owner's event loop after exact
+scope and pending checks, immediately before consumption, with no intervening
+await. It may raise to revoke authority; the exception propagates unchanged and
+the same Future remains pending. The callback must not return an awaitable or
+mutate SDK lifecycle state. Both this API and legacy messager replies consume
+through `AvatarSessionManager.submit_human_reply`, so only one can receive the
+input. That common consumer also checks the original pool-entry identity and
+current run/lifecycle admission, including legacy messages already in transit
+when pause/stop/finalize starts. Warm resume of the same owner reopens admission;
+replacement or removal of that owner never revives its old inputs.
+Legacy `interact_agent_team` still reports publication rather than this stronger
+receipt. Tool permission approval remains on its existing separate API.

@@ -46,6 +46,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    Callable,
     Optional,
     Union,
 )
@@ -72,6 +73,7 @@ from openjiuwen.core.single_agent import (
 )
 
 if TYPE_CHECKING:
+    from openjiuwen.agent_teams.interaction.payload import DeliverResult
     from openjiuwen.agent_teams.monitor import (
         TeamMonitor,
         TeamStreamLogger,
@@ -271,6 +273,7 @@ class _TeamRunnerMixin:
                     # Attach the embedder's pause/resume control surface to the
                     # leader brain; SwarmflowTool reads it to register run handles.
                     activation.agent.set_background_task_controller(background_task_controller)
+                self._get_team_runtime_manager().bind_swarmflow_human_reply_admission(activation.agent)
                 async for chunk in activation.agent.stream(inputs, session=activation.session):
                     if stream_logger is not None:
                         stream_logger.feed(chunk)
@@ -468,6 +471,32 @@ class _TeamRunnerMixin:
             session_id=session_id,
             member_name=member_name,
             callback=callback,
+        )
+
+    async def reply_swarmflow_human(
+        self,
+        *,
+        session_id: str,
+        team_name: str,
+        run_id: str,
+        correlation_id: str,
+        answer: str,
+        before_effect: Callable[[], None] | None = None,
+    ) -> "DeliverResult":
+        """Deliver raw human input to an exact, already-pending Swarmflow turn.
+
+        Success proves input receipt only. This never activates/restores a team
+        or publishes an unacknowledged message. The optional synchronous callback
+        runs at the original Future owner after all checks, immediately before
+        consumption; its exception propagates and leaves that input pending.
+        """
+        from openjiuwen.agent_teams.interaction.payload import DeliverResult
+
+        if self._team_runtime_manager is None:
+            return DeliverResult.failure("not_active")
+        return await self._team_runtime_manager.reply_swarmflow_human(
+            session_id=session_id, team_name=team_name, run_id=run_id,
+            correlation_id=correlation_id, answer=answer, before_effect=before_effect,
         )
 
     async def pause_agent_team(
@@ -1011,6 +1040,27 @@ class _TeamRunnerClassMixin:
             session_id=session_id,
             member_name=member_name,
             callback=callback,
+        )
+
+    @classmethod
+    async def reply_swarmflow_human(
+        cls,
+        *,
+        session_id: str,
+        team_name: str,
+        run_id: str,
+        correlation_id: str,
+        answer: str,
+        before_effect: Callable[[], None] | None = None,
+    ) -> "DeliverResult":
+        """Receive exact pending human input; success is not workflow completion.
+
+        ``before_effect`` must be synchronous. It runs once immediately before
+        the original pending Future is resolved; exceptions propagate unchanged.
+        """
+        return await _global_runner().reply_swarmflow_human(
+            session_id=session_id, team_name=team_name, run_id=run_id,
+            correlation_id=correlation_id, answer=answer, before_effect=before_effect,
         )
 
     @classmethod

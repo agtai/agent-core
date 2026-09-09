@@ -3,9 +3,9 @@
 
 """Background task controller: external pause/resume for leader background work.
 
-Threaded through ``Runner.run_agent_team_streaming`` and attached to the leader
-harness, this is the embedder-held control surface for long-running background
-tools (today: the leader's swarmflow run). A single object instead of a growing
+Owned by the leader harness by default (or explicitly supplied through Runner),
+this is the control surface for long-running background tools (today: the
+leader's swarmflow run). A single object instead of a growing
 set of Runner facade methods, so new controls / callbacks extend the object, not
 the SDK surface.
 
@@ -17,10 +17,13 @@ completion. ``pause`` / ``resume`` operate on the registered handles.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable
 
 from openjiuwen.core.common.logging import team_logger
+
+if TYPE_CHECKING:
+    from openjiuwen.agent_teams.interaction.payload import DeliverResult
 
 
 @dataclass
@@ -32,6 +35,7 @@ class SwarmflowRunHandle:
     backend: Any  # TeamWorkerBackend → abort_sessions()
     native: Any  # leader NativeHarness → async_tool_runtime.cancel
     relaunch: Callable[[], None]  # re-launch run_background with the SAME inputs
+    _record: Any = field(default=None, init=False, repr=False)
 
 
 @dataclass
@@ -44,7 +48,7 @@ class _PausedRun:
 class BackgroundTaskController:
     """Unified pause/resume control surface threaded through streaming.
 
-    Lifecycle-neutral: created by the embedder, attached to the leader harness,
+    Lifecycle-neutral: owned by the leader harness, optionally supplied externally,
     and self-populated by ``SwarmflowTool`` as runs launch. Pausing / resuming
     with no matching run is a no-op (returns ``False``).
     """
@@ -53,6 +57,7 @@ class BackgroundTaskController:
         self._active: dict[str, SwarmflowRunHandle] = {}
         self._paused: dict[str, _PausedRun] = {}
         self._lock = asyncio.Lock()
+        self._human_reply_admission_factory: Callable[[str | None, str], Callable[[], bool]] | None = None
 
     # ------------------------------------------------------------------
     # Registration seam (SwarmflowTool self-registers at launch)
@@ -60,7 +65,9 @@ class BackgroundTaskController:
 
     def register(self, handle: SwarmflowRunHandle) -> None:
         """Register a live run's control handles (called at launch)."""
+        handle._record = handle.native.async_tool_runtime.get(handle.task_id)
         self._active[handle.task_id] = handle
+        self._bind_human_reply_owner(handle)
 
     def deregister(self, task_id: str) -> None:
         """Drop a run's handles (called in the launcher's finally; idempotent)."""
@@ -69,6 +76,70 @@ class BackgroundTaskController:
     # ------------------------------------------------------------------
     # Control surface (embedder)
     # ------------------------------------------------------------------
+
+    def has_owned_runs(self) -> bool:
+        """Whether replacing this controller would abandon active/paused runs."""
+        return bool(self._active or self._paused)
+
+    def bind_human_reply_admission(
+        self, factory: Callable[[str | None, str], Callable[[], bool]],
+    ) -> None:
+        """Bind run consumers to the original pool's live lifecycle authority."""
+        self._human_reply_admission_factory = factory
+        for handle in self._active.values():
+            self._bind_human_reply_owner(handle)
+
+    def _bind_human_reply_owner(self, handle: SwarmflowRunHandle) -> None:
+        factory = self._human_reply_admission_factory
+        bind = getattr(handle.backend, "bind_human_reply_admission", None)
+        if factory is None or bind is None:
+            return
+        session_id, team_name, _ = handle.backend.human_reply_scope
+        pool_admitted = factory(session_id, team_name)
+        # Installed once on the backend; re-binding a reused controller never
+        # lends an old backend the identity of a replacement pool entry.
+        bind(lambda: pool_admitted() and self._run_receives_human_input(handle))
+
+    def _run_receives_human_input(self, handle: SwarmflowRunHandle) -> bool:
+        record = handle.native.async_tool_runtime.get(handle.task_id)
+        return (
+            self._active.get(handle.task_id) is handle and not handle.abort_event.is_set()
+            and record is not None and record is handle._record and not record.execution_settled
+            and not record.cancellation_requested and record.status == "running"
+        )
+
+    def reply_swarmflow_human(
+        self,
+        *,
+        session_id: str,
+        team_name: str,
+        run_id: str,
+        correlation_id: str,
+        answer: str,
+        before_effect: Callable[[], None] | None = None,
+    ) -> "DeliverResult":
+        """Forward to one exact live run's original human-input owner.
+
+        This synchronous path shares the event loop with register/pause and the
+        avatar's bus handler. It cannot yield between scope validation and the
+        original Future's consume operation.
+        """
+        from openjiuwen.agent_teams.interaction.payload import DeliverResult
+
+        scope = (session_id, team_name, run_id)
+        matches = [handle for handle in self._active.values()
+                   if getattr(handle.backend, "human_reply_scope", None) == scope]
+        if not matches:
+            return DeliverResult.failure("unknown_run")
+        if len(matches) != 1:
+            return DeliverResult.failure("ambiguous_run")
+        handle = matches[0]
+        if not self._run_receives_human_input(handle):
+            return DeliverResult.failure("run_closed")
+        return handle.backend.reply_swarmflow_human(
+            session_id=session_id, team_name=team_name, run_id=run_id,
+            correlation_id=correlation_id, answer=answer, before_effect=before_effect,
+        )
 
     async def pause(self) -> bool:
         """Pause every active background run. Returns ``False`` when none active.
