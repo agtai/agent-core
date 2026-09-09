@@ -40,7 +40,11 @@ from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackEvent,
     TaskIterationInputs,
 )
-from openjiuwen.harness.schema.interaction import _source_metadata_for_run, _execution_origin_for_run
+from openjiuwen.harness.schema.interaction import (
+    ActiveInteractionRound,
+    _source_metadata_for_run,
+    _execution_origin_for_run,
+)
 
 if TYPE_CHECKING:
     from openjiuwen.harness.deep_agent import (
@@ -146,7 +150,9 @@ class TaskLoopEventExecutor(TaskExecutor):
         )
         request_id = extra.get("_interaction_request_id") if isinstance(extra, dict) else None
         active = agent.active_round
-        if active is not None and active.task_id == task_id and not is_goal:
+        # Only the interaction supervisor owns a RoundWorkItem. NativeHarness
+        # shares this executor but keeps its origin in the actual task metadata.
+        if isinstance(active, ActiveInteractionRound) and active.task_id == task_id and not is_goal:
             request_id = active.work.request_id
         origin = _execution_origin_for_run(
             task_run_context, session_id=cid, kind="goal" if is_goal else "user", request_id=request_id,
