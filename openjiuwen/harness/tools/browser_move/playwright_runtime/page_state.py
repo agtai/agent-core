@@ -14,10 +14,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 _AX_REF_LINE_RE = re.compile(
     r"^\s*-\s+(?P<role>[A-Za-z][\w-]*)"
-    r'(?:\s+"(?P<name>[^"]*)")?.*?\[ref=(?P<ref>[A-Za-z0-9_.:-]+)\]',
-    re.MULTILINE,
+    r'(?:\s+"(?P<name>[^"]*)")?.*?\[(?:ref=)?(?P<ref>[A-Za-z0-9_.:-]+)\]',
+    re.MULTILINE | re.IGNORECASE,
 )
 _ANY_REF_RE = re.compile(r"\bref\s*=\s*[\"']?([A-Za-z0-9_.:-]+)", re.IGNORECASE)
+_BRACKET_INDEX_REF_RE = re.compile(r"\[(\d+)\]")
 _BLOCKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("captcha", re.compile(r"captcha|验证码|人机验证", re.IGNORECASE)),
     (
@@ -87,6 +88,35 @@ def _generation_number(generation_id: str) -> int:
     if not re.fullmatch(r"g\d+", normalized):
         raise ValueError("generation_id must use the PageState generation format, for example g3")
     return int(normalized[1:])
+
+
+def _normalize_ref_value(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    explicit_match = re.fullmatch(r"""\[?\s*ref\s*=\s*["']?([^"'\]\s]+)["']?\s*\]?""", normalized, re.IGNORECASE)
+    if explicit_match is not None:
+        return str(explicit_match.group(1) or "").strip()
+    bracket_index_match = re.fullmatch(r"\[\s*(\d+)\s*\]", normalized)
+    if bracket_index_match is not None:
+        return str(bracket_index_match.group(1) or "").strip()
+    return normalized
+
+
+def _snapshot_ref_tokens(text: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for ref_value in _ANY_REF_RE.findall(text):
+        normalized = _normalize_ref_value(ref_value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            tokens.append(normalized)
+    for ref_value in _BRACKET_INDEX_REF_RE.findall(text):
+        normalized = _normalize_ref_value(ref_value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            tokens.append(normalized)
+    return tuple(tokens)
 
 
 @dataclass
@@ -325,38 +355,22 @@ class BrowserPageState:
         text = value if isinstance(value, str) else str(value)
         registered: list[str] = []
         for match in _AX_REF_LINE_RE.finditer(text):
-            ref_value = match.group("ref")
+            ref_value = _normalize_ref_value(match.group("ref"))
             role = str(match.group("role") or "").strip()
             name = str(match.group("name") or "").strip()
+            if not ref_value:
+                continue
             self.reference_generations[ref_value] = self.generation
-            existing_id = self._ref_targets.get(ref_value)
-            existing_target = self._targets.get(existing_id or "")
-            if existing_target is not None and existing_target.generation == self.generation:
-                target = existing_target
-            else:
-                target = self._new_target(
-                    source="ax",
-                    locator={"ref": ref_value},
-                    ref=ref_value,
-                    role=role,
-                    name=name,
-                    text=name,
-                )
-                self._ref_targets[ref_value] = target.target_id
+            target = self._bind_snapshot_ref(ref_value, role=role, name=name)
             if target.target_id not in self._interactive_target_ids:
                 self._interactive_target_ids.append(target.target_id)
             registered.append(ref_value)
 
-        for ref_value in _ANY_REF_RE.findall(text):
+        for ref_value in _snapshot_ref_tokens(text):
             if self.reference_generations.get(ref_value) == self.generation:
                 continue
             self.reference_generations[ref_value] = self.generation
-            target = self._new_target(
-                source="ax",
-                locator={"ref": ref_value},
-                ref=ref_value,
-            )
-            self._ref_targets[ref_value] = target.target_id
+            target = self._bind_snapshot_ref(ref_value)
             self._interactive_target_ids.append(target.target_id)
             registered.append(ref_value)
 
@@ -366,7 +380,7 @@ class BrowserPageState:
     def replace_ax_snapshot(self, value: Any) -> tuple[str, ...]:
         """Replace current-generation AX refs with refs from one complete snapshot."""
         text = value if isinstance(value, str) else str(value)
-        snapshot_refs = set(_ANY_REF_RE.findall(text))
+        snapshot_refs = set(_snapshot_ref_tokens(text))
         missing_refs = [
             ref_value
             for ref_value, generation in self.reference_generations.items()
@@ -383,6 +397,38 @@ class BrowserPageState:
             if normalized:
                 self.field_coverage.add(normalized)
 
+    def _bind_snapshot_ref(
+        self,
+        ref_value: str,
+        *,
+        role: str = "",
+        name: str = "",
+    ) -> BrowserTarget:
+        existing_id = self._ref_targets.get(ref_value)
+        existing_target = self._targets.get(existing_id or "")
+        if existing_target is not None and existing_target.generation == self.generation:
+            return existing_target
+
+        if ref_value.isdigit():
+            for target in self._targets.values():
+                if target.generation != self.generation or target.source != "bu":
+                    continue
+                if str(target.locator.get("bu_index") or "").strip() != ref_value:
+                    continue
+                self._ref_targets[ref_value] = target.target_id
+                return target
+
+        target = self._new_target(
+            source="ax",
+            locator={"ref": ref_value},
+            ref=ref_value,
+            role=role,
+            name=name,
+            text=name,
+        )
+        self._ref_targets[ref_value] = target.target_id
+        return target
+
     def resolve_target(
         self,
         *,
@@ -395,7 +441,7 @@ class BrowserPageState:
         """Resolve one target and reject every stale generation before execution."""
         self.validate_generation(generation_id)
         normalized_target_id = str(target_id or "").strip()
-        normalized_ref = str(ref or "").strip()
+        normalized_ref = _normalize_ref_value(ref)
         normalized_selector = str(selector or "").strip()
 
         if normalized_target_id:

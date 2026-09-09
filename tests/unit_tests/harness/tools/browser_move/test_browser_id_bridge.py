@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from unittest.mock import AsyncMock
 
 from openjiuwen.harness.tools.browser_move.drivers.base import IndexRef, NodeRef, SelectorRef
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserInstanceConfig
@@ -207,6 +208,106 @@ def test_plain_click_does_not_bump_generation_id() -> None:
     assert runtime.generation_id == "g0"
     runtime._apply_document_changed(changed=False)
     assert runtime.generation_id == "g0"
+
+
+def test_snapshot_ref_click_and_type_use_current_browser_driver_identity() -> None:
+    async def exercise() -> None:
+        driver = FakeDriver(driver_generation=2)
+        await driver.connect(cdp_url="http://127.0.0.1:9222")
+        runtime = _make_driver_runtime(driver)
+        runtime.ensure_runtime_ready = AsyncMock()
+
+        observation = SimpleNamespace(
+            url="https://example.test/form",
+            title="Form",
+            driver_generation=2,
+            elements=(
+                SimpleNamespace(
+                    index=2,
+                    backend_node_id=42,
+                    frame_id="frame-1",
+                    role="textbox",
+                    name="Customer name",
+                    visible=True,
+                ),
+                SimpleNamespace(
+                    index=3,
+                    backend_node_id=43,
+                    frame_id="frame-1",
+                    role="button",
+                    name="Submit",
+                    visible=True,
+                ),
+            ),
+            ax_text='\n'.join(
+                [
+                    '- textbox "Customer name" [2]',
+                    '- button "Submit" [3]',
+                ]
+            ),
+        )
+
+        runtime._register_observation_targets(observation)
+        runtime._register_snapshot_refs(observation.ax_text, replace=True)
+
+        typed = await runtime.type_text(generation_id="g0", ref="[2]", text="Ada Lovelace")
+        clicked = await runtime.click(generation_id="g0", ref="3")
+
+        assert typed["ok"] is True
+        assert clicked["ok"] is True
+
+        stamp_calls = [call for call in driver.act_calls if call.method == "stamp"]
+        type_calls = [call for call in driver.act_calls if call.method == "type_text"]
+        click_calls = [call for call in driver.act_calls if call.method == "click"]
+        assert len(stamp_calls) == 2
+        assert isinstance(stamp_calls[0].kwargs["ref"], IndexRef)
+        assert stamp_calls[0].kwargs["ref"].index == 2
+        assert stamp_calls[0].kwargs["ref"].driver_generation == 2
+        assert isinstance(stamp_calls[1].kwargs["ref"], IndexRef)
+        assert stamp_calls[1].kwargs["ref"].index == 3
+        assert stamp_calls[1].kwargs["ref"].driver_generation == 2
+        assert isinstance(type_calls[0].kwargs["ref"], SelectorRef)
+        assert "data-openjiuwen-target-id" in type_calls[0].kwargs["ref"].css
+        assert isinstance(click_calls[0].kwargs["ref"], SelectorRef)
+        assert "data-openjiuwen-target-id" in click_calls[0].kwargs["ref"].css
+
+    _run(exercise())
+
+
+def test_stale_snapshot_ref_reports_current_generation_on_browser_driver_path() -> None:
+    async def exercise() -> None:
+        driver = FakeDriver(driver_generation=4)
+        await driver.connect(cdp_url="http://127.0.0.1:9222")
+        runtime = _make_driver_runtime(driver)
+        runtime.ensure_runtime_ready = AsyncMock()
+
+        runtime._page_state.advance(url="https://example.test/current")
+        runtime._register_observation_targets(
+            SimpleNamespace(
+                url="https://example.test/current",
+                title="Current",
+                elements=(
+                    SimpleNamespace(
+                        index=2,
+                        backend_node_id=42,
+                        frame_id="frame-1",
+                        role="textbox",
+                        name="Customer name",
+                        visible=True,
+                    ),
+                ),
+                driver_generation=4,
+                ax_text='- textbox "Customer name" [2]',
+            )
+        )
+        runtime._register_snapshot_refs('- textbox "Customer name" [2]', replace=True)
+
+        result = await runtime.type_text(generation_id="g0", ref="2", text="Ada")
+
+        assert result["ok"] is False
+        assert "Stale PageState generation g0" in (result["error"] or "")
+
+    _run(exercise())
 
 
 @pytest.mark.parametrize(

@@ -259,6 +259,27 @@ def test_ax_ref_reused_after_navigation_gets_a_new_current_target() -> None:
     assert new_target.target_id != old_target_id
 
 
+def test_browser_driver_snapshot_numeric_refs_bind_to_current_bu_targets() -> None:
+    state = BrowserPageState(page_id="page-bu-refs")
+    bu_target = state._new_target(
+        source="bu",
+        locator={"bu_index": "2", "backend_node_id": "42", "driver_generation": "7"},
+        role="textbox",
+        name="Customer name",
+        text="Customer name",
+        visible=True,
+        enabled=True,
+        actionable=True,
+        clickable=True,
+    )
+
+    registered = state.register_ax_snapshot('- textbox "Customer name" [2]')
+
+    assert registered == ("2",)
+    assert state.resolve_target(generation_id="g0", ref="2") is bu_target
+    assert state.resolve_target(generation_id="g0", ref="[2]") is bu_target
+
+
 def test_stale_probe_target_refreshes_only_to_unique_current_equivalent() -> None:
     state = BrowserPageState(page_id="page-refresh")
     first = _interactive("[data-date='2026-08-26']", "26")
