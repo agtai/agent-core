@@ -3046,6 +3046,71 @@ class DeepAgent(BaseAgent):
         self._active_interaction_round = None
         self._interaction_round_task = None
 
+    async def set_goal(self, objective: str, **controls) -> tuple[GoalRecord, Optional[InteractionOutputStream]]:
+        """Set an admitted Goal and acquire its output within the same control lock.
+
+        Controls are GoalManager.set keyword arguments. The returned stream is
+        None when an existing consumer already owns output; it continues to
+        receive the admitted Goal's progress. Rejection never attaches output.
+        """
+        return await self._goal_with_output("set", objective, **controls)
+
+    async def resume_goal(self, **controls) -> tuple[Optional[GoalRecord], Optional[InteractionOutputStream]]:
+        """Resume the exact Goal and acquire output only after admission."""
+        return await self._goal_with_output("resume", **controls)
+
+    async def _goal_with_output(self, action, *args, **controls):
+        if not self._interaction_started or self._interaction_phase is InteractionPhase.TERMINATED:
+            raise RuntimeError("interaction_terminated")
+        if self.goal_manager is None:
+            raise RuntimeError("goal_manager_not_started")
+        if "prepare_output" in controls:
+            raise ValueError("DeepAgent owns Goal output preparation")
+        stream = None
+        finishing_lease = None
+
+        class OutputFinishing(Exception):
+            """Release the Goal lock before waiting for the previous reader."""
+
+        async def prepare_output():
+            nonlocal stream, finishing_lease
+            # Admission may have waited behind another control or shutdown.
+            if not self._interaction_started or self._interaction_phase is InteractionPhase.TERMINATED:
+                raise RuntimeError("interaction_terminated")
+            stream = await self._attach_output_locked()
+            if stream is None and not self.has_output_stream():
+                raise RuntimeError("interaction_output_closed")
+            lease = self._interaction_output.current_lease()
+            if stream is None and lease is not None and lease.finishing:
+                finishing_lease = lease
+                raise OutputFinishing()
+
+        async with self._interaction_send_lock:
+            while True:
+                try:
+                    record = await getattr(self.goal_manager, action)(*args, **controls, prepare_output=prepare_output)
+                    return record, stream
+                except OutputFinishing:
+                    # Keep the old reader's final chunks intact. Its END releases
+                    # the lease without needing the send lock. Retry revalidates
+                    # Goal identity, authority and lifecycle under the Goal lock.
+                    await finishing_lease.closed.wait()
+                except BaseException:
+                    if stream is not None:
+                        # Retain cleanup ownership even if the caller is cancelled
+                        # again while detach waits for another Goal control.
+                        cleanup = asyncio.create_task(
+                            stream.close(abort_active_round=False, discard_pending_work=False),
+                            name="goal_output_release",
+                        )
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                pass
+                        cleanup.result()
+                    raise
+
     async def attach_output(self) -> Optional[InteractionOutputStream]:
         """Claim the sole output reader for this interaction.
 
@@ -3155,12 +3220,13 @@ class DeepAgent(BaseAgent):
     async def next_output(self, lease: OutputLease) -> Optional[Any]:
         return await self._interaction_output.next_item(lease)
 
-    async def detach_output(self, token: str, *, abort_active_round: bool) -> None:
+    async def detach_output(self, token: str, *, abort_active_round: bool, discard_pending_work: bool = True) -> None:
         async with self._interaction_control_lock:
             detached = await self._interaction_output.detach(token)
             if not detached:
                 return
-            self._event_manager.discard_all_work()
+            if discard_pending_work:
+                self._event_manager.discard_all_work()
             if abort_active_round:
                 await self._cancel_active_round(reason="output_detached")
 

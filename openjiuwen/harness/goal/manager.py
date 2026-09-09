@@ -107,6 +107,7 @@ class GoalManager:
         expected_goal_id: str | None = None,
         expected_control_revision: int | None = None,
         before_effect: Callable[[], Awaitable[None] | None] | None = None,
+        prepare_output: Callable[[], Awaitable[None]] | None = None,
     ) -> GoalRecord:
         normalized = objective.strip()
         if not normalized:
@@ -130,7 +131,8 @@ class GoalManager:
 
         async with self._control_lock:
             await self._admit_control(before_effect)
-            existing = self._read_control_target("set", expected_goal_id, expected_control_revision)
+            existing = self._read_control_target(
+                "set", expected_goal_id, expected_control_revision, strict=prepare_output is not None)
             if existing is not None and not overwrite_confirmed:
                 raise GoalOperationError(
                     operation="set",
@@ -138,6 +140,11 @@ class GoalManager:
                     message="a goal already exists for this session",
                     goal=existing,
                 )
+
+            # The interaction owner may acquire output only after admission.
+            # Attaching output beforehand can schedule an unrelated active Goal.
+            if prepare_output is not None:
+                await prepare_output()
 
             if existing is not None:
                 self._event_manager.discard_goal_work(
@@ -177,10 +184,10 @@ class GoalManager:
             if inspect.isawaitable(result):
                 await result
 
-    def _read_control_target(self, operation, expected_goal_id, expected_control_revision):
+    def _read_control_target(self, operation, expected_goal_id, expected_control_revision, *, strict=False):
         """Read/check under the interaction lock before any write or effect."""
         if expected_goal_id is None and expected_control_revision is None:
-            return self._store.load()
+            return self._store.peek() if strict else self._store.load()
         if (not isinstance(expected_goal_id, str) or not expected_goal_id
                 or type(expected_control_revision) is not int or expected_control_revision < 1):
             raise GoalOperationError(operation=operation, code="invalid_target",
@@ -228,12 +235,18 @@ class GoalManager:
 
     async def resume(self, *, expected_goal_id: str | None = None,
                      expected_control_revision: int | None = None,
-                     before_effect: Callable[[], Awaitable[None] | None] | None = None) -> Optional[GoalRecord]:
+                     before_effect: Callable[[], Awaitable[None] | None] | None = None,
+                     prepare_output: Callable[[], Awaitable[None]] | None = None) -> Optional[GoalRecord]:
         async with self._control_lock:
             await self._admit_control(before_effect)
-            record = self._read_control_target("resume", expected_goal_id, expected_control_revision)
+            record = self._read_control_target(
+                "resume", expected_goal_id, expected_control_revision, strict=prepare_output is not None)
             if record is None:
                 return None
+            if prepare_output is not None and record.status in (GoalStatus.ACTIVE, GoalStatus.PAUSED, GoalStatus.BLOCKED):
+                await prepare_output()
+                if record.status is GoalStatus.ACTIVE and self._has_output_stream():
+                    self._ensure_goal_work_locked(record)
             if record.status in (GoalStatus.PAUSED, GoalStatus.BLOCKED):
                 # While paused, hosts freeze on time_used_seconds. If an attempt
                 # kept running, active_started_at still tracks that segment—

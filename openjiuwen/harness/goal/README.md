@@ -30,3 +30,28 @@ attempt to finish and record its assessment. In-flight pause/resume must not
 invalidate that attempt generation. Set/resume execution still requires the
 existing output attachment and stream consumer; a state update alone is not
 evidence of execution. A read or rejected control never starts a consumer.
+
+For an interactive host, use `DeepAgent.set_goal(objective, **controls)` or
+`DeepAgent.resume_goal(**controls)`. These return `(record, output_stream)` and
+use the same `GoalManager`, store and scheduler. Identity, authority and state
+validation happen before output attachment under the control lock. These entry
+points read corrupt state strictly, without the legacy `load()` repair.
+
+Consume the returned stream when it is non-null. A null stream means an existing
+reader owns output and receives the admitted Goal's progress. If that reader is
+already finishing, the call waits for its buffered output to drain and then
+revalidates admission before acquiring a new lease. No Goal control lock is held
+during that wait. Cancelling the waiting command does not cancel the old reader.
+
+Do not attach output before validating a Goal command: ordinary `attach_output`
+may ensure active Goal work, and ordinary stream close discards queued work.
+On failure after acquisition, the new APIs wait for their own lease to be
+released, including through repeated cancellation, and preserve unrelated queued
+work. An exception after a store write/commit begins is an uncertain outcome;
+inspect the authoritative Goal before retrying rather than assuming no mutation.
+This does not make a successful admission a claim of business completion.
+
+`InteractionOutputStream.close(discard_pending_work=False,
+abort_active_round=False)` releases just that stream's lease. Existing close
+defaults still discard pending work and cancel the active round. A stale handle
+cannot release a newer reader.

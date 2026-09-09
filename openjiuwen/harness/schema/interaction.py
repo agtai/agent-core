@@ -223,15 +223,16 @@ class InteractionOutputStream:
     async def aclose(self) -> None:
         await self.close()
 
-    async def close(self, *, abort_active_round: bool = True) -> None:
+    async def close(self, *, abort_active_round: bool = True, discard_pending_work: bool = True) -> None:
         """Release this stream only; stale streams cannot release a newer one."""
         if self._closed:
             return
-        self._closed = True
         await self._agent.detach_output(
             self._lease.token,
             abort_active_round=abort_active_round,
+            **({"discard_pending_work": False} if not discard_pending_work else {}),
         )
+        self._closed = True
 
 
 class OutputLeaseManager:
