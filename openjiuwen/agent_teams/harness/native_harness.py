@@ -510,7 +510,7 @@ class NativeHarness(DeepAgent):
     # External API: send / abort / pause
     # ------------------------------------------------------------------
 
-    async def send(self, content: "str | InteractiveInput", *, immediate: bool = False) -> str:
+    async def send(self, content: "str | InteractiveInput", *, immediate: bool = False, before_effect=None) -> str:
         """Push an inbound message to the supervisor.
 
         ``content`` may be an ``InteractiveInput`` carrying an interrupt resume.
@@ -532,6 +532,10 @@ class NativeHarness(DeepAgent):
         Args:
             content: Raw user content.
             immediate: See above; ignored when PAUSED.
+            before_effect: Optional trusted synchronous None-or-raises check,
+                consumed by the supervisor immediately before input mutation.
+                Cancelling before that check prevents delivery; cancelling an
+                observer afterward does not roll back already admitted work.
 
         Returns:
             The monotonic sequence id of this message.
@@ -539,7 +543,7 @@ class NativeHarness(DeepAgent):
         self._require_alive()
         ack: asyncio.Future = asyncio.get_running_loop().create_future()
         msg = InboxMessage(seq=0, content=content, immediate=immediate)
-        await self._control.put(_CmdSend(msg=msg, ack=ack))
+        await self._control.put(_CmdSend(msg=msg, ack=ack, before_effect=before_effect))
         return await ack
 
     async def abort(self, *, immediate: bool = False) -> None:
@@ -806,6 +810,26 @@ class NativeHarness(DeepAgent):
 
     async def _on_send(self, cmd: _CmdSend) -> None:
         """Route a send according to current phase."""
+        if cmd.before_effect is not None:
+            import inspect
+
+            # A cancelled waiter before consumption has no input effects. A
+            # failed guard rejects only this input; original work keeps running.
+            if cmd.ack.done():
+                return
+            try:
+                if self._st.phase not in (HarnessState.IDLE, HarnessState.RUNNING, HarnessState.PAUSED):
+                    raise ValueError('guarded_input_phase_unavailable')
+                result = cmd.before_effect()
+                if inspect.iscoroutine(result):
+                    result.close()
+                if result is not None:
+                    raise ValueError('guarded_input_guard_must_return_none')
+                if self._st.phase not in (HarnessState.IDLE, HarnessState.RUNNING, HarnessState.PAUSED):
+                    raise ValueError('guarded_input_phase_unavailable')
+            except (Exception, asyncio.CancelledError) as exc:
+                cmd.ack.set_exception(exc)
+                return
         seq = self._st.next_seq()
         msg = InboxMessage(seq=seq, content=cmd.msg.content, immediate=cmd.msg.immediate)
 

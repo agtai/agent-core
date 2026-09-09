@@ -406,6 +406,7 @@ class TeamRuntimeManager:
         *,
         team_name: str,
         session_id: str,
+        before_effect=None,
     ) -> DeliverResult:
         """Route an interact payload through the active team's gate.
 
@@ -446,9 +447,17 @@ class TeamRuntimeManager:
             when the runtime is shutting down. Other failure reasons
             propagate from the underlying inbox.
         """
+        if before_effect is not None and (type(payload) is not GodViewMessage
+                                          or type(payload.body) is not str or not callable(before_effect)):
+            return DeliverResult.failure('guarded_input_unsupported')
         entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
         if entry is None:
             return DeliverResult.failure("not_active")
+
+        if before_effect is not None:
+            # The guarded contract is one explicit local leader. Never parse
+            # strings, resolve recipients, restore a runtime, or fan out.
+            return await self._deliver_guarded_leader(entry, payload, before_effect)
 
         if isinstance(payload, InteractiveInput):
             if entry.agent.has_pending_interrupt():
@@ -493,6 +502,46 @@ class TeamRuntimeManager:
             return await self.dispatch_payloads(entry.agent, payloads)
         finally:
             await entry.interact_gate.consume_done(ticket)
+
+    async def _deliver_guarded_leader(self, entry, payload, before_effect):
+        import inspect
+        from openjiuwen.agent_teams.harness.native_harness import NativeHarness
+
+        agent, gate = entry.agent, entry.interact_gate
+        harness = agent.harness
+        native = getattr(harness, '_native', None)
+        if not isinstance(native, NativeHarness):
+            return DeliverResult.failure('guarded_input_unsupported')
+        session_id, team_name = entry.current_session_id, entry.team_name
+
+        def require_owner():
+            if (self.pool._teams.get(team_name) is not entry or entry.agent is not agent
+                    or entry.current_session_id != session_id or entry.closing
+                    or entry.state is not RuntimeState.RUNNING or entry.interact_gate is not gate
+                    or gate.closed or agent.harness is not harness or harness._native is not native):
+                raise ValueError('guarded_input_owner_changed')
+
+        def admit():
+            require_owner()
+            result = before_effect()
+            if inspect.iscoroutine(result):
+                result.close()
+            if result is not None:
+                raise ValueError('guarded_input_guard_must_return_none')
+            require_owner()
+
+        if entry.closing or entry.state is not RuntimeState.RUNNING:
+            return DeliverResult.failure('not_active')
+        ticket = await gate.admit()
+        if ticket is None:
+            return DeliverResult.failure('gate_closed')
+        try:
+            await agent.deliver_input(payload.body, before_effect=admit)
+            return DeliverResult.success(None)
+        except Exception as exc:
+            return DeliverResult.failure(f'deliver_to_leader_failed:{exc}')
+        finally:
+            await gate.consume_done(ticket)
 
     @staticmethod
     def _as_swarmflow_human_reply(

@@ -424,6 +424,7 @@ class _TeamRunnerMixin:
         *,
         team_name: Optional[str] = None,
         session_id: Optional[str] = None,
+        before_effect=None,
     ):
         """Deliver an interact payload to an active TeamAgent runtime.
 
@@ -433,6 +434,12 @@ class _TeamRunnerMixin:
         channel (``GodViewMessage(body=...)``); the conversion happens
         inside ``TeamRuntimeManager.interact``.
 
+        With ``before_effect``, only an explicit string-bodied GodViewMessage
+        to an already resident local leader is supported. The synchronous
+        callback must return None or raise. The original supervisor rechecks
+        the exact owner and callback before applying the input. Rejection has
+        no input effect; acceptance is delivery, not business completion.
+
         Returns a ``DeliverResult``. Missing ``team_name`` or
         ``session_id`` returns ``DeliverResult.failure("missing_target")``.
         """
@@ -440,11 +447,18 @@ class _TeamRunnerMixin:
 
         if team_name is None or session_id is None:
             return DeliverResult.failure("missing_target")
+        if before_effect is not None:
+            manager = vars(self).get('_team_runtime_manager')
+            if manager is None:
+                return DeliverResult.failure('not_active')
+        else:
+            manager = self._get_team_runtime_manager()
         with self._bind_interact_team_session(session_id):
-            return await self._get_team_runtime_manager().interact(
+            return await manager.interact(
                 payload,
                 team_name=team_name,
                 session_id=session_id,
+                **({"before_effect": before_effect} if before_effect is not None else {}),
             )
 
     async def register_human_agent_inbound(
@@ -1017,12 +1031,14 @@ class _TeamRunnerClassMixin:
         *,
         team_name: Optional[str] = None,
         session_id: Optional[str] = None,
+        before_effect=None,
     ):
         """Deliver an interact payload to an active TeamAgent runtime."""
         return await _global_runner().interact_agent_team(
             payload,
             team_name=team_name,
             session_id=session_id,
+            **({"before_effect": before_effect} if before_effect is not None else {}),
         )
 
     @classmethod

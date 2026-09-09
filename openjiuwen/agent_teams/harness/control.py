@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Union
+from typing import Callable, Union
 
 from openjiuwen.agent_teams.harness.state import InboxMessage
 
@@ -26,6 +26,7 @@ class _CmdSend:
 
     msg: InboxMessage
     ack: asyncio.Future
+    before_effect: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)

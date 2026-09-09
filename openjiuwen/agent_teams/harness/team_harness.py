@@ -288,14 +288,15 @@ class TeamHarness:
             )
         return self._native.outputs()
 
-    async def send(self, content: Any, *, immediate: bool = False) -> Any:
+    async def send(self, content: Any, *, immediate: bool = False, before_effect=None) -> Any:
         """Submit input to the native; ``immediate`` steers the active round."""
         if self._native is None:
             raise_error(
                 StatusCode.AGENT_TEAM_EXECUTION_ERROR,
                 error_msg="TeamHarness.send() before start().",
             )
-        return await self._native.send(content, immediate=immediate)
+        return await self._native.send(content, immediate=immediate,
+                                       **({"before_effect": before_effect} if before_effect is not None else {}))
 
     async def abort(self, *, immediate: bool = False) -> None:
         """Abort the active round: graceful (False) or hard+rollback (True).

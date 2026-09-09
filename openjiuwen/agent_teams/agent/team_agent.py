@@ -420,14 +420,17 @@ class TeamAgent(BaseAgent):
     def has_in_flight_round(self) -> bool:
         return self._has_in_flight_round()
 
-    async def deliver_input(self, content: Any, *, use_steer: bool = True) -> None:
+    async def deliver_input(self, content: Any, *, use_steer: bool = True, before_effect=None) -> None:
         # The runtime's single supervisor serialises inputs: send() starts a
         # round when idle, steers (use_steer) or queues a follow-up when running.
         # No transition-window race, so no manual branch / pending queue here.
         harness = self.harness
         if harness is None:
+            if before_effect is not None:
+                raise ValueError("guarded_input_owner_unavailable")
             return
-        await harness.send(content, immediate=use_steer)
+        await harness.send(content, immediate=use_steer,
+                           **({"before_effect": before_effect} if before_effect is not None else {}))
 
     def set_background_task_controller(self, controller: Any) -> None:
         """Attach the embedder's background task controller to this member's brain.
