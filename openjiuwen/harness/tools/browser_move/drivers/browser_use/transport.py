@@ -123,6 +123,8 @@ class SidecarTransport:
         """Spawn the sidecar and read its hello line."""
         python_path = discover_sidecar_python()
         main_path = _sidecar_dir() / "main.py"
+        # asyncio StreamReader defaults to a 64 KiB line limit; screenshot
+        # NDJSON replies routinely exceed that. Align with wire.MAX_LINE_BYTES.
         self._process = await asyncio.create_subprocess_exec(
             str(python_path),
             str(main_path),
@@ -130,15 +132,19 @@ class SidecarTransport:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_sidecar_env(),
+            limit=wire.MAX_LINE_BYTES,
         )
         asyncio.ensure_future(self._drain_stderr())
 
         assert self._process.stdout is not None
         try:
-            raw_line = await asyncio.wait_for(self._process.stdout.readline(), timeout=timeout_s)
+            raw_line = await asyncio.wait_for(self._readline_stdout(), timeout=timeout_s)
         except asyncio.TimeoutError as exc:
             await self._terminate()
             raise driver_errors.DriverConnectionError("sidecar did not send hello within timeout") from exc
+        except driver_errors.DriverConnectionLost as exc:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError(str(exc)) from exc
 
         if not raw_line:
             await self._terminate()
@@ -189,15 +195,41 @@ class SidecarTransport:
 
             return self._unwrap_reply(reply)
 
+    async def _readline_stdout(self) -> bytes:
+        """Read one stdout line, mapping StreamReader oversize to DriverConnectionLost.
+
+        ``asyncio.StreamReader.readline`` fails when a separator is found but the
+        chunk exceeds the reader limit (classic message: ``"Separator is found,
+        but chunk is longer than limit"``). On Python 3.11+ that surfaces as
+        ``ValueError`` wrapping ``LimitOverrunError``; older paths may raise
+        ``LimitOverrunError`` directly. Map both to the wire max-line contract
+        so large base64 screenshot NDJSON replies become a clear driver error
+        instead of a raw asyncio failure.
+        """
+        assert self._process is not None and self._process.stdout is not None
+        try:
+            raw_line = await self._process.stdout.readline()
+        except asyncio.LimitOverrunError as exc:
+            raise driver_errors.DriverConnectionLost(
+                "sidecar emitted a line exceeding the max line size"
+            ) from exc
+        except ValueError as exc:
+            if "chunk is longer than limit" not in str(exc):
+                raise
+            raise driver_errors.DriverConnectionLost(
+                "sidecar emitted a line exceeding the max line size"
+            ) from exc
+        if raw_line and len(raw_line) > wire.MAX_LINE_BYTES:
+            raise driver_errors.DriverConnectionLost("sidecar emitted a line exceeding the max line size")
+        return raw_line
+
     async def _read_reply(self, request_id: int) -> dict[str, Any]:
         """Read lines until the reply for ``request_id`` arrives, forwarding log lines as we go."""
         assert self._process is not None and self._process.stdout is not None
         while True:
-            raw_line = await self._process.stdout.readline()
+            raw_line = await self._readline_stdout()
             if not raw_line:
                 raise driver_errors.DriverConnectionLost("sidecar closed stdout unexpectedly")
-            if len(raw_line) > wire.MAX_LINE_BYTES:
-                raise driver_errors.DriverConnectionLost("sidecar emitted a line exceeding the max line size")
             try:
                 message = json.loads(raw_line.decode("utf-8").strip())
             except json.JSONDecodeError:
