@@ -95,6 +95,7 @@ _BROWSER_TASK_RESUME_LIMIT = 1
 _BROWSER_TERMINAL_SYNTHESIS_KEY = "terminal_synthesis_started"
 _BROWSER_RUNTIME_TOOL_NAMES = frozenset(
     {
+        "browser_navigate",
         "browser_batch_interact",
         "browser_probe_interactives",
         "browser_probe_cards",
@@ -2074,6 +2075,50 @@ class BrowserAgentRuntime:
             if len(read_target_keys) != 1:
                 errors.append(f"steps[{index}] op={op} requires exactly one of target_id or selector")
         return errors
+
+    async def navigate(
+        self,
+        *,
+        url: str,
+        wait_until: str = "load",
+        timeout_ms: int | None = None,
+    ) -> Dict[str, Any]:
+        """Navigate the connected BrowserDriver to ``url`` (BU/runtime hands path)."""
+        await self.ensure_runtime_ready()
+        target = str(url or "").strip()
+        if not target:
+            return {
+                "ok": False,
+                "error": "'url' is required",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            nav = await driver.navigate(
+                target,
+                wait_until=str(wait_until or "load"),
+                timeout_ms=timeout_ms,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_navigate failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        resolved_url = str(nav.url or target).strip() or target
+        resolved_title = str(nav.title or "").strip()
+        self._apply_document_changed(
+            changed=bool(nav.changed_document),
+            url=resolved_url,
+            title=resolved_title,
+        )
+        return {
+            "ok": True,
+            "url": resolved_url,
+            "title": resolved_title,
+            "changed_document": bool(nav.changed_document),
+            "page_state": self.export_page_state(),
+        }
 
     async def run_custom_action(
         self,

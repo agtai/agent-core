@@ -280,9 +280,30 @@ def test_before_tool_call_canonicalizes_playwright_official_server_separator() -
 
 def test_before_tool_call_canonicalizes_bare_mcp_tool_name() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.service.allowed_tool_names = ("browser_navigate",)
+    runtime.service.allowed_tool_names = ("browser_click",)
     runtime.service.mcp_cfg.server_name = "playwright-official"
     runtime.semantic_progress = {}
+    rail = BrowserRuntimeRail(runtime)
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        inputs=ToolCallInputs(
+            tool_call=ToolCall(id="click-1", type="function", name="browser_click", arguments="{}"),
+            tool_name="browser_click",
+            tool_args={"target": "e1"},
+        ),
+    )
+
+    _run(rail.before_tool_call(ctx))
+
+    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_click"
+
+
+def test_before_tool_call_keeps_runtime_browser_navigate_name() -> None:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.service.allowed_tool_names = ("browser_navigate", "browser_click")
+    runtime.service.mcp_cfg.server_name = "playwright-official"
+    runtime.semantic_progress = {}
+    runtime.export_page_state.return_value = {"url": "about:blank"}
     rail = BrowserRuntimeRail(runtime)
     ctx = AgentCallbackContext(
         agent=MagicMock(),
@@ -291,11 +312,19 @@ def test_before_tool_call_canonicalizes_bare_mcp_tool_name() -> None:
             tool_name="browser_navigate",
             tool_args={"url": "https://example.com"},
         ),
+        session=_FakeSession(),
+    )
+    ctx.session.update_state(
+        {
+            "__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state(
+                "Open https://example.com and report the title"
+            )
+        }
     )
 
     _run(rail.before_tool_call(ctx))
 
-    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_navigate"
+    assert ctx.inputs.tool_name == "browser_navigate"
 
 
 def test_before_tool_call_normalizes_bracketed_refs_in_json_arguments() -> None:
@@ -551,6 +580,61 @@ def test_known_url_must_be_navigated_before_selector_exploration() -> None:
             "mcp_playwright_browser_snapshot",
             {},
         )
+
+
+def test_known_url_gate_denies_probe_until_direct_navigation() -> None:
+    session = _FakeSession()
+    session.update_state(
+        {
+            "__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state(
+                "Open https://example.com and extract the H1"
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="Navigate to it directly"):
+        BrowserRuntimeRail._consume_phase_budget(
+            session,
+            "browser_probe_interactives",
+            {},
+            current_page_state={"url": "about:blank"},
+        )
+
+
+def test_known_url_gate_allows_browser_navigate_then_exploration() -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Open https://example.com and extract the H1")
+    session.update_state({"__browser_phase_budget_state__": state})
+
+    navigate_class = BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "browser_navigate",
+        {"url": "https://example.com"},
+        current_page_state={"url": "about:blank"},
+    )
+    assert navigate_class == "navigation"
+
+    BrowserRuntimeRail._record_phase_result(
+        session,
+        "browser_navigate",
+        {"url": "https://example.com"},
+        {"ok": True, "url": "https://example.com", "title": "Example Domain"},
+    )
+    BrowserRuntimeRail._update_last_page(
+        session.get_state("__browser_phase_budget_state__"),
+        {"ok": True, "url": "https://example.com", "title": "Example Domain"},
+    )
+
+    probe_class = BrowserRuntimeRail._consume_phase_budget(
+        session,
+        "browser_probe_cards",
+        {},
+        current_page_state={"url": "https://example.com", "title": "Example Domain"},
+    )
+    assert probe_class == "structured_extraction"
+    updated = session.get_state("__browser_phase_budget_state__")
+    assert updated["last_page"]["url"] == "https://example.com"
+    assert updated["phases"]["navigation"]["successes"] == 1
 
 
 def test_exhausted_phase_budget_requires_replan() -> None:

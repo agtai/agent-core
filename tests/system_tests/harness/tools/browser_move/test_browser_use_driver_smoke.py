@@ -120,7 +120,8 @@ async def _run_smoke(cdp_url: str) -> dict[str, Any]:
 
     assert _cdp_ready(cdp_url), "managed/attached Chrome must survive driver.close()"
     if sidecar_proc is not None:
-        assert sidecar_proc.poll() is not None, f"sidecar pid={sidecar_pid} still running after close"
+        # asyncio.subprocess.Process exposes returncode, not poll() (Popen API).
+        assert sidecar_proc.returncode is not None, f"sidecar pid={sidecar_pid} still running after close"
 
     return {
         "ok": True,

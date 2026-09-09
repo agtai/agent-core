@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from openjiuwen.core.foundation.tool import McpServerConfig, Tool, ToolCard
 from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
@@ -16,6 +16,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools impo
     BrowserClearCancelTool,
     BrowserCustomActionTool,
     BrowserListActionsTool,
+    BrowserNavigateTool,
     BrowserProbeCardsTool,
     BrowserProbeInteractivesTool,
     BrowserRuntimeHealthTool,
@@ -47,7 +48,7 @@ def _make_runtime() -> BrowserAgentRuntime:
 
 def test_build_browser_runtime_tools_returns_helper_tools_by_default() -> None:
     tools = build_browser_runtime_tools(_make_runtime())
-    assert len(tools) == 8
+    assert len(tools) == 9
 
 
 def test_each_tool_is_tool_subclass() -> None:
@@ -63,6 +64,7 @@ def test_each_tool_has_tool_card() -> None:
 def test_default_helper_tool_names() -> None:
     names = [tool.card.name for tool in build_browser_runtime_tools(_make_runtime())]
     assert names == [
+        "browser_navigate",
         "browser_cancel_run",
         "browser_clear_cancel",
         "browser_probe_interactives",
@@ -76,6 +78,7 @@ def test_default_helper_tool_names() -> None:
 
 def test_helper_tool_classes() -> None:
     (
+        navigate,
         cancel,
         clear_cancel,
         probe_interactives,
@@ -85,6 +88,7 @@ def test_helper_tool_classes() -> None:
         list_actions,
         health,
     ) = build_browser_runtime_tools(_make_runtime())
+    assert isinstance(navigate, BrowserNavigateTool)
     assert isinstance(cancel, BrowserCancelTool)
     assert isinstance(clear_cancel, BrowserClearCancelTool)
     assert isinstance(probe_interactives, BrowserProbeInteractivesTool)
@@ -116,6 +120,93 @@ def test_cancel_tool_calls_cancel_run() -> None:
     runtime.ensure_runtime_ready.assert_called_once()
     runtime.cancel_run.assert_called_once_with(session_id="s1", request_id=None)
     assert result.success is True
+
+
+def test_navigate_tool_calls_runtime_navigate() -> None:
+    runtime = _make_runtime()
+    runtime.navigate = AsyncMock(
+        return_value={
+            "ok": True,
+            "url": "https://example.com/",
+            "title": "Example Domain",
+            "changed_document": True,
+            "page_state": {"url": "https://example.com/", "generation_id": "g1"},
+        }
+    )
+    tool = BrowserNavigateTool(runtime)
+    result = _run(
+        tool.invoke(
+            {
+                "url": "https://example.com",
+                "wait_until": "domcontentloaded",
+                "timeout_ms": 5000,
+            }
+        )
+    )
+    runtime.navigate.assert_called_once_with(
+        url="https://example.com",
+        wait_until="domcontentloaded",
+        timeout_ms=5000,
+    )
+    assert result.success is True
+    assert result.data["url"] == "https://example.com/"
+
+
+def test_navigate_tool_is_registered_in_build_browser_runtime_tools() -> None:
+    tools = build_browser_runtime_tools(_make_runtime())
+    navigate = next(tool for tool in tools if tool.card.name == "browser_navigate")
+    assert isinstance(navigate, BrowserNavigateTool)
+    assert "url" in navigate.card.input_params["required"]
+
+
+def test_navigate_tool_rejects_non_integer_timeout() -> None:
+    runtime = _make_runtime()
+    runtime.navigate = AsyncMock()
+    tool = BrowserNavigateTool(runtime)
+    result = _run(tool.invoke({"url": "https://example.com", "timeout_ms": "slow"}))
+    assert result.success is False
+    assert "timeout_ms" in (result.error or "")
+    runtime.navigate.assert_not_called()
+
+
+def test_runtime_navigate_calls_driver_navigate() -> None:
+    from openjiuwen.harness.tools.browser_move.drivers.base import NavResult
+
+    runtime = _make_runtime()
+    driver = AsyncMock()
+    driver.navigate = AsyncMock(
+        return_value=NavResult(
+            url="https://example.com/",
+            title="Example Domain",
+            changed_document=True,
+            driver_generation=2,
+        )
+    )
+    runtime.ensure_runtime_ready = AsyncMock()
+    runtime._ensure_browser_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
+    runtime._apply_document_changed = MagicMock()  # type: ignore[method-assign]
+
+    result = _run(
+        runtime.navigate(
+            url="https://example.com",
+            wait_until="domcontentloaded",
+            timeout_ms=2500,
+        )
+    )
+
+    driver.navigate.assert_called_once_with(
+        "https://example.com",
+        wait_until="domcontentloaded",
+        timeout_ms=2500,
+    )
+    runtime._apply_document_changed.assert_called_once_with(
+        changed=True,
+        url="https://example.com/",
+        title="Example Domain",
+    )
+    assert result["ok"] is True
+    assert result["url"] == "https://example.com/"
+    assert result["title"] == "Example Domain"
 
 
 def test_clear_cancel_tool_calls_runtime_clear_cancel() -> None:

@@ -49,10 +49,35 @@ _CLEAR_CANCEL_PARAMS: Dict[str, Any] = {
     "required": ["session_id"],
 }
 
+_NAVIGATE_DESC = (
+    "Navigate the browser to a URL. "
+    "Use this first when the task already contains a known URL "
+    "(instead of probing or custom_action on about:blank). "
+    "Returns the resulting page URL/title and PageState."
+)
+_NAVIGATE_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "Absolute URL to open, e.g. https://example.com",
+        },
+        "wait_until": {
+            "type": "string",
+            "description": "Navigation wait condition forwarded to the driver. Default load.",
+        },
+        "timeout_ms": {
+            "type": "integer",
+            "description": "Optional navigation timeout in milliseconds.",
+        },
+    },
+    "required": ["url"],
+}
+
 _CUSTOM_ACTION_DESC = (
     "Run a registered custom browser action by name. "
     "Use for deterministic helpers such as drag-and-drop or coordinate resolution "
-    "alongside the direct Playwright MCP browser tools. "
+    "alongside browser_navigate and other runtime browser tools. "
     "Call browser_list_custom_actions first to discover available actions and parameters. "
     "Aliases source/target and source_x/source_y/target_x/target_y are accepted."
 )
@@ -507,6 +532,53 @@ _BATCH_INTERACT_PARAMS: Dict[str, Any] = {
 }
 
 
+class BrowserNavigateTool(Tool):
+    """Navigate to a URL via BrowserDriver (runtime/BU path)."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_navigate",
+                description=_NAVIGATE_DESC,
+                input_params=_NAVIGATE_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        url = str(inputs.get("url") or "").strip()
+        wait_until = str(inputs.get("wait_until") or "load").strip() or "load"
+        timeout_raw = inputs.get("timeout_ms")
+        timeout_ms: int | None
+        if timeout_raw in (None, ""):
+            timeout_ms = None
+        else:
+            try:
+                timeout_ms = int(timeout_raw)
+            except (TypeError, ValueError):
+                return ToolOutput(success=False, error="'timeout_ms' must be an integer")
+        try:
+            result = await self._runtime.navigate(
+                url=url,
+                wait_until=wait_until,
+                timeout_ms=timeout_ms,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
 class BrowserCancelTool(Tool):
     """Cancel an in-progress browser task."""
 
@@ -838,12 +910,12 @@ def build_browser_runtime_tools(
 ) -> List[Tool]:
     """Build browser helper tools backed by ``BrowserAgentRuntime``.
 
-    By default this returns deterministic helper tools only. The browser subagent
-    continues to use Playwright MCP primitive tools directly for low-level browser
-    actions.
+    Includes first-class ``browser_navigate`` for the BrowserDriver (BU) path,
+    plus probes, batch interact, and other deterministic helpers.
     """
 
     return [
+        BrowserNavigateTool(runtime, language),
         BrowserCancelTool(runtime, language),
         BrowserClearCancelTool(runtime, language),
         BrowserProbeInteractivesTool(runtime, language),
