@@ -159,7 +159,8 @@ def test_before_invoke_with_none_allowlist_defaults_to_core() -> None:
     )
 
 
-def test_before_invoke_removes_screenshot_for_non_multimodal_model() -> None:
+def test_before_invoke_keeps_screenshot_capture_without_image_input_support() -> None:
+    """Capture tools stay available; vision input support only gates image consumption."""
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
     runtime._uses_browser_driver.return_value = False
@@ -179,11 +180,11 @@ def test_before_invoke_removes_screenshot_for_non_multimodal_model() -> None:
 
     ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
         runtime.service.mcp_cfg,
-        ("browser_click", "browser_snapshot"),
+        ("browser_click", "browser_take_screenshot", "browser_snapshot"),
     )
 
 
-def test_before_invoke_builds_non_multimodal_allowlist_from_core() -> None:
+def test_before_invoke_builds_allowlist_from_core_including_screenshot() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
     runtime._uses_browser_driver.return_value = False
@@ -198,8 +199,9 @@ def test_before_invoke_builds_non_multimodal_allowlist_from_core() -> None:
 
     ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
         runtime.service.mcp_cfg,
-        tuple(tool_name for tool_name in CORE_BROWSER_TOOL_NAMES if tool_name != "browser_take_screenshot"),
+        CORE_BROWSER_TOOL_NAMES,
     )
+    assert "browser_take_screenshot" in CORE_BROWSER_TOOL_NAMES
 
 
 def test_pdf_allowlist_filters_active_browser_agent_schemas() -> None:
@@ -449,8 +451,10 @@ def test_before_tool_call_rewrites_card_primary_link_click_to_navigation() -> No
     assert ctx.inputs.tool_args == {"url": "https://example.com/item/1"}
 
 
-def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> None:
+def test_before_tool_call_allows_batch_screenshot_without_image_input_support() -> None:
+    """Artifact capture must not be hard-blocked when vision input is unsupported."""
     runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.semantic_progress = {}
     rail = BrowserRuntimeRail(runtime)
     agent = MagicMock()
     agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False)
@@ -469,10 +473,11 @@ def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> No
 
     _run(rail.before_tool_call(ctx))
 
-    assert ctx.inputs.tool_result["status"] == "denied"
-    assert ctx.inputs.tool_result["error"]["code"] == "browser_image_input_unavailable"
-    assert ctx.inputs.tool_msg is not None
-    assert ctx.extra["_skip_tool_calls"]
+    tool_result = getattr(ctx.inputs, "tool_result", None)
+    if isinstance(tool_result, dict) and tool_result:
+        assert tool_result.get("status") != "denied"
+        assert (tool_result.get("error") or {}).get("code") != "browser_image_input_unavailable"
+    assert not ctx.extra.get("_skip_tool_calls")
 
 
 def test_navigation_invalidates_snapshot_refs_from_older_generation() -> None:
@@ -1723,7 +1728,7 @@ def test_before_model_call_skips_dynamic_progress_without_attachment_manager() -
     assert not builder.has_section("browser_progress_continuation")
 
 
-def test_before_model_call_explains_screenshot_is_disabled_without_image_support() -> None:
+def test_before_model_call_keeps_screenshot_capture_without_image_input_support() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     builder = SystemPromptBuilder(language="en")
     agent = MagicMock()
@@ -1734,9 +1739,59 @@ def test_before_model_call_explains_screenshot_is_disabled_without_image_support
     _run(rail.before_model_call(AgentCallbackContext(agent=agent)))
 
     prompt = builder.build()
-    assert "Image input is unavailable or unverified" in prompt
-    assert "browser_take_screenshot" in prompt
-    assert "op=screenshot" in prompt
+    assert "Image input is unavailable" in prompt
+    assert "browser_take_screenshot remains available" in prompt
+    assert "Do not request screenshots" not in prompt
+
+
+def test_before_model_call_pending_image_probe_does_not_forbid_screenshot_capture() -> None:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    builder = SystemPromptBuilder(language="en")
+    agent = MagicMock()
+    # Auto mode with unresolved probe cache => status None.
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=None, model=object())
+    agent.system_prompt_builder = builder
+    rail = BrowserRuntimeRail(runtime)
+
+    with patch(
+        "openjiuwen.harness.rails._multimodal.get_cached_image_support",
+        return_value=None,
+    ):
+        _run(rail.before_model_call(AgentCallbackContext(agent=agent)))
+
+    prompt = builder.build()
+    assert "still being verified" in prompt
+    assert "browser_take_screenshot remains available" in prompt
+    assert "Do not request screenshots" not in prompt
+    assert BrowserRuntimeRail._image_input_support_status(agent) is None
+    assert BrowserRuntimeRail._image_input_supported(agent) is False
+
+
+def test_before_model_call_refreshes_guidance_after_probe_resolves_true() -> None:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    builder = SystemPromptBuilder(language="en")
+    agent = MagicMock()
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=None, model=object())
+    agent.system_prompt_builder = builder
+    rail = BrowserRuntimeRail(runtime)
+    ctx = AgentCallbackContext(agent=agent)
+
+    with patch(
+        "openjiuwen.harness.rails._multimodal.get_cached_image_support",
+        return_value=None,
+    ):
+        _run(rail.before_model_call(ctx))
+    assert "still being verified" in builder.build()
+
+    with patch(
+        "openjiuwen.harness.rails._multimodal.get_cached_image_support",
+        return_value=True,
+    ):
+        _run(rail.before_model_call(ctx))
+
+    prompt = builder.build()
+    assert "The current model can inspect image input" in prompt
+    assert "still being verified" not in prompt
 
 
 def test_before_model_call_limits_screenshot_use_for_multimodal_model() -> None:
@@ -1752,6 +1807,51 @@ def test_before_model_call_limits_screenshot_use_for_multimodal_model() -> None:
     prompt = builder.build()
     assert "The current model can inspect image input" in prompt
     assert "pixel-level visual evidence" in prompt
+
+
+def test_action_form_screenshot_task_does_not_require_title() -> None:
+    task = (
+        'Open https://httpbin.org/forms/post, snapshot, type "Ada Lovelace" into '
+        "Customer name using a current snapshot target, submit, then screenshot the result."
+    )
+    assert BrowserRuntimeRail._infer_required_fields(task) == []
+    assert BrowserRuntimeRail._infer_required_evidence_slots(task) == []
+    state = BrowserRuntimeRail._build_phase_state(task)
+    state["last_page"] = {"url": "https://httpbin.org/post", "title": "httpbin.org/post"}
+    state["field_coverage"] = []
+    assert BrowserRuntimeRail._missing_completion_requirements(state) == []
+
+
+def test_incidental_customer_name_wording_does_not_create_title_slot() -> None:
+    assert BrowserRuntimeRail._infer_required_fields('type "Ada Lovelace" into Customer name') == []
+    assert BrowserRuntimeRail._infer_required_fields("submit the form then screenshot the result") == []
+
+
+def test_explicit_extraction_tasks_still_require_title_or_name() -> None:
+    assert BrowserRuntimeRail._infer_required_fields("extract the product title") == ["title"]
+    assert BrowserRuntimeRail._infer_required_fields("return the product name") == ["title"]
+    assert BrowserRuntimeRail._infer_required_fields("Extract the title") == ["title"]
+
+
+def test_action_task_completion_not_blocked_by_missing_title_when_page_title_present() -> None:
+    task = (
+        "Open https://httpbin.org/forms/post, fill Customer name, submit, "
+        "then screenshot the result."
+    )
+    state = BrowserRuntimeRail._build_phase_state(task)
+    assert "title" not in state["required_fields"]
+    state["last_page"] = {"url": "https://httpbin.org/post", "title": "httpbin.org/post"}
+    state["phases"]["form"]["status"] = "completed"
+    session = _FakeSession()
+    session.update_state({"__browser_phase_budget_state__": state})
+    BrowserRuntimeRail._apply_worker_progress_to_task_state(
+        session,
+        {"status": "completed", "completion_evidence": ["form submitted"], "missing_requirements": []},
+        final="done",
+    )
+    updated = session.get_state("__browser_phase_budget_state__")
+    assert updated["status"] == "completed"
+    assert "missing_required_field:title" not in updated.get("blockers", [])
 
 
 def test_before_model_call_initializes_runtime_task_state_without_progress_attachment() -> None:

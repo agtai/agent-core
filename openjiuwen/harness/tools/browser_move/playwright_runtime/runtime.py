@@ -27,6 +27,7 @@ from openjiuwen.core.runner import Runner
 from openjiuwen.core.single_agent.prompts.builder import PromptSection
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail
 from openjiuwen.harness.rails._multimodal import (
+    resolve_image_input_support_status,
     should_enable_read_image_multimodal,
 )
 from ..controllers import ActionController, BaseController, validate_batch_steps
@@ -80,7 +81,6 @@ _BROWSER_PROGRESS_TASK_KEY = "__browser_subagent_last_task__"
 _BROWSER_PROGRESS_FORMAT_SECTION_NAME = "browser_progress_format"
 _BROWSER_IMAGE_CAPABILITY_SECTION_NAME = "browser_image_input_capability"
 _BROWSER_PHASE_STATE_KEY = BROWSER_TASK_STATE_KEY
-_BROWSER_SCREENSHOT_TOOL_NAMES = frozenset({"browser_take_screenshot"})
 _BROWSER_LOG_CONTEXT_TOKEN_KEY = "__browser_agent_log_context_token__"
 _BROWSER_TOOL_RUNTIME_STATE_KEY = "__browser_tool_runtime_state__"
 _BROWSER_ACTION_GROUP_BY_CALL_KEY = "__browser_action_group_by_call__"
@@ -295,25 +295,40 @@ _BROWSER_PROGRESS_FORMAT_GUIDANCE = {
 _BROWSER_IMAGE_CAPABILITY_GUIDANCE = {
     True: {
         "en": (
-            "The current model can inspect image input. Use browser_take_screenshot only when "
-            "pixel-level visual evidence is required and DOM probes, accessibility snapshots, "
-            "or targeted evaluation cannot answer the task."
+            "The current model can inspect image input. Use browser_take_screenshot when the "
+            "task asks to capture a screenshot, or when pixel-level visual evidence is required "
+            "and DOM probes, accessibility snapshots, or targeted evaluation cannot answer."
         ),
         "cn": (
-            "当前模型可以理解图片输入。仅当任务需要像素级视觉证据，且 DOM 探测、无障碍快照或"
-            "定向脚本无法解决时，才使用 browser_take_screenshot。"
+            "当前模型可以理解图片输入。当任务要求截图，或需要像素级视觉证据且 DOM 探测、"
+            "无障碍快照或定向脚本无法解决时，使用 browser_take_screenshot。"
         ),
     },
     False: {
         "en": (
-            "Image input is unavailable or unverified for this run. Do not request screenshots, "
-            "including browser_take_screenshot or browser_batch_interact with op=screenshot. "
-            "Use DOM probes, accessibility snapshots, and targeted evaluation instead."
+            "Image input is unavailable for this run: the model cannot inspect screenshot "
+            "pixels as visual evidence. browser_take_screenshot remains available when the "
+            "task explicitly asks to capture or save a screenshot artifact; do not rely on "
+            "the model reading that image. Prefer DOM probes and accessibility snapshots "
+            "for visual questions."
         ),
         "cn": (
-            "本次运行的图片输入能力不可用或尚未确认。不要请求截图，包括 "
-            "browser_take_screenshot 或 browser_batch_interact 的 op=screenshot；"
-            "请改用 DOM 探测、无障碍快照和定向脚本。"
+            "本次运行无法把截图作为模型可读的图片输入。若任务明确要求捕获或保存截图，"
+            "仍可使用 browser_take_screenshot，但不要假设模型能看懂该图片；"
+            "视觉问答请改用 DOM 探测、无障碍快照和定向脚本。"
+        ),
+    },
+    None: {
+        "en": (
+            "Image input support is still being verified for this run. "
+            "browser_take_screenshot remains available when the task asks to capture a "
+            "screenshot. Until verification finishes, do not assume the model can inspect "
+            "screenshot pixels; prefer DOM probes and accessibility snapshots for visual questions."
+        ),
+        "cn": (
+            "本次运行的图片输入能力仍在确认中。若任务要求截图，仍可使用 "
+            "browser_take_screenshot；在确认完成前，不要假设模型能看懂截图像素，"
+            "视觉问答请优先使用 DOM 探测、无障碍快照和定向脚本。"
         ),
     },
 }
@@ -3335,11 +3350,11 @@ class BrowserRuntimeRail(AgentRail):
         if str(state.get("status") or "").strip().lower() not in _BROWSER_TERMINAL_STATUSES:
             builder.remove_section("browser_terminal_synthesis")
 
-        image_input_supported = self._image_input_supported(ctx.agent)
+        image_input_status = self._image_input_support_status(ctx.agent)
         builder.add_section(
             PromptSection(
                 name=_BROWSER_IMAGE_CAPABILITY_SECTION_NAME,
-                content=_BROWSER_IMAGE_CAPABILITY_GUIDANCE[image_input_supported],
+                content=_BROWSER_IMAGE_CAPABILITY_GUIDANCE[image_input_status],
                 priority=85,
             )
         )
@@ -3690,20 +3705,6 @@ class BrowserRuntimeRail(AgentRail):
         if normalized_args is not tool_args:
             inputs.tool_args = normalized_args
         normalized_tool_name = tool_name.strip().lower()
-        if "browser_batch_interact" in normalized_tool_name and not self._image_input_supported(
-            getattr(ctx, "agent", None)
-        ):
-            batch_args = self._coerce_tool_args(normalized_args)
-            steps = batch_args.get("steps")
-            if any(
-                isinstance(step, dict) and str(step.get("op") or "").strip().lower() == "screenshot"
-                for step in (steps if isinstance(steps, list) else [])
-            ):
-                raise ValueError(
-                    "Screenshot input is unavailable for this browser agent. "
-                    "Remove the screenshot batch step and use DOM probes or "
-                    "structured extraction."
-                )
         if "playwright" in normalized_tool_name and normalized_tool_name.endswith("browser_click"):
             primary_link = self._runtime.resolve_primary_link(normalized_args)
             if isinstance(primary_link, str) and primary_link:
@@ -4524,7 +4525,12 @@ class BrowserRuntimeRail(AgentRail):
     def _infer_required_fields(cls, task: str) -> list[str]:
         normalized = str(task or "").lower()
         request_scopes = _BROWSER_OUTPUT_REQUEST_CUE_RE.findall(normalized)
-        output_scope = " ".join(request_scopes).strip() or normalized
+        if not request_scopes:
+            # Action-only tasks (navigate / type / click / screenshot) must not
+            # invent extraction slots from incidental wording such as
+            # "Customer name" or "screenshot the result".
+            return []
+        output_scope = " ".join(request_scopes).strip()
         inferred = [
             field
             for field, aliases in _BROWSER_FIELD_ALIASES.items()
@@ -6028,7 +6034,13 @@ class BrowserRuntimeRail(AgentRail):
         )
 
     @staticmethod
+    def _image_input_support_status(agent: Any) -> bool | None:
+        """True/False when known; None while auto-mode probe is still pending."""
+        return resolve_image_input_support_status(agent)
+
+    @staticmethod
     def _image_input_supported(agent: Any) -> bool:
+        """Whether the model may consume image bytes (not whether capture is allowed)."""
         return should_enable_read_image_multimodal(agent)
 
     async def _effective_browser_tool_allowlist(
@@ -6036,12 +6048,12 @@ class BrowserRuntimeRail(AgentRail):
         agent: Any,
         mcp_cfg: McpServerConfig,
     ) -> tuple[str, ...]:
-        del mcp_cfg
+        del agent, mcp_cfg
+        # Screenshot *capture* is independent of multimodal *input* support.
+        # Keep catalog screenshot tools available whenever they are configured;
+        # vision-input guidance alone decides whether the model can inspect pixels.
         configured = self._runtime.service.allowed_tool_names or CORE_BROWSER_TOOL_NAMES
-        if self._image_input_supported(agent):
-            return tuple(configured)
-
-        return tuple(tool_name for tool_name in configured if tool_name not in _BROWSER_SCREENSHOT_TOOL_NAMES)
+        return tuple(configured)
 
     async def _ensure_browser_mcp_ability(self, ctx: AgentCallbackContext) -> None:
         # BrowserDriver path registers bare catalog Tools; do not attach MCP twins.
