@@ -13,6 +13,8 @@ from collections import deque
 from typing import Any, Dict, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .tool_semantics import NEUTRAL_PROGRESS_NAME, coerce_tool_args as _coerce_tool_args
+
 
 _FILTER_KEY_TOKENS = (
     "filter",
@@ -41,18 +43,6 @@ _TRACKING_QUERY_KEYS = {
     "cachebuster",
     "_t",
 }
-
-
-def _coerce_tool_args(tool_args: Any) -> Dict[str, Any]:
-    if isinstance(tool_args, dict):
-        return tool_args
-    if isinstance(tool_args, str):
-        try:
-            parsed = json.loads(tool_args)
-        except ValueError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
 
 
 def _numbers_from_filter_value(value: Any) -> list[str]:
@@ -305,8 +295,17 @@ class SemanticStateTracker:
         raw_state: Mapping[str, Any],
         *,
         action_group_id: str = "",
+        mutating: bool = True,
     ) -> Dict[str, Any]:
-        """Record one model action group and return its progress classification."""
+        """Record one model action group and return its progress classification.
+
+        ``mutating=False`` marks an action group that cannot change the semantic
+        state by itself (pointer reveal, query, dialog arming, read-only script).
+        Such a group is scored as an observation instead of no-progress: it never
+        feeds no-progress counters, state-revisit counters or the digest history,
+        so loop detection keeps measuring only actions that could have moved the
+        page. A neutral group whose digest did change is still real progress.
+        """
         normalized_group_id = str(action_group_id or "").strip()
         if normalized_group_id and normalized_group_id == self._last_action_group_id:
             return self.latest
@@ -325,8 +324,11 @@ class SemanticStateTracker:
             self._filter_history and filter_digest in self._filter_history and filter_digest != self._filter_history[-1]
         )
 
+        neutral_observation = bool(not mutating and repeated_state)
         if not self._history:
             progress = "initial"
+        elif neutral_observation:
+            progress = NEUTRAL_PROGRESS_NAME
         elif repeated_state:
             progress = "no_progress"
             self._consecutive_no_progress += 1
@@ -339,8 +341,12 @@ class SemanticStateTracker:
             self._consecutive_no_progress = 0
             self._state_revisit_count = 0
 
-        self._history.append(state_digest)
-        self._filter_history.append(filter_digest)
+        if not neutral_observation:
+            # A repeated digest from a neutral group is not a visited state; keeping
+            # it out of the histories is what keeps aba_loop and revisit detection
+            # measuring real navigation instead of repeated observation.
+            self._history.append(state_digest)
+            self._filter_history.append(filter_digest)
         self._last_state = semantic_state
         self._revision += 1
 

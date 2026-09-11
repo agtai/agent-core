@@ -20,6 +20,7 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
 
 from .browser_logging import browser_agent_log_warning
 from .browser_working_context import BrowserWorkingContextStore
+from .tool_semantics import tool_is_semantically_neutral
 
 _BROWSER_STATE_MESSAGE_NAME = "current_browser_state"
 _BROWSER_STATE_METADATA_KEY = "browser_state_context"
@@ -141,15 +142,26 @@ class BrowserStateContextProcessor(ContextProcessor):
     ) -> tuple[ContextEvent | None, ContextWindow]:
         del kwargs
         source_messages = context.get_messages() if context is not None else context_window.context_messages
-        action_group_id, refresh_tool_call_ids, observation_only = self._completed_state_action_group(source_messages)
+        (
+            action_group_id,
+            refresh_tool_call_ids,
+            observation_only,
+            mutating,
+        ) = self._completed_state_action_group(source_messages)
         should_refresh = self._cached_state is None or bool(
             action_group_id and action_group_id not in self._seen_action_group_ids
         )
         if should_refresh:
             if observation_only and action_group_id:
-                captured_state = await self._capture_compact_state(action_group_id=action_group_id)
+                captured_state = await self._capture_compact_state(
+                    action_group_id=action_group_id,
+                    mutating=mutating,
+                )
             else:
-                captured_state = await self._capture_state(action_group_id=action_group_id or "initial")
+                captured_state = await self._capture_state(
+                    action_group_id=action_group_id or "initial",
+                    mutating=mutating,
+                )
             self._page_change = self._classify_page_change(captured_state)
             semantic_progress = captured_state.get("semantic_progress")
             if isinstance(semantic_progress, dict):
@@ -187,7 +199,7 @@ class BrowserStateContextProcessor(ContextProcessor):
     ) -> tuple[str, set[str]]:
         """Return the latest completed model action group that mutates browser state."""
 
-        action_group_id, refresh_ids, observation_only = cls._completed_state_action_group(messages)
+        action_group_id, refresh_ids, observation_only, _mutating = cls._completed_state_action_group(messages)
         if observation_only:
             return "", set()
         mutation_ids: set[str] = set()
@@ -206,8 +218,14 @@ class BrowserStateContextProcessor(ContextProcessor):
     def _completed_state_action_group(
         cls,
         messages: list[BaseMessage],
-    ) -> tuple[str, set[str], bool]:
-        """Return one completed browser group, merging concurrent read-only observations."""
+    ) -> tuple[str, set[str], bool, bool]:
+        """Return one completed browser group, merging concurrent read-only observations.
+
+        The fourth element answers a different question from the third: a group
+        can need a FULL capture (hover, dialog arming) while still being unable
+        to change the semantic state, in which case it is reported as
+        non-mutating so progress scoring treats it as an observation.
+        """
 
         completed_call_ids = {
             str(message.tool_call_id)
@@ -222,6 +240,7 @@ class BrowserStateContextProcessor(ContextProcessor):
         refresh_tool_call_ids: set[str] = set()
         latest_group_id = ""
         latest_observation_only = False
+        latest_mutating = True
         for message in messages:
             if not isinstance(message, AssistantMessage):
                 continue
@@ -231,21 +250,30 @@ class BrowserStateContextProcessor(ContextProcessor):
                 continue
             group_refresh_ids: set[str] = set()
             group_observation_ids: set[str] = set()
+            group_mutating = False
             for tool_call in tool_calls:
                 call_id = str(tool_call.id or "")
                 if not call_id or call_id not in executed_call_ids:
                     continue
-                if cls._is_refresh_tool_name(tool_call.name):
+                is_refresh = cls._is_refresh_tool_name(tool_call.name)
+                is_observation = cls._is_observation_tool_name(tool_call.name)
+                if is_refresh:
                     group_refresh_ids.add(call_id)
-                if cls._is_observation_tool_name(tool_call.name):
+                if is_observation:
                     group_observation_ids.add(call_id)
+                if (is_refresh or is_observation) and not tool_is_semantically_neutral(
+                    tool_call.name,
+                    tool_call.arguments,
+                ):
+                    group_mutating = True
             group_browser_ids = group_refresh_ids | group_observation_ids
             if not group_browser_ids:
                 continue
             refresh_tool_call_ids.update(group_browser_ids)
             latest_group_id = hashlib.sha256("\x1f".join(call_ids).encode("utf-8")).hexdigest()[:16]
             latest_observation_only = not group_refresh_ids and bool(group_observation_ids)
-        return latest_group_id, refresh_tool_call_ids, latest_observation_only
+            latest_mutating = group_mutating
+        return latest_group_id, refresh_tool_call_ids, latest_observation_only, latest_mutating
 
     @staticmethod
     def _tool_message_was_executed(message: ToolMessage) -> bool:
@@ -282,18 +310,34 @@ class BrowserStateContextProcessor(ContextProcessor):
             for expected in _BROWSER_STATE_OBSERVATION_TOOL_NAMES
         )
 
-    async def _capture_state(self, *, action_group_id: str) -> Dict[str, Any]:
+    @staticmethod
+    async def _call_capture(capture: Any, **kwargs: Any) -> Any:
+        """Call a capture provider, dropping keywords an older provider lacks.
+
+        Keyword support is probed one argument at a time so a provider that
+        predates any of them cannot crash the processor.
+        """
+        supported = dict(kwargs)
+        while True:
+            try:
+                return await capture(**supported)
+            except TypeError as exc:
+                unsupported = next((key for key in supported if key in str(exc)), None)
+                if unsupported is None:
+                    raise
+                supported.pop(unsupported)
+
+    async def _capture_state(self, *, action_group_id: str, mutating: bool = True) -> Dict[str, Any]:
         try:
             capture = self.config.provider.capture_browser_state
             if action_group_id == "initial":
                 state = await capture()
             else:
-                try:
-                    state = await capture(action_group_id=action_group_id)
-                except TypeError as exc:
-                    if "action_group_id" not in str(exc):
-                        raise
-                    state = await capture()
+                state = await self._call_capture(
+                    capture,
+                    action_group_id=action_group_id,
+                    mutating=mutating,
+                )
         except Exception as exc:
             browser_agent_log_warning(
                 "[BrowserStateContextProcessor] browser state capture failed: %s",
@@ -321,20 +365,24 @@ class BrowserStateContextProcessor(ContextProcessor):
             }
         return state
 
-    async def _capture_compact_state(self, *, action_group_id: str) -> Dict[str, Any]:
+    async def _capture_compact_state(self, *, action_group_id: str, mutating: bool = True) -> Dict[str, Any]:
         capture = getattr(self.config.provider, "capture_compact_browser_state", None)
         if not callable(capture):
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, mutating=mutating)
         try:
-            state = await capture(action_group_id=action_group_id)
+            state = await self._call_capture(
+                capture,
+                action_group_id=action_group_id,
+                mutating=mutating,
+            )
         except Exception as exc:
             browser_agent_log_warning(
                 "[BrowserStateContextProcessor] compact browser state merge failed: %s",
                 exc,
             )
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, mutating=mutating)
         if not isinstance(state, dict):
-            return await self._capture_state(action_group_id=action_group_id)
+            return await self._capture_state(action_group_id=action_group_id, mutating=mutating)
         if self._cached_state:
             if not state.get("tabs"):
                 state["tabs"] = self._cached_state.get("tabs") or []

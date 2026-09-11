@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from openjiuwen.core.foundation.llm import BaseMessage, ToolMessage, UserMessage
 
 from .browser_logging import browser_agent_log_info, browser_agent_log_warning
+from .tool_semantics import progress_is_semantically_neutral
 
 
 BROWSER_WORKING_CONTEXT_STATE_KEY = "__browser_subagent_working_context__"
@@ -547,6 +548,11 @@ class BrowserWorkingContextStore:
         recovered: bool,
     ) -> None:
         if str(state.get("status") or "").strip().lower() in _TERMINAL_TASK_STATUSES:
+            return
+        if progress_is_semantically_neutral(progress.get("progress")):
+            # A neutral observation proves nothing either way: it is not a
+            # recovered replan trial, and it must not burn the pending trial as
+            # a failed strategy.
             return
         if recovered:
             cls.mark_replan_recovered(state)

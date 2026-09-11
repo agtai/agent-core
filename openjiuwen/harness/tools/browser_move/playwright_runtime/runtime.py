@@ -67,6 +67,7 @@ from .probes import (
 from .page_state import CARD_EVIDENCE_FIELDS, BrowserPageState, BrowserTarget
 from .probe_semantics import normalize_card_probe_payload
 from .semantic_state import SemanticStateTracker, price_interval_signature
+from .tool_semantics import batch_steps_are_read_only, coerce_tool_args, operation_intent
 from .service import MAX_ITERATION_MESSAGE, BrowserService, BrowserTaskProgressState
 from .site_profiles import (
     get_selector_cache,
@@ -865,11 +866,19 @@ class BrowserAgentRuntime:
         self._controller.bind_code_executor(_direct_code_executor)
         self._controller.register_builtin_actions()
 
-    async def capture_browser_state(self, *, action_group_id: str = "") -> Dict[str, Any]:
-        """Capture a fresh, non-cached browser observation for the next model call."""
+    async def capture_browser_state(self, *, action_group_id: str = "", mutating: bool = True) -> Dict[str, Any]:
+        """Capture a fresh, non-cached browser observation for the next model call.
+
+        ``mutating=False`` means the completed action group could not change the
+        semantic state, so an unchanged digest must be scored as an observation
+        rather than as semantic no-progress.
+        """
         await self.ensure_runtime_ready()
         if self._uses_browser_driver():
-            return await self._capture_browser_state_via_driver(action_group_id=action_group_id)
+            return await self._capture_browser_state_via_driver(
+                action_group_id=action_group_id,
+                mutating=mutating,
+            )
 
         dom = ""
         dom_error = None
@@ -940,6 +949,7 @@ class BrowserAgentRuntime:
             semantic_progress = semantic_tracker.observe(
                 semantic_state,
                 action_group_id=action_group_id,
+                mutating=mutating,
             )
         return {
             "ok": not errors,
@@ -957,7 +967,12 @@ class BrowserAgentRuntime:
             "audit": {"ax_snapshot": snapshot_audit} if snapshot_audit else {},
         }
 
-    async def _capture_browser_state_via_driver(self, *, action_group_id: str = "") -> Dict[str, Any]:
+    async def _capture_browser_state_via_driver(
+        self,
+        *,
+        action_group_id: str = "",
+        mutating: bool = True,
+    ) -> Dict[str, Any]:
         """Capture state through BrowserDriver.observe (fills the former browser_snapshot slot)."""
         driver = await self._ensure_browser_driver()
         dom_error = None
@@ -1057,6 +1072,7 @@ class BrowserAgentRuntime:
             semantic_progress = semantic_tracker.observe(
                 semantic_state,
                 action_group_id=action_group_id,
+                mutating=mutating,
             )
         return {
             "ok": not errors,
@@ -1111,7 +1127,7 @@ class BrowserAgentRuntime:
                     exc_info=True,
                 )
 
-    async def capture_compact_browser_state(self, *, action_group_id: str) -> Dict[str, Any]:
+    async def capture_compact_browser_state(self, *, action_group_id: str, mutating: bool = True) -> Dict[str, Any]:
         """Merge completed read-only observations without another browser round trip."""
         page_state = self.export_page_state()
         semantic_tracker = self._ensure_semantic_state_tracker()
@@ -1125,6 +1141,7 @@ class BrowserAgentRuntime:
         semantic_progress = semantic_tracker.observe(
             semantic_state,
             action_group_id=action_group_id,
+            mutating=mutating,
         )
         return {
             "ok": True,
@@ -4847,15 +4864,7 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _coerce_tool_args(tool_args: Any) -> Dict[str, Any]:
-        if isinstance(tool_args, dict):
-            return tool_args
-        if isinstance(tool_args, str):
-            try:
-                parsed = json.loads(tool_args)
-            except ValueError:
-                return {}
-            return parsed if isinstance(parsed, dict) else {}
-        return {}
+        return coerce_tool_args(tool_args)
 
     @classmethod
     def _classify_tool_phase(
@@ -5110,27 +5119,8 @@ class BrowserRuntimeRail(AgentRail):
 
     @staticmethod
     def _operation_intent(tool_name: str, args: Dict[str, Any]) -> str:
-        steps = args.get("steps")
-        if isinstance(steps, list):
-            operations = sorted(
-                {
-                    str(step.get("op") or "").strip().lower()
-                    for step in steps
-                    if isinstance(step, dict) and str(step.get("op") or "").strip()
-                }
-            )
-            return "+".join(operations)[:120] or "batch"
-        name = str(tool_name or "").strip().lower().rsplit("browser_", 1)[-1]
-        if name in {"evaluate", "run_code", "run_code_unsafe"}:
-            expression = str(
-                args.get("function") or args.get("expression") or args.get("script") or args.get("code") or ""
-            ).lower()
-            if re.search(r"\.click\s*\(|dispatchEvent|\.value\s*=|setAttribute\s*\(", expression):
-                return "script_mutation"
-            if re.search(r"textContent|innerText|return|querySelector|document\.title", expression):
-                return "script_extraction"
-            return "script_inspection"
-        return name or "other"
+        """Delegate call-intent classification to the shared tool-semantics module."""
+        return operation_intent(tool_name, args)
 
     @staticmethod
     def _price_interval_signature(tool_name: str, tool_args: Any) -> str:
@@ -5152,12 +5142,21 @@ class BrowserRuntimeRail(AgentRail):
             return "structured_extraction"
         if any(token in name for token in ("probe_interactives", "snapshot", "find")):
             return "target_discovery"
+        # Pointer reveal, dialog arming and file drop must not share the click
+        # strategy class: hovering an element and then clicking it is a material
+        # strategy change, and a colliding fingerprint reads as a semantic loop.
+        if "handle_dialog" in name:
+            return "dialog_control"
+        if "hover" in name:
+            return "pointer_reveal"
+        if "drop" in name:
+            return "file_drop"
         phase = cls._classify_tool_phase(tool_name, tool_args, state)
         if phase == "extraction":
             return "structured_extraction"
         if phase in {"form", "filtering"}:
             return phase
-        if any(token in name for token in ("click", "hover", "press", "drag", "drop")):
+        if any(token in name for token in ("click", "press", "drag")):
             return "interaction"
         if any(token in serialized for token in ("filter", "sort", "price", "rating", "筛选", "排序", "价格")):
             return "filtering"
@@ -5370,10 +5369,15 @@ class BrowserRuntimeRail(AgentRail):
             )
         replan_count = int(state.get("replan_count") or 0)
         if replan_count >= 2:
+            detail = cls._replan_blocker_detail(state)
             state["status"] = "blocked"
             state["blockers"] = ["semantic_replan_budget_exhausted"]
+            if detail:
+                state["blocker_detail"] = detail
             raise ValueError(
-                "Semantic progress remained blocked after two replan trials. "
+                "Semantic progress remained blocked after two replan trials "
+                "(semantic replan budget exhausted). "
+                f"{detail}"
                 "Return blocked or partial with the available structured evidence."
             )
         blocked_strategy = str(
@@ -5405,6 +5409,30 @@ class BrowserRuntimeRail(AgentRail):
         state["status"] = "replan_trial"
 
     @staticmethod
+    def _replan_blocker_detail(state: Dict[str, Any]) -> str:
+        """Summarize why the gate blocked, so the blocker is actionable rather than opaque."""
+        parts: list[str] = []
+        semantic_progress = state.get("semantic_progress")
+        raw_reasons = semantic_progress.get("replan_reason") if isinstance(semantic_progress, dict) else None
+        if isinstance(raw_reasons, str):
+            raw_reasons = [raw_reasons]
+        reasons = [str(item).strip() for item in raw_reasons or [] if str(item).strip()]
+        if reasons:
+            parts.append(f"Replan reasons: {', '.join(reasons)}.")
+        failed = [str(item) for item in state.get("failed_strategies") or [] if str(item).strip()]
+        if failed:
+            parts.append(f"Failed strategies: {', '.join(failed[-3:])}.")
+        recent = [item for item in state.get("recent_actions") or [] if isinstance(item, dict)]
+        if recent:
+            trail = "; ".join(
+                f"{item.get('tool') or 'unknown'}/{item.get('action_class') or 'unknown'}"
+                f"->{item.get('semantic_delta') or 'unknown'}"
+                for item in recent[-3:]
+            )
+            parts.append(f"Recent actions: {trail}.")
+        return " ".join(parts) + " " if parts else ""
+
+    @staticmethod
     def _is_replan_exempt_tool(tool_name: str) -> bool:
         normalized_name = str(tool_name or "").strip().lower()
         exempt_tokens = (
@@ -5433,9 +5461,22 @@ class BrowserRuntimeRail(AgentRail):
 
     @classmethod
     def _is_read_only_recovery(cls, tool_name: str, tool_args: Any) -> bool:
+        """Return True when this call is a bounded, non-mutating recovery attempt.
+
+        Invariant (guarded by ``test_browser_tool_semantics``'s
+        ``test_every_semantically_neutral_tool_is_a_read_only_recovery``): every
+        name in ``SEMANTICALLY_NEUTRAL_TOOL_NAMES`` must qualify here. The
+        converse does NOT hold and must not be assumed - ``browser_tabs`` with
+        ``action=select`` is a valid read-only recovery yet changes the url, so
+        it is not semantically neutral. The two sets stay separate concepts.
+        """
         normalized_name = str(tool_name or "").strip().lower()
         args = cls._coerce_tool_args(tool_args)
-        if any(token in normalized_name for token in ("probe", "find", "snapshot", "screenshot")):
+        # hover / handle_dialog reveal or arm without mutating, so they are valid
+        # recovery attempts. browser_drop stays out: dropping is a real mutation.
+        if any(
+            token in normalized_name for token in ("probe", "find", "snapshot", "screenshot", "hover", "handle_dialog")
+        ):
             return True
         if "browser_tabs" in normalized_name:
             return str(args.get("action") or "list").strip().lower() in {"list", "select"}
@@ -5443,22 +5484,7 @@ class BrowserRuntimeRail(AgentRail):
             return cls._operation_intent(normalized_name, args) != "script_mutation"
         if "browser_batch_interact" not in normalized_name:
             return False
-        steps = args.get("steps")
-        if not isinstance(steps, list) or not steps:
-            return False
-        read_only_ops = (
-            _BATCH_SAFE_READ_SELECTOR_OPS
-            | _BATCH_EXPLICIT_SELECTOR_OPS
-            | {
-                "wait_for_text",
-                "wait_for_load_state",
-                "wait_for_url",
-                "wait_for_tab",
-            }
-        )
-        return all(
-            isinstance(step, dict) and str(step.get("op") or "").strip().lower() in read_only_ops for step in steps
-        )
+        return batch_steps_are_read_only(args)
 
     @staticmethod
     def _consume_replan_denial(state: Dict[str, Any], reason: str) -> None:
@@ -5987,6 +6013,7 @@ class BrowserRuntimeRail(AgentRail):
         return {
             "seq": state["action_sequence"],
             "phase": progress_delta.get("phase") or state.get("current_phase"),
+            "tool": str(tool_name or "").strip().rsplit(".", 1)[-1],
             "action_class": action_class or cls._classify_action_class(tool_name, tool_args, state),
             "target_summary": cls._target_summary(tool_name, tool_args),
             "outcome": "success" if succeeded else f"error: {error[:180] or 'tool_failed'}",
