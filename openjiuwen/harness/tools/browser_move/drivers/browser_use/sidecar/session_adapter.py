@@ -25,12 +25,37 @@ import asyncio
 import base64
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import cdp
 import exceptions
 import keys as key_utils
 import mapping
+
+
+def _normalize_upload_paths(paths: list[str]) -> tuple[list[str], list[str]]:
+    """Return ``(existing_absolute_paths, missing_or_unreadable_paths)``.
+
+    Paths are ``expanduser().resolve()``'d before the ``is_file`` check so CDP
+    always receives absolute paths Chrome can open, and errors list absolutes.
+    """
+    existing: list[str] = []
+    missing: list[str] = []
+    for raw in paths:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            resolved = str(Path(text).expanduser().resolve())
+        except OSError:
+            missing.append(text)
+            continue
+        if Path(resolved).is_file():
+            existing.append(resolved)
+        else:
+            missing.append(resolved)
+    return existing, missing
 
 
 def browser_use_version() -> str:
@@ -311,14 +336,73 @@ class SessionAdapter:
 
     async def upload_files(self, ref: dict[str, Any], paths: list[str]) -> dict[str, Any]:
         before_url = await self._safe_current_url()
-        from browser_use.browser.events import UploadFileEvent
-
-        node = await self._node_for_event(ref)
-        file_path = paths[0] if paths else ""
-        event = self._session.event_bus.dispatch(UploadFileEvent(node=node, file_path=file_path))
-        await event
-        await event.event_result(raise_if_any=True, raise_if_none=False)
-        return await self._act_result(before_url, ok=True, detail=f"uploaded {len(paths)} file(s)")
+        normalized, missing = _normalize_upload_paths(paths or [])
+        if not normalized and not missing:
+            return await self._act_result(before_url, ok=False, detail="upload_files requires at least one path")
+        if missing:
+            listed = ", ".join(repr(p) for p in missing)
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail=f"upload file(s) not found or not readable: {listed}",
+            )
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        cdp_session = await self._ensure_cdp_session()
+        facts = await cdp.call_function_on_backend_node(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            backend_node_id,
+            "function(){"
+            "  const isFile = !!(this && this.tagName === 'INPUT' &&"
+            "    String(this.type || '').toLowerCase() === 'file');"
+            "  return {isFile: isFile, multiple: !!(isFile && this.multiple),"
+            "    files: (isFile && this.files) ? this.files.length : 0};"
+            "}",
+        )
+        if not isinstance(facts, dict) or not facts.get("isFile"):
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail="upload target is not an <input type=file>",
+            )
+        if len(normalized) > 1 and not facts.get("multiple"):
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail=(
+                    f"upload target does not accept multiple files "
+                    f"(got {len(normalized)} paths); pass a single path or a multiple= file input"
+                ),
+            )
+        await cdp.set_file_input_files(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            backend_node_id,
+            normalized,
+        )
+        attached = await cdp.call_function_on_backend_node(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            backend_node_id,
+            "function(){ return (this.files && this.files.length) || 0; }",
+        )
+        count = int(attached or 0)
+        if count < 1:
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail=(
+                    "file input has no files after attach "
+                    "(DOM.setFileInputFiles did not stick; check path is readable by Chrome)"
+                ),
+            )
+        if count != len(normalized):
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail=f"file input has {count} file(s) after attach, expected {len(normalized)}",
+            )
+        return await self._act_result(before_url, ok=True, detail=f"uploaded {count} file(s)")
 
     async def drag(
         self, source: dict[str, Any], target: dict[str, Any], *, steps: int = 10, delay_ms: int = 0
@@ -332,23 +416,22 @@ class SessionAdapter:
             raise exceptions.ElementNotFound("drag source or target has no bounding box")
         sx, sy = source_box["x"] + source_box["width"] / 2.0, source_box["y"] + source_box["height"] / 2.0
         tx, ty = target_box["x"] + target_box["width"] / 2.0, target_box["y"] + target_box["height"] / 2.0
+        source_is_html5 = await self._element_is_html5_draggable(source_id)
         cdp_session = await self._ensure_cdp_session()
-        client, session_id = cdp_session.cdp_client, cdp_session.session_id
-        await client.send.Input.dispatchMouseEvent(
-            params={"type": "mousePressed", "x": sx, "y": sy, "button": "left", "clickCount": 1, "modifiers": 0},
-            session_id=session_id,
+        result = await cdp.perform_drag(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            sx=sx,
+            sy=sy,
+            tx=tx,
+            ty=ty,
+            steps=steps,
+            delay_ms=delay_ms,
+            source_is_html5=source_is_html5,
+            source_backend_node_id=source_id,
+            target_backend_node_id=target_id,
         )
-        steps = max(1, steps)
-        for step in range(1, steps + 1):
-            frac = step / steps
-            await cdp.dispatch_mouse_move(client, session_id, x=sx + (tx - sx) * frac, y=sy + (ty - sy) * frac)
-            if delay_ms:
-                await asyncio.sleep(delay_ms / 1000.0)
-        await client.send.Input.dispatchMouseEvent(
-            params={"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1, "modifiers": 0},
-            session_id=session_id,
-        )
-        return await self._act_result(before_url, ok=True, detail="dragged")
+        return await self._act_result(before_url, ok=bool(result.get("ok")), detail=str(result.get("detail") or ""))
 
     async def switch_tab(self, tab: dict[str, Any]) -> dict[str, Any]:
         before_url = await self._safe_current_url()
@@ -526,6 +609,24 @@ class SessionAdapter:
         if not isinstance(rect, dict):
             return None
         return {k: float(rect.get(k, 0.0) or 0.0) for k in ("x", "y", "width", "height")}
+
+    async def _element_is_html5_draggable(self, backend_node_id: int) -> bool:
+        """True when the node opts into HTML5 DnD (mouse-only drag would be a no-op)."""
+        cdp_session = await self._ensure_cdp_session()
+        try:
+            result = await cdp.call_function_on_backend_node(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                backend_node_id,
+                "function(){"
+                "  if (this.getAttribute && this.getAttribute('draggable') === 'true') return true;"
+                "  if (this.draggable === true) return true;"
+                "  return false;"
+                "}",
+            )
+        except exceptions.DriverError:
+            return False
+        return bool(result)
 
     async def _element_facts(self, backend_node_id: int) -> tuple[str, dict[str, str], bool]:
         cdp_session = await self._ensure_cdp_session()

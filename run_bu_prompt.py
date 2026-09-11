@@ -64,7 +64,7 @@ async def main() -> None:
         await agent.ensure_initialized()
         result = await Runner.run_agent(
             agent,
-            {"query": query, "conversation_id": "bu-lab-11"},
+            {"query": query, "conversation_id": "bu-lab-18"},
         )
     finally:
         await Runner.stop()

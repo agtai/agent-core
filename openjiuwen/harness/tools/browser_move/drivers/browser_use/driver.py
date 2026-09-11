@@ -318,8 +318,40 @@ class BrowserUseDriver:
         return act_result
 
     async def upload_files(self, ref: ElementRef, paths: Sequence[str]) -> ActResult:
+        from pathlib import Path
+
+        existing: list[str] = []
+        missing: list[str] = []
+        for raw in paths:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                resolved = str(Path(text).expanduser().resolve())
+            except OSError:
+                missing.append(text)
+                continue
+            if Path(resolved).is_file():
+                existing.append(resolved)
+            else:
+                missing.append(resolved)
+        if missing:
+            listed = ", ".join(repr(p) for p in missing)
+            return ActResult(
+                ok=False,
+                detail=f"upload file(s) not found or not readable: {listed}",
+                document_changed=False,
+                driver_generation=self._driver_generation,
+            )
+        if not existing:
+            return ActResult(
+                ok=False,
+                detail="upload_files requires at least one path",
+                document_changed=False,
+                driver_generation=self._driver_generation,
+            )
         transport = self._require_transport()
-        result = await transport.request("upload_files", {"ref": _ref_to_wire(ref), "paths": list(paths)})
+        result = await transport.request("upload_files", {"ref": _ref_to_wire(ref), "paths": existing})
         act_result = _act_result_from_wire(result)
         self._driver_generation = act_result.driver_generation
         return act_result

@@ -4,10 +4,11 @@
 """Raw CDP helpers for operations browser-use has no high-level API for.
 
 STDLIB ONLY. browser-use's ``ExecuteJavaScriptEvent`` is commented out in
-0.13.10, so ``evaluate``, ``stamp``, ``resolve(SelectorRef)``, and
-``drag`` go through ``cdp_session.cdp_client.send.Runtime.evaluate`` /
+0.13.10, so ``evaluate``, ``stamp``, ``resolve(SelectorRef)``, ``drag``,
+and ``upload_files`` go through ``cdp_session.cdp_client.send.Runtime.evaluate`` /
 ``DOM.querySelector`` / ``Runtime.callFunctionOn`` /
-``Input.dispatchMouseEvent`` directly.
+``Input.dispatchMouseEvent`` / ``Input.setInterceptDrags`` /
+``Input.dispatchDragEvent`` / ``DOM.setFileInputFiles`` directly.
 
 Every function here takes a duck-typed ``cdp_client`` (whatever object
 exposes ``.send.<Domain>.<method>(params, session_id=...)``, matching
@@ -21,6 +22,7 @@ mirroring every other file in this subtree except ``wire.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -134,12 +136,281 @@ async def dispatch_mouse_click(
     await cdp_client.send.Input.dispatchMouseEvent(params={**base, "type": "mouseReleased"}, session_id=session_id)
 
 
-async def dispatch_mouse_move(cdp_client: Any, session_id: str, *, x: float, y: float) -> None:
-    """Dispatch a synthetic mouse move to page coordinates (used by drag)."""
+async def dispatch_mouse_move(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    x: float,
+    y: float,
+    buttons: int = 0,
+) -> None:
+    """Dispatch a synthetic mouse move to page coordinates (used by drag).
+
+    Pass ``buttons=1`` while the primary button is held so Chromium treats the
+    move as part of an active drag gesture (required for HTML5 ``dragstart``).
+    """
+    button = "left" if buttons & 1 else "none"
     await cdp_client.send.Input.dispatchMouseEvent(
-        params={"type": "mouseMoved", "x": x, "y": y, "button": "none", "clickCount": 0, "modifiers": 0},
+        params={
+            "type": "mouseMoved",
+            "x": x,
+            "y": y,
+            "button": button,
+            "buttons": buttons,
+            "clickCount": 0,
+            "modifiers": 0,
+        },
         session_id=session_id,
     )
+
+
+async def set_intercept_drags(cdp_client: Any, session_id: str, enabled: bool) -> None:
+    """Enable/disable CDP drag interception (``Input.setInterceptDrags``)."""
+    await cdp_client.send.Input.setInterceptDrags(params={"enabled": bool(enabled)}, session_id=session_id)
+
+
+async def dispatch_drag_event(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    event_type: str,
+    x: float,
+    y: float,
+    data: dict[str, Any],
+) -> None:
+    """Dispatch one ``Input.dispatchDragEvent`` (``dragEnter`` / ``dragOver`` / ``drop`` / ``dragCancel``)."""
+    await cdp_client.send.Input.dispatchDragEvent(
+        params={"type": event_type, "x": x, "y": y, "data": data, "modifiers": 0},
+        session_id=session_id,
+    )
+
+
+def register_drag_intercepted(cdp_client: Any, callback: Any) -> Any:
+    """Register an ``Input.dragIntercepted`` handler; return an unregister callable."""
+
+    def _unregister_registry() -> None:
+        registry = getattr(cdp_client, "_event_registry", None)
+        if registry is not None and hasattr(registry, "unregister"):
+            registry.unregister("Input.dragIntercepted")
+
+    register = getattr(cdp_client, "register", None)
+    input_reg = getattr(register, "Input", None) if register is not None else None
+    if input_reg is not None and hasattr(input_reg, "dragIntercepted"):
+        input_reg.dragIntercepted(callback)
+        return _unregister_registry
+
+    registry = getattr(cdp_client, "_event_registry", None)
+    if registry is not None and hasattr(registry, "register"):
+        registry.register("Input.dragIntercepted", callback)
+        return _unregister_registry
+
+    custom = getattr(cdp_client, "register_event", None)
+    if callable(custom):
+        custom("Input.dragIntercepted", callback)
+        unregister = getattr(cdp_client, "unregister_event", None)
+        if callable(unregister):
+            return lambda: unregister("Input.dragIntercepted")
+        return lambda: None
+
+    raise exceptions.DriverUnsupported("CDP client cannot register Input.dragIntercepted handlers")
+
+
+def _drag_data_from_intercept_event(event: Any) -> dict[str, Any]:
+    """Normalize ``Input.dragIntercepted`` payload to a CDP ``DragData`` dict."""
+    if isinstance(event, dict):
+        data = event.get("data", event)
+    else:
+        data = getattr(event, "data", event)
+    if not isinstance(data, dict):
+        return {"items": [], "files": [], "dragOperationsMask": 1}
+    items = data.get("items") or []
+    files = data.get("files") or []
+    mask = data.get("dragOperationsMask", 1)
+    return {
+        "items": list(items) if isinstance(items, (list, tuple)) else [],
+        "files": list(files) if isinstance(files, (list, tuple)) else [],
+        "dragOperationsMask": int(mask if mask is not None else 1),
+    }
+
+
+_HTML5_DND_JS = (
+    "function(target) {"
+    "  if (!target) { return { ok: false, error: 'missing drop target' }; }"
+    "  const source = this;"
+    "  const dt = new DataTransfer();"
+    "  const opts = { bubbles: true, cancelable: true, dataTransfer: dt };"
+    "  source.dispatchEvent(new DragEvent('dragstart', opts));"
+    "  target.dispatchEvent(new DragEvent('dragenter', opts));"
+    "  target.dispatchEvent(new DragEvent('dragover', opts));"
+    "  const dropped = target.dispatchEvent(new DragEvent('drop', opts));"
+    "  source.dispatchEvent(new DragEvent('dragend', opts));"
+    "  return { ok: true, dropped: !!dropped };"
+    "}"
+)
+
+
+async def html5_drag_drop_via_js(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    source_backend_node_id: int,
+    target_backend_node_id: int,
+) -> dict[str, Any]:
+    """Fire HTML5 ``dragstart``/``dragenter``/``dragover``/``drop``/``dragend`` in-page.
+
+    Used when CDP intercept did not yield ``dragIntercepted`` but the source is
+    HTML5-draggable. Returns the JS result dict (``ok`` / ``dropped`` / ``error``).
+    """
+    target_object_id = await resolve_object_id_by_backend_node(cdp_client, session_id, target_backend_node_id)
+    result = await call_function_on_backend_node(
+        cdp_client,
+        session_id,
+        source_backend_node_id,
+        _HTML5_DND_JS,
+        arguments=[{"objectId": target_object_id}],
+    )
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "html5 js drag returned non-object"}
+    return result
+
+
+async def perform_drag(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    sx: float,
+    sy: float,
+    tx: float,
+    ty: float,
+    steps: int = 10,
+    delay_ms: int = 0,
+    source_is_html5: bool = False,
+    source_backend_node_id: int | None = None,
+    target_backend_node_id: int | None = None,
+) -> dict[str, Any]:
+    """Drag from ``(sx,sy)`` to ``(tx,ty)`` with HTML5 DnD support when needed.
+
+    Sequence (Playwright / Puppeteer style):
+      1. ``Input.setInterceptDrags(true)`` + listen for ``Input.dragIntercepted``
+      2. mousePressed at source, mouseMoved (with ``buttons=1``) toward target
+      3. if intercept fires → ``dragEnter`` / ``dragOver`` / ``drop`` + mouseReleased
+      4. else if source is HTML5-draggable → JS ``DragEvent`` fallback between nodes
+      5. else plain pointer mouseReleased (non-HTML5 UIs)
+
+    Never reports success for an HTML5-draggable source when neither CDP intercept
+    nor the JS fallback could complete a drop.
+    """
+    steps = max(1, int(steps))
+    intercepted: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    def _on_intercepted(event: Any, _sid: Any = None) -> None:
+        if not intercepted.done():
+            intercepted.set_result(_drag_data_from_intercept_event(event))
+
+    unregister = register_drag_intercepted(cdp_client, _on_intercepted)
+    try:
+        await set_intercept_drags(cdp_client, session_id, True)
+        await cdp_client.send.Input.dispatchMouseEvent(
+            params={
+                "type": "mouseMoved",
+                "x": sx,
+                "y": sy,
+                "button": "none",
+                "buttons": 0,
+                "clickCount": 0,
+                "modifiers": 0,
+            },
+            session_id=session_id,
+        )
+        await cdp_client.send.Input.dispatchMouseEvent(
+            params={
+                "type": "mousePressed",
+                "x": sx,
+                "y": sy,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+                "modifiers": 0,
+            },
+            session_id=session_id,
+        )
+        for step in range(1, steps + 1):
+            frac = step / steps
+            await dispatch_mouse_move(
+                cdp_client,
+                session_id,
+                x=sx + (tx - sx) * frac,
+                y=sy + (ty - sy) * frac,
+                buttons=1,
+            )
+            if intercepted.done():
+                break
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000.0)
+
+        if intercepted.done():
+            data = intercepted.result()
+            await dispatch_drag_event(cdp_client, session_id, event_type="dragEnter", x=tx, y=ty, data=data)
+            await dispatch_drag_event(cdp_client, session_id, event_type="dragOver", x=tx, y=ty, data=data)
+            await dispatch_drag_event(cdp_client, session_id, event_type="drop", x=tx, y=ty, data=data)
+            await cdp_client.send.Input.dispatchMouseEvent(
+                params={
+                    "type": "mouseReleased",
+                    "x": tx,
+                    "y": ty,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                    "modifiers": 0,
+                },
+                session_id=session_id,
+            )
+            return {"ok": True, "detail": "dragged (html5 cdp)", "mode": "html5_cdp"}
+
+        await cdp_client.send.Input.dispatchMouseEvent(
+            params={
+                "type": "mouseReleased",
+                "x": tx,
+                "y": ty,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+                "modifiers": 0,
+            },
+            session_id=session_id,
+        )
+
+        if source_is_html5:
+            if source_backend_node_id is None or target_backend_node_id is None:
+                return {
+                    "ok": False,
+                    "detail": (
+                        "HTML5 drag did not start (no Input.dragIntercepted); "
+                        "cannot run JS fallback without source/target backend node ids"
+                    ),
+                    "mode": "html5_failed",
+                }
+            js_result = await html5_drag_drop_via_js(
+                cdp_client,
+                session_id,
+                source_backend_node_id=source_backend_node_id,
+                target_backend_node_id=target_backend_node_id,
+            )
+            if js_result.get("ok"):
+                return {"ok": True, "detail": "dragged (html5 js)", "mode": "html5_js"}
+            error = js_result.get("error") or "HTML5 JS drag/drop produced no effect"
+            return {"ok": False, "detail": str(error), "mode": "html5_failed"}
+
+        return {"ok": True, "detail": "dragged", "mode": "pointer"}
+    finally:
+        try:
+            await set_intercept_drags(cdp_client, session_id, False)
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+        try:
+            unregister()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
 
 
 async def insert_text(cdp_client: Any, session_id: str, text: str) -> None:
@@ -159,6 +430,25 @@ async def request_node_id_from_object(cdp_client: Any, session_id: str, object_i
     return int(result["nodeId"])
 
 
+async def set_file_input_files(
+    cdp_client: Any,
+    session_id: str,
+    backend_node_id: int,
+    files: list[str],
+) -> None:
+    """Attach local file path(s) to an ``<input type=file>`` via CDP.
+
+    Uses ``backendNodeId`` (not ``nodeId``): ``nodeId`` can fail to grant the
+    renderer file access and leave a fakepath that later submits as
+    ``ERR_FILE_NOT_FOUND``. Paths must be absolute and readable by the Chrome
+    process that owns the CDP session.
+    """
+    await cdp_client.send.DOM.setFileInputFiles(
+        params={"files": list(files), "backendNodeId": int(backend_node_id)},
+        session_id=session_id,
+    )
+
+
 def _unwrap_js_result(result: dict[str, Any]) -> Any:
     """Raise ``exceptions.EvaluateError`` on a JS exception, else return the value."""
     exception_details = result.get("exceptionDetails")
@@ -173,13 +463,19 @@ def _unwrap_js_result(result: dict[str, Any]) -> Any:
 __all__ = [
     "call_function_on_backend_node",
     "describe_node_backend_id",
+    "dispatch_drag_event",
     "dispatch_key_press",
     "dispatch_mouse_click",
     "dispatch_mouse_move",
     "evaluate_expression",
     "get_document_root_node_id",
+    "html5_drag_drop_via_js",
     "insert_text",
+    "perform_drag",
     "query_selector_node_id",
+    "register_drag_intercepted",
     "request_node_id_from_object",
     "resolve_object_id_by_backend_node",
+    "set_file_input_files",
+    "set_intercept_drags",
 ]
