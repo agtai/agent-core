@@ -10,11 +10,12 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from openjiuwen.harness.tools.browser_move.drivers.base import ActResult, SelectorRef
 from openjiuwen.harness.tools.browser_move.drivers.browser_use.driver import BrowserUseDriver
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
 
 
 def _run(coro):
@@ -39,9 +40,9 @@ def test_upload_files_missing_path_returns_failed_act_result_without_sidecar() -
     assert isinstance(result, ActResult)
     assert result.ok is False
     assert "not found" in result.detail.lower()
+    assert "not readable" not in result.detail.lower()
     assert "openjiuwen_missing_upload_no_such_file.txt" in result.detail
-    # Error prefers the resolved absolute path.
-    assert Path(missing).name in result.detail
+    assert "BROWSER_UPLOAD_ROOT" in result.detail
     transport.request.assert_not_called()
 
 
@@ -61,7 +62,6 @@ def test_upload_files_existing_path_calls_sidecar_with_resolved_absolute() -> No
         handle.write(b"hello")
         existing = handle.name
     try:
-        # Relative path from the temp file's directory should resolve + pass absolute.
         parent = Path(existing).parent
         rel = Path(existing).name
         old_cwd = Path.cwd()
@@ -109,6 +109,47 @@ def test_upload_files_tilde_path_is_expanded_before_sidecar() -> None:
     assert "~" not in params["paths"][0]
 
 
+def test_upload_files_strips_wrapping_quotes_before_is_file() -> None:
+    transport = AsyncMock()
+    transport.request = AsyncMock(
+        return_value={
+            "ok": True,
+            "detail": "uploaded 1 file(s)",
+            "document_changed": False,
+            "driver_generation": 8,
+        }
+    )
+    driver = _make_driver_with_transport(transport)
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as handle:
+        handle.write(b"quoted")
+        existing = handle.name
+    try:
+        quoted = f"'{existing}'"
+        result = _run(driver.upload_files(SelectorRef(css="input[type=file]"), [quoted]))
+    finally:
+        Path(existing).unlink(missing_ok=True)
+
+    assert result.ok is True
+    method, params = transport.request.call_args.args
+    assert params["paths"] == [str(Path(existing).resolve())]
+
+
+def test_resolve_upload_file_paths_uses_browser_upload_root_for_basename() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        target = root / "staged_upload.txt"
+        target.write_text("staged", encoding="utf-8")
+        with patch(
+            "openjiuwen.harness.tools.browser_move.utils.upload_paths.resolve_upload_root",
+            return_value=root.resolve(),
+        ):
+            existing, err = resolve_upload_file_paths(["staged_upload.txt"])
+
+    assert err is None
+    assert existing == [str(target.resolve())]
+
+
 def test_runtime_file_upload_missing_path_fails_closed() -> None:
     runtime = BrowserAgentRuntime.__new__(BrowserAgentRuntime)
     runtime.ensure_runtime_ready = AsyncMock()
@@ -128,8 +169,10 @@ def test_runtime_file_upload_missing_path_fails_closed() -> None:
 
     assert result["ok"] is False
     assert "not found" in str(result.get("error") or "").lower()
+    assert "not readable" not in str(result.get("error") or "").lower()
     assert "openjiuwen_missing_runtime_upload.txt" in str(result.get("error") or "")
     runtime._ensure_browser_driver.assert_not_called()
+    runtime._resolve_catalog_element_ref.assert_not_called()
 
 
 def test_runtime_file_upload_normalizes_existing_path_before_driver() -> None:

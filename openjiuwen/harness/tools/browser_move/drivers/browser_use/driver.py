@@ -318,35 +318,13 @@ class BrowserUseDriver:
         return act_result
 
     async def upload_files(self, ref: ElementRef, paths: Sequence[str]) -> ActResult:
-        from pathlib import Path
+        from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
 
-        existing: list[str] = []
-        missing: list[str] = []
-        for raw in paths:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            try:
-                resolved = str(Path(text).expanduser().resolve())
-            except OSError:
-                missing.append(text)
-                continue
-            if Path(resolved).is_file():
-                existing.append(resolved)
-            else:
-                missing.append(resolved)
-        if missing:
-            listed = ", ".join(repr(p) for p in missing)
+        existing, path_error = resolve_upload_file_paths(paths)
+        if path_error:
             return ActResult(
                 ok=False,
-                detail=f"upload file(s) not found or not readable: {listed}",
-                document_changed=False,
-                driver_generation=self._driver_generation,
-            )
-        if not existing:
-            return ActResult(
-                ok=False,
-                detail="upload_files requires at least one path",
+                detail=path_error,
                 document_changed=False,
                 driver_generation=self._driver_generation,
             )

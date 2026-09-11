@@ -2727,35 +2727,14 @@ class BrowserAgentRuntime:
     ) -> Dict[str, Any]:
         """Upload files to an input via BrowserDriver (catalog ``browser_file_upload``)."""
         await self.ensure_runtime_ready()
-        from pathlib import Path
+        from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
 
-        path_list: list[str] = []
-        missing: list[str] = []
-        for path in paths or []:
-            text = str(path).strip()
-            if not text:
-                continue
-            try:
-                resolved = str(Path(text).expanduser().resolve())
-            except OSError:
-                missing.append(text)
-                continue
-            if Path(resolved).is_file():
-                path_list.append(resolved)
-            else:
-                missing.append(resolved)
-        if not path_list and not missing:
+        path_list, path_error = resolve_upload_file_paths(paths or [])
+        if path_error:
             return {
                 "ok": False,
-                "error": "'paths' must contain at least one file path",
-                "page_state": self.export_page_state(),
-            }
-        if missing:
-            listed = ", ".join(repr(p) for p in missing)
-            return {
-                "ok": False,
-                "error": f"upload file(s) not found or not readable: {listed}",
-                "paths": path_list + missing,
+                "error": path_error,
+                "paths": path_list,
                 "page_state": self.export_page_state(),
             }
         try:

@@ -101,6 +101,10 @@ def _sidecar_env() -> dict[str, str]:
     for key, value in os.environ.items():
         if key.startswith("BROWSER_USE_") and key != "BROWSER_USE_SIDECAR_PYTHON":
             env[key] = value
+    # Same catalog root as list_upload_files / runtime path resolution.
+    upload_root = os.environ.get("BROWSER_UPLOAD_ROOT")
+    if upload_root is not None and str(upload_root).strip():
+        env["BROWSER_UPLOAD_ROOT"] = str(upload_root).strip()
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     return env
 

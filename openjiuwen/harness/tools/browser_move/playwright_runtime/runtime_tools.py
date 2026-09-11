@@ -262,7 +262,11 @@ _FILE_UPLOAD_PARAMS: Dict[str, Any] = {
         "paths": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Absolute or workspace-relative file paths to upload.",
+            "description": (
+                "Absolute or workspace-relative file paths to upload. "
+                "Relative/bare names also resolve under BROWSER_UPLOAD_ROOT when set "
+                "(see list_upload_files)."
+            ),
         },
     },
     "required": ["generation_id", "paths"],

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -34,28 +35,89 @@ import keys as key_utils
 import mapping
 
 
-def _normalize_upload_paths(paths: list[str]) -> tuple[list[str], list[str]]:
-    """Return ``(existing_absolute_paths, missing_or_unreadable_paths)``.
+def _strip_upload_path_text(raw: str) -> str:
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1].strip()
+    return text
 
-    Paths are ``expanduser().resolve()``'d before the ``is_file`` check so CDP
-    always receives absolute paths Chrome can open, and errors list absolutes.
+
+def _upload_root() -> Path | None:
+    raw = (os.environ.get("BROWSER_UPLOAD_ROOT") or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _normalize_upload_paths(paths: list[str]) -> tuple[list[str], str | None]:
+    """Return ``(existing_absolute_paths, error_or_none)``.
+
+    Mirrors runtime/driver ``resolve_upload_file_paths``: quote-strip,
+    ``expanduser().resolve()``, optional ``BROWSER_UPLOAD_ROOT`` for relative
+    names, and distinguish not-found vs open/read failure. CDP always gets
+    absolute paths Chrome can open.
     """
     existing: list[str] = []
     missing: list[str] = []
-    for raw in paths:
-        text = str(raw or "").strip()
+    unreadable: list[str] = []
+    seen: set[str] = set()
+    root = _upload_root()
+
+    for raw in paths or []:
+        text = _strip_upload_path_text(str(raw))
         if not text:
             continue
-        try:
-            resolved = str(Path(text).expanduser().resolve())
-        except OSError:
-            missing.append(text)
+        primary = Path(text).expanduser()
+        candidates = [primary]
+        if not primary.is_absolute() and root is not None:
+            candidates.append(root / text)
+            candidates.append(root / primary.name)
+        resolved_ok: str | None = None
+        last_resolved = text
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            last_resolved = str(resolved)
+            if not resolved.is_file():
+                continue
+            try:
+                with resolved.open("rb") as handle:
+                    handle.read(1)
+            except OSError:
+                unreadable.append(str(resolved))
+                resolved_ok = None
+                break
+            resolved_ok = str(resolved)
+            break
+        if resolved_ok is None:
+            if last_resolved not in unreadable:
+                missing.append(last_resolved)
             continue
-        if Path(resolved).is_file():
-            existing.append(resolved)
-        else:
-            missing.append(resolved)
-    return existing, missing
+        if resolved_ok not in seen:
+            seen.add(resolved_ok)
+            existing.append(resolved_ok)
+
+    if not existing and not missing and not unreadable:
+        return [], "upload_files requires at least one path"
+    err_parts: list[str] = []
+    if missing:
+        listed = ", ".join(repr(p) for p in missing)
+        err_parts.append(
+            f"upload file(s) not found: {listed} "
+            "(create the file, use an absolute path, or place it under "
+            "BROWSER_UPLOAD_ROOT and call list_upload_files)"
+        )
+    if unreadable:
+        listed = ", ".join(repr(p) for p in unreadable)
+        err_parts.append(f"upload file(s) not readable: {listed}")
+    if err_parts:
+        return existing, "; ".join(err_parts)
+    return existing, None
 
 
 def browser_use_version() -> str:
@@ -336,16 +398,9 @@ class SessionAdapter:
 
     async def upload_files(self, ref: dict[str, Any], paths: list[str]) -> dict[str, Any]:
         before_url = await self._safe_current_url()
-        normalized, missing = _normalize_upload_paths(paths or [])
-        if not normalized and not missing:
-            return await self._act_result(before_url, ok=False, detail="upload_files requires at least one path")
-        if missing:
-            listed = ", ".join(repr(p) for p in missing)
-            return await self._act_result(
-                before_url,
-                ok=False,
-                detail=f"upload file(s) not found or not readable: {listed}",
-            )
+        normalized, path_error = _normalize_upload_paths(paths or [])
+        if path_error:
+            return await self._act_result(before_url, ok=False, detail=path_error)
         backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
         cdp_session = await self._ensure_cdp_session()
         facts = await cdp.call_function_on_backend_node(

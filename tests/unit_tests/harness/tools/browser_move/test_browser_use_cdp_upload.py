@@ -210,5 +210,28 @@ def test_session_adapter_upload_files_missing_path_skips_cdp() -> None:
 
     assert result["ok"] is False
     assert "not found" in result["detail"].lower()
+    assert "not readable" not in result["detail"].lower()
     adapter._resolve_ref_to_backend_node_id.assert_not_called()
     assert client.calls == []
+
+
+def test_session_adapter_upload_files_strips_quotes_and_resolves_absolute() -> None:
+    adapter = _session_adapter.SessionAdapter()
+    client = _FakeCdpClient(attach_ok=True, is_file_input=True, multiple=False)
+    adapter._cdp_session = SimpleNamespace(cdp_client=client, session_id="s1")
+    adapter._session = SimpleNamespace(get_current_page_url=AsyncMock(return_value="https://example.test/upload"))
+    adapter._resolve_ref_to_backend_node_id = AsyncMock(return_value=11)
+    adapter._ensure_cdp_session = AsyncMock(return_value=adapter._cdp_session)
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as handle:
+        handle.write(b"payload")
+        path = handle.name
+    try:
+        result = _run(adapter.upload_files({"kind": "node", "backend_node_id": 11}, [f'"{path}"']))
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    assert result["ok"] is True
+    set_calls = [c for c in client.calls if c[0] == "DOM.setFileInputFiles"]
+    assert len(set_calls) == 1
+    assert set_calls[0][1]["files"] == [str(Path(path).resolve())]
