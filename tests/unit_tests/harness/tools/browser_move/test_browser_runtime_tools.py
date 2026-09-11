@@ -18,9 +18,13 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools impo
     BrowserCloseTool,
     BrowserCustomActionTool,
     BrowserDragTool,
+    BrowserDropTool,
     BrowserEvaluateTool,
     BrowserFileUploadTool,
     BrowserFillFormTool,
+    BrowserFindTool,
+    BrowserHandleDialogTool,
+    BrowserHoverTool,
     BrowserListActionsTool,
     BrowserNavigateBackTool,
     BrowserNavigateTool,
@@ -61,7 +65,7 @@ def _make_runtime() -> BrowserAgentRuntime:
 
 def test_build_browser_runtime_tools_returns_catalog_and_cancel_tools() -> None:
     tools = build_browser_runtime_tools(_make_runtime())
-    assert len(tools) == 16
+    assert len(tools) == 20
 
 
 def test_each_tool_is_tool_subclass() -> None:
@@ -89,6 +93,10 @@ def test_default_catalog_tool_names() -> None:
         "browser_evaluate",
         "browser_drag",
         "browser_file_upload",
+        "browser_hover",
+        "browser_find",
+        "browser_handle_dialog",
+        "browser_drop",
         "browser_fill_form",
         "browser_snapshot",
         "browser_cancel_run",
@@ -120,6 +128,10 @@ def test_helper_tool_classes() -> None:
         evaluate,
         drag,
         file_upload,
+        hover,
+        find_tool,
+        handle_dialog,
+        drop,
         fill_form,
         snapshot,
         cancel,
@@ -137,6 +149,10 @@ def test_helper_tool_classes() -> None:
     assert isinstance(evaluate, BrowserEvaluateTool)
     assert isinstance(drag, BrowserDragTool)
     assert isinstance(file_upload, BrowserFileUploadTool)
+    assert isinstance(hover, BrowserHoverTool)
+    assert isinstance(find_tool, BrowserFindTool)
+    assert isinstance(handle_dialog, BrowserHandleDialogTool)
+    assert isinstance(drop, BrowserDropTool)
     assert isinstance(fill_form, BrowserFillFormTool)
     assert isinstance(snapshot, BrowserSnapshotTool)
     assert isinstance(cancel, BrowserCancelTool)

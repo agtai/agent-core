@@ -113,9 +113,13 @@ BROWSER_CATALOG_RUNTIME_TOOL_NAMES = frozenset(
         "browser_click",
         "browser_close",
         "browser_drag",
+        "browser_drop",
         "browser_evaluate",
         "browser_file_upload",
         "browser_fill_form",
+        "browser_find",
+        "browser_handle_dialog",
+        "browser_hover",
         "browser_navigate",
         "browser_navigate_back",
         "browser_press_key",
@@ -2766,6 +2770,213 @@ class BrowserAgentRuntime:
             "detail": act.detail,
             "changed_document": bool(act.document_changed),
             "paths": path_list,
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def hover(
+        self,
+        *,
+        generation_id: str,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+    ) -> Dict[str, Any]:
+        """Hover the mouse over an element (catalog ``browser_hover``)."""
+        await self.ensure_runtime_ready()
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="hover",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_hover failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.hover(element_ref)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_hover failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def find(
+        self,
+        *,
+        query: str,
+        regex: bool = False,
+        limit: int = 20,
+        generation_id: str = "",
+    ) -> Dict[str, Any]:
+        """Search the current generation's snapshot / interactives (catalog ``browser_find``)."""
+        await self.ensure_runtime_ready()
+        page_state = self._ensure_page_state()
+        effective_generation = str(generation_id or "").strip() or page_state.generation_id
+        try:
+            page_state.validate_generation(effective_generation)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_find failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        if not page_state.has_searchable_snapshot():
+            return {
+                "ok": False,
+                "error": (
+                    "browser_find has no searchable snapshot for the current generation; "
+                    "call browser_snapshot first"
+                ),
+                "matches": [],
+                "count": 0,
+                "page_state": self.export_page_state(),
+            }
+        needle = str(query or "").strip()
+        if not needle:
+            return {
+                "ok": False,
+                "error": "'query' is required",
+                "matches": [],
+                "count": 0,
+                "page_state": self.export_page_state(),
+            }
+        try:
+            matches = page_state.find_in_snapshot(
+                needle,
+                regex=bool(regex),
+                limit=max(1, min(100, int(limit or 20))),
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": f"browser_find failed: {exc}",
+                "matches": [],
+                "count": 0,
+                "page_state": self.export_page_state(),
+            }
+        return {
+            "ok": True,
+            "query": needle,
+            "regex": bool(regex),
+            "matches": matches,
+            "count": len(matches),
+            "error": None,
+            "page_state": self.export_page_state(),
+        }
+
+    async def handle_dialog(
+        self,
+        *,
+        accept: bool,
+        prompt_text: str | None = None,
+    ) -> Dict[str, Any]:
+        """Accept/dismiss a JS dialog, or arm for the next one (catalog ``browser_handle_dialog``)."""
+        await self.ensure_runtime_ready()
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.handle_dialog(accept=bool(accept), prompt_text=prompt_text)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_handle_dialog failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "error": None if act.ok else act.detail,
+            "page_state": self.export_page_state(),
+        }
+
+    async def drop(
+        self,
+        *,
+        generation_id: str,
+        paths: list[str] | tuple[str, ...] | None = None,
+        data: list[Dict[str, Any]] | tuple[Dict[str, Any], ...] | None = None,
+        target_id: str = "",
+        ref: str = "",
+        selector: str = "",
+    ) -> Dict[str, Any]:
+        """Drop external files / MIME data onto an element (catalog ``browser_drop``)."""
+        await self.ensure_runtime_ready()
+        path_list = [str(path) for path in (paths or []) if str(path or "").strip()]
+        data_list: list[Dict[str, str]] = []
+        for index, item in enumerate(data or []):
+            if not isinstance(item, dict):
+                return {
+                    "ok": False,
+                    "error": f"data[{index}] must be an object with mimeType/data",
+                    "page_state": self.export_page_state(),
+                }
+            mime = str(item.get("mimeType") or item.get("mime_type") or "").strip()
+            data_list.append({"mimeType": mime, "data": str(item.get("data") or "")})
+        if not path_list and not data_list:
+            return {
+                "ok": False,
+                "error": "drop requires at least one of paths or data",
+                "page_state": self.export_page_state(),
+            }
+        from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
+
+        resolved_paths: list[str] = []
+        if path_list:
+            resolved_paths, path_error = resolve_upload_file_paths(path_list)
+            if path_error:
+                return {
+                    "ok": False,
+                    "error": path_error,
+                    "paths": resolved_paths,
+                    "page_state": self.export_page_state(),
+                }
+        try:
+            element_ref = await self._resolve_catalog_element_ref(
+                generation_id=generation_id,
+                target_id=target_id,
+                ref=ref,
+                selector=selector,
+                op="drop",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_drop failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        driver = await self._ensure_browser_driver()
+        try:
+            act = await driver.drop(element_ref, paths=resolved_paths, data=data_list)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"browser_drop failed: {exc}",
+                "page_state": self.export_page_state(),
+            }
+        self._apply_document_changed(changed=bool(act.document_changed))
+        return {
+            "ok": bool(act.ok),
+            "detail": act.detail,
+            "changed_document": bool(act.document_changed),
+            "paths": resolved_paths,
+            "data": data_list,
             "error": None if act.ok else act.detail,
             "page_state": self.export_page_state(),
         }

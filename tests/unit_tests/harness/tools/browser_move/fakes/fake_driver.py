@@ -334,6 +334,27 @@ class FakeDriver:
         self._record("drag", source=source, target=target, steps=steps, delay_ms=delay_ms)
         return self._act_result(document_changed=False)
 
+    async def hover(self, ref: ElementRef) -> ActResult:
+        self._require_connected()
+        self._record("hover", ref=ref)
+        return self._act_result(document_changed=False)
+
+    async def handle_dialog(self, *, accept: bool, prompt_text: str | None = None) -> ActResult:
+        self._require_connected()
+        self._record("handle_dialog", accept=accept, prompt_text=prompt_text)
+        return self._act_result(document_changed=False)
+
+    async def drop(
+        self,
+        ref: ElementRef,
+        *,
+        paths: Sequence[str] = (),
+        data: Sequence[dict[str, str]] = (),
+    ) -> ActResult:
+        self._require_connected()
+        self._record("drop", ref=ref, paths=list(paths), data=[dict(item) for item in data])
+        return self._act_result(document_changed=False)
+
     async def switch_tab(self, tab: TabRef) -> ActResult:
         self._require_connected()
         self._record("switch_tab", tab=tab)

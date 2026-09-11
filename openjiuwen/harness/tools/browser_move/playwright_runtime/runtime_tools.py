@@ -272,6 +272,101 @@ _FILE_UPLOAD_PARAMS: Dict[str, Any] = {
     "required": ["generation_id", "paths"],
 }
 
+_HOVER_DESC = "Hover the mouse over an element (tooltips / :hover menus)."
+_HOVER_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+    },
+    "required": ["generation_id"],
+}
+
+_FIND_DESC = (
+    "Search the current accessibility / page snapshot for text or a regex. "
+    "Returns matching nodes with target_id/ref and short context. "
+    "Requires a prior browser_snapshot (or probe) for the current generation."
+)
+_FIND_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Text or regex pattern to search for in the current snapshot.",
+        },
+        "regex": {
+            "type": "boolean",
+            "description": "Treat query as a regular expression. Default false.",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Maximum matches to return (1-100). Default 20.",
+        },
+        "generation_id": {
+            "type": "string",
+            "description": "Optional PageState generation_id; defaults to current.",
+        },
+    },
+    "required": ["query"],
+}
+
+_HANDLE_DIALOG_DESC = (
+    "Accept or dismiss a JavaScript alert/confirm/prompt. "
+    "If no dialog is open yet, arms handling for the next dialog — "
+    "call this before the click/type that opens it."
+)
+_HANDLE_DIALOG_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "accept": {
+            "type": "boolean",
+            "description": "True to accept/OK, false to dismiss/Cancel.",
+        },
+        "promptText": {
+            "type": "string",
+            "description": "Optional text to submit for a prompt() dialog.",
+        },
+        "prompt_text": {
+            "type": "string",
+            "description": "Alias for promptText.",
+        },
+    },
+    "required": ["accept"],
+}
+
+_DROP_DESC = (
+    "Drop local files and/or MIME-typed data onto an element as if dragged from "
+    "outside the page. Distinct from browser_drag (element→element). "
+    "At least one of paths or data is required. Supported MIME types: "
+    "text/plain, text/uri-list, text/html."
+)
+_DROP_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **_ELEMENT_TARGET_PROPERTIES,
+        "paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Absolute or workspace-relative file paths to drop. "
+                "Resolved like browser_file_upload (BROWSER_UPLOAD_ROOT)."
+            ),
+        },
+        "data": {
+            "type": "array",
+            "description": "MIME-typed drag data items (mimeType + data).",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "mimeType": {"type": "string"},
+                    "mime_type": {"type": "string"},
+                    "data": {"type": "string"},
+                },
+            },
+        },
+    },
+    "required": ["generation_id"],
+}
+
 _FILL_FORM_DESC = "Fill multiple form fields in one call (type / select / checkbox)."
 _FILL_FORM_PARAMS: Dict[str, Any] = {
     "type": "object",
@@ -1278,6 +1373,194 @@ class BrowserFileUploadTool(Tool):
             yield None
 
 
+class BrowserHoverTool(Tool):
+    """Hover over an element via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_hover",
+                description=_HOVER_DESC,
+                input_params=_HOVER_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        try:
+            result = await self._runtime.hover(
+                generation_id=generation_id,
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserFindTool(Tool):
+    """Search the current PageState snapshot for text/regex matches."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_find",
+                description=_FIND_DESC,
+                input_params=_FIND_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        query = str(inputs.get("query") or "").strip()
+        if not query:
+            return ToolOutput(success=False, error="'query' is required")
+        regex_raw = inputs.get("regex", False)
+        if isinstance(regex_raw, str):
+            regex = regex_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            regex = bool(regex_raw)
+        limit_raw = inputs.get("limit", 20)
+        try:
+            limit = int(limit_raw if limit_raw not in (None, "") else 20)
+        except (TypeError, ValueError):
+            return ToolOutput(success=False, error="'limit' must be an integer")
+        generation_id = str(inputs.get("generation_id") or "").strip()
+        try:
+            result = await self._runtime.find(
+                query=query,
+                regex=regex,
+                limit=limit,
+                generation_id=generation_id,
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserHandleDialogTool(Tool):
+    """Accept/dismiss a JS dialog, or arm for the next one."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_handle_dialog",
+                description=_HANDLE_DIALOG_DESC,
+                input_params=_HANDLE_DIALOG_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        if "accept" not in inputs:
+            return ToolOutput(success=False, error="'accept' is required")
+        accept_raw = inputs.get("accept")
+        if isinstance(accept_raw, str):
+            accept = accept_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            accept = bool(accept_raw)
+        prompt_raw = inputs.get("promptText", inputs.get("prompt_text"))
+        prompt_text = None if prompt_raw is None else str(prompt_raw)
+        try:
+            result = await self._runtime.handle_dialog(accept=accept, prompt_text=prompt_text)
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
+class BrowserDropTool(Tool):
+    """Drop external files / MIME data onto an element via BrowserDriver."""
+
+    def __init__(self, runtime: "BrowserAgentRuntime", language: str = "cn") -> None:
+        del language
+        super().__init__(
+            ToolCard(
+                name="browser_drop",
+                description=_DROP_DESC,
+                input_params=_DROP_PARAMS,
+            )
+        )
+        self._runtime = runtime
+
+    async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
+        del kwargs
+        generation_id = _parse_generation_id(inputs)
+        if isinstance(generation_id, ToolOutput):
+            return generation_id
+        paths_raw = inputs.get("paths")
+        data_raw = inputs.get("data")
+        paths: list[str] | None = None
+        data: list[Dict[str, Any]] | None = None
+        if paths_raw is not None:
+            if not isinstance(paths_raw, list):
+                return ToolOutput(success=False, error="'paths' must be a list of strings")
+            paths = [str(path) for path in paths_raw]
+        if data_raw is not None:
+            if not isinstance(data_raw, list):
+                return ToolOutput(success=False, error="'data' must be a list of objects")
+            data = [item for item in data_raw if isinstance(item, dict)]
+            if len(data) != len(data_raw):
+                return ToolOutput(success=False, error="'data' items must be objects")
+        try:
+            result = await self._runtime.drop(
+                generation_id=generation_id,
+                paths=paths,
+                data=data,
+                target_id=str(inputs.get("target_id") or "").strip(),
+                ref=str(inputs.get("ref") or "").strip(),
+                selector=str(inputs.get("selector") or "").strip(),
+            )
+            return ToolOutput(
+                success=bool(result.get("ok", True)),
+                data=result,
+                error=result.get("error"),
+            )
+        except Exception as exc:
+            return ToolOutput(success=False, error=str(exc))
+
+    async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[Any]:
+        del inputs, kwargs
+        if False:
+            yield None
+
+
 class BrowserFillFormTool(Tool):
     """Fill multiple form fields via composed driver actions."""
 
@@ -1702,6 +1985,10 @@ def build_browser_runtime_tools(
         BrowserEvaluateTool(runtime, language),
         BrowserDragTool(runtime, language),
         BrowserFileUploadTool(runtime, language),
+        BrowserHoverTool(runtime, language),
+        BrowserFindTool(runtime, language),
+        BrowserHandleDialogTool(runtime, language),
+        BrowserDropTool(runtime, language),
         BrowserFillFormTool(runtime, language),
         BrowserSnapshotTool(runtime, language),
         # Non-CORE exceptions: session cancellation control for long-running tasks.

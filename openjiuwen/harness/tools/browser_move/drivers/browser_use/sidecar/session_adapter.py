@@ -137,6 +137,12 @@ class SessionAdapter:
         self._cdp_session: Any = None
         self._driver_generation = 0
         self._index_cache: dict[int, Any] = {}
+        # Dialog arming: apply to the next JS dialog, or to a currently pending one.
+        self._dialog_armed: dict[str, Any] | None = None
+        self._dialog_pending: dict[str, Any] | None = None
+        self._dialog_listener_registered = False
+        self._dialog_unregister: Any = None
+        self._dialog_handle_tasks: set[asyncio.Task] = set()
 
     # -- lifecycle ---------------------------------------------------
 
@@ -148,6 +154,7 @@ class SessionAdapter:
         self._session = BrowserSession(cdp_url=cdp_url, is_local=False, browser_profile=profile)
         await self._session.start()
         self._cdp_session = await self._session.get_or_create_cdp_session()
+        await self._ensure_dialog_listener()
 
         version_info: dict[str, Any] = {}
         try:
@@ -488,6 +495,113 @@ class SessionAdapter:
         )
         return await self._act_result(before_url, ok=bool(result.get("ok")), detail=str(result.get("detail") or ""))
 
+    async def hover(self, ref: dict[str, Any]) -> dict[str, Any]:
+        before_url = await self._safe_current_url()
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        box = await self._element_box(backend_node_id)
+        if box is None:
+            raise exceptions.ElementNotFound(f"element (backend_node_id={backend_node_id}) has no bounding box")
+        cx, cy = box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
+        cdp_session = await self._ensure_cdp_session()
+        # Approach stream then settle on center (tooltip / :hover menus).
+        await cdp.dispatch_mouse_move(
+            cdp_session.cdp_client,
+            cdp_session.session_id,
+            x=max(0.0, cx - 4.0),
+            y=max(0.0, cy - 4.0),
+        )
+        await cdp.dispatch_mouse_move(cdp_session.cdp_client, cdp_session.session_id, x=cx, y=cy)
+        return await self._act_result(before_url, ok=True, detail="hovered")
+
+    async def handle_dialog(self, *, accept: bool, prompt_text: str | None = None) -> dict[str, Any]:
+        """Handle the open dialog, or arm for the next one.
+
+        Call this *before* the click/type that opens a blocking dialog when the
+        dialog is not already pending. Success always means either
+        ``Page.handleJavaScriptDialog`` ran, or the next opening is armed to run it.
+        """
+        before_url = await self._safe_current_url()
+        await self._ensure_dialog_listener()
+        if self._dialog_pending is not None:
+            pending = self._dialog_pending
+            self._dialog_pending = None
+            cdp_session = await self._ensure_cdp_session()
+            await cdp.handle_javascript_dialog(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                accept=bool(accept),
+                prompt_text=prompt_text,
+            )
+            dialog_type = str(pending.get("type") or "dialog")
+            action = "accepted" if accept else "dismissed"
+            return await self._act_result(before_url, ok=True, detail=f"{action} {dialog_type}")
+        self._dialog_armed = {"accept": bool(accept), "prompt_text": prompt_text}
+        return await self._act_result(
+            before_url,
+            ok=True,
+            detail="armed for next dialog; call before the action that opens it",
+        )
+
+    async def drop(
+        self,
+        ref: dict[str, Any],
+        *,
+        paths: list[str] | None = None,
+        data: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Drop external files and/or MIME data onto an element (not element→element drag)."""
+        before_url = await self._safe_current_url()
+        path_list = list(paths or [])
+        data_list = list(data or [])
+        if not path_list and not data_list:
+            return await self._act_result(
+                before_url,
+                ok=False,
+                detail="drop requires at least one of paths or data",
+            )
+        normalized: list[str] = []
+        if path_list:
+            normalized, path_error = _normalize_upload_paths(path_list)
+            if path_error:
+                return await self._act_result(before_url, ok=False, detail=path_error)
+        backend_node_id = await self._resolve_ref_to_backend_node_id(ref)
+        box = await self._element_box(backend_node_id)
+        if box is None:
+            raise exceptions.ElementNotFound(f"drop target (backend_node_id={backend_node_id}) has no bounding box")
+        cx, cy = box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
+        cdp_session = await self._ensure_cdp_session()
+        try:
+            result = await cdp.perform_external_drop(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                x=cx,
+                y=cy,
+                paths=normalized,
+                items=data_list,
+            )
+        except exceptions.DriverUnsupported:
+            raise
+        except exceptions.DriverError as exc:
+            return await self._act_result(before_url, ok=False, detail=str(exc))
+        detail = str(result.get("detail") or "dropped")
+        # Best-effort verify: file inputs may receive files via the DataTransfer.
+        if normalized:
+            attached = await cdp.call_function_on_backend_node(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                backend_node_id,
+                "function(){"
+                "  if (this && this.tagName === 'INPUT' &&"
+                "      String(this.type || '').toLowerCase() === 'file') {"
+                "    return (this.files && this.files.length) || 0;"
+                "  }"
+                "  return null;"
+                "}",
+            )
+            if isinstance(attached, int) and attached > 0:
+                detail = f"{detail}; file input now has {attached} file(s)"
+        return await self._act_result(before_url, ok=bool(result.get("ok")), detail=detail)
+
     async def switch_tab(self, tab: dict[str, Any]) -> dict[str, Any]:
         before_url = await self._safe_current_url()
         from browser_use.browser.events import SwitchTabEvent
@@ -496,6 +610,8 @@ class SessionAdapter:
         await event
         await event.event_result(raise_if_any=True, raise_if_none=False)
         self._cdp_session = None  # invalidate cached CDP session across tab switch
+        self._dialog_listener_registered = False
+        self._dialog_unregister = None
         return await self._act_result(before_url, ok=True, detail="switched tab")
 
     async def close_tab(self, tab: dict[str, Any]) -> dict[str, Any]:
@@ -538,6 +654,54 @@ class SessionAdapter:
         if self._cdp_session is None:
             self._cdp_session = await self._session.get_or_create_cdp_session()
         return self._cdp_session
+
+    async def _ensure_dialog_listener(self) -> None:
+        """Enable Page events and arm javascriptDialogOpening routing."""
+        if self._dialog_listener_registered:
+            return
+        cdp_session = await self._ensure_cdp_session()
+        await cdp.enable_page_domain(cdp_session.cdp_client, cdp_session.session_id)
+
+        def _on_dialog(event: Any, _sid: Any = None) -> None:
+            payload = event if isinstance(event, dict) else getattr(event, "__dict__", {}) or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            info = {
+                "type": str(payload.get("type") or "alert"),
+                "message": str(payload.get("message") or ""),
+                "defaultPrompt": str(payload.get("defaultPrompt") or ""),
+            }
+            armed = self._dialog_armed
+            if armed is not None:
+                self._dialog_armed = None
+                self._dialog_pending = None
+                task = asyncio.create_task(
+                    self._apply_armed_dialog(
+                        accept=bool(armed.get("accept")),
+                        prompt_text=armed.get("prompt_text"),
+                    )
+                )
+                self._dialog_handle_tasks.add(task)
+                task.add_done_callback(self._dialog_handle_tasks.discard)
+            else:
+                self._dialog_pending = info
+
+        self._dialog_unregister = cdp.register_javascript_dialog_opening(
+            cdp_session.cdp_client, _on_dialog
+        )
+        self._dialog_listener_registered = True
+
+    async def _apply_armed_dialog(self, *, accept: bool, prompt_text: str | None) -> None:
+        try:
+            cdp_session = await self._ensure_cdp_session()
+            await cdp.handle_javascript_dialog(
+                cdp_session.cdp_client,
+                cdp_session.session_id,
+                accept=accept,
+                prompt_text=prompt_text,
+            )
+        except Exception:  # noqa: BLE001 - dialog arming must not crash the session
+            pass
 
     async def _safe_current_url(self) -> str:
         try:

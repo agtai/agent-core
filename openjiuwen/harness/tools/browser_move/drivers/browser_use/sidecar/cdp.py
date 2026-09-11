@@ -449,6 +449,131 @@ async def set_file_input_files(
     )
 
 
+SUPPORTED_DROP_MIME_TYPES: frozenset[str] = frozenset(
+    {
+        "text/plain",
+        "text/uri-list",
+        "text/html",
+    }
+)
+
+
+def build_external_drag_data(
+    *,
+    paths: list[str] | None = None,
+    items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a CDP ``DragData`` payload for an external (out-of-page) drop.
+
+    ``paths`` become ``files`` (absolute paths Chrome can open). ``items`` are
+    MIME payloads; only :data:`SUPPORTED_DROP_MIME_TYPES` are accepted — any
+    other mime raises ``DriverUnsupported``.
+    """
+    file_paths = [str(path) for path in (paths or []) if str(path or "").strip()]
+    mime_items: list[dict[str, str]] = []
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            raise exceptions.DriverUnsupported("drop data items must be objects with mimeType/data")
+        mime = str(raw.get("mimeType") or raw.get("mime_type") or "").strip().lower()
+        if not mime:
+            raise exceptions.DriverUnsupported("drop data item missing mimeType")
+        if mime not in SUPPORTED_DROP_MIME_TYPES:
+            supported = ", ".join(sorted(SUPPORTED_DROP_MIME_TYPES))
+            raise exceptions.DriverUnsupported(
+                f"drop MIME type {mime!r} is not supported (supported: {supported})"
+            )
+        mime_items.append({"mimeType": mime, "data": str(raw.get("data") or "")})
+    if not file_paths and not mime_items:
+        raise exceptions.DriverError("drop requires at least one path or data item")
+    return {
+        "items": mime_items,
+        "files": file_paths,
+        "dragOperationsMask": 1,  # copy
+    }
+
+
+async def perform_external_drop(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    x: float,
+    y: float,
+    paths: list[str] | None = None,
+    items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Drop external files and/or MIME data onto page coordinates via CDP.
+
+    Distinct from element→element ``perform_drag``: this synthesizes an
+    out-of-page DataTransfer using ``Input.dispatchDragEvent`` only.
+    """
+    data = build_external_drag_data(paths=paths, items=items)
+    await dispatch_drag_event(cdp_client, session_id, event_type="dragEnter", x=x, y=y, data=data)
+    await dispatch_drag_event(cdp_client, session_id, event_type="dragOver", x=x, y=y, data=data)
+    await dispatch_drag_event(cdp_client, session_id, event_type="drop", x=x, y=y, data=data)
+    file_count = len(data.get("files") or [])
+    item_count = len(data.get("items") or [])
+    parts: list[str] = []
+    if file_count:
+        parts.append(f"{file_count} file(s)")
+    if item_count:
+        parts.append(f"{item_count} mime item(s)")
+    return {
+        "ok": True,
+        "detail": f"dropped {' + '.join(parts)} via CDP Input.dispatchDragEvent",
+        "files": list(data.get("files") or []),
+        "items": list(data.get("items") or []),
+    }
+
+
+async def enable_page_domain(cdp_client: Any, session_id: str) -> None:
+    """Enable the Page domain (required for JS dialog events/handling)."""
+    await cdp_client.send.Page.enable(params={}, session_id=session_id)
+
+
+async def handle_javascript_dialog(
+    cdp_client: Any,
+    session_id: str,
+    *,
+    accept: bool,
+    prompt_text: str | None = None,
+) -> None:
+    """Accept or dismiss the currently open JS dialog via CDP."""
+    params: dict[str, Any] = {"accept": bool(accept)}
+    if prompt_text is not None:
+        params["promptText"] = str(prompt_text)
+    await cdp_client.send.Page.handleJavaScriptDialog(params=params, session_id=session_id)
+
+
+def register_javascript_dialog_opening(cdp_client: Any, callback: Any) -> Any:
+    """Register a ``Page.javascriptDialogOpening`` handler; return unregister callable."""
+
+    def _unregister_registry() -> None:
+        registry = getattr(cdp_client, "_event_registry", None)
+        if registry is not None and hasattr(registry, "unregister"):
+            registry.unregister("Page.javascriptDialogOpening")
+
+    register = getattr(cdp_client, "register", None)
+    page_reg = getattr(register, "Page", None) if register is not None else None
+    if page_reg is not None and hasattr(page_reg, "javascriptDialogOpening"):
+        page_reg.javascriptDialogOpening(callback)
+        return _unregister_registry
+
+    registry = getattr(cdp_client, "_event_registry", None)
+    if registry is not None and hasattr(registry, "register"):
+        registry.register("Page.javascriptDialogOpening", callback)
+        return _unregister_registry
+
+    custom = getattr(cdp_client, "register_event", None)
+    if callable(custom):
+        custom("Page.javascriptDialogOpening", callback)
+        unregister = getattr(cdp_client, "unregister_event", None)
+        if callable(unregister):
+            return lambda: unregister("Page.javascriptDialogOpening")
+        return lambda: None
+
+    raise exceptions.DriverUnsupported("CDP client cannot register Page.javascriptDialogOpening handlers")
+
+
 def _unwrap_js_result(result: dict[str, Any]) -> Any:
     """Raise ``exceptions.EvaluateError`` on a JS exception, else return the value."""
     exception_details = result.get("exceptionDetails")
@@ -461,19 +586,25 @@ def _unwrap_js_result(result: dict[str, Any]) -> Any:
 
 
 __all__ = [
+    "SUPPORTED_DROP_MIME_TYPES",
+    "build_external_drag_data",
     "call_function_on_backend_node",
     "describe_node_backend_id",
     "dispatch_drag_event",
     "dispatch_key_press",
     "dispatch_mouse_click",
     "dispatch_mouse_move",
+    "enable_page_domain",
     "evaluate_expression",
     "get_document_root_node_id",
+    "handle_javascript_dialog",
     "html5_drag_drop_via_js",
     "insert_text",
     "perform_drag",
+    "perform_external_drop",
     "query_selector_node_id",
     "register_drag_intercepted",
+    "register_javascript_dialog_opening",
     "request_node_id_from_object",
     "resolve_object_id_by_backend_node",
     "set_file_input_files",

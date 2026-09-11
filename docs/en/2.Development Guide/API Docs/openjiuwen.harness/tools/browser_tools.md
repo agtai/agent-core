@@ -21,10 +21,11 @@ Grouped by capability. `core` is always available; every other group must be req
 | `browser_type` | Type text into an element. |
 | `browser_fill_form` | Fill multiple form fields in one call. |
 | `browser_select_option` | Select an option in a native dropdown. |
-| `browser_hover` | Hover over an element. |
-| `browser_drag` / `browser_drop` | Drag an element and drop it on a target. |
+| `browser_hover` | Hover over an element (tooltips / `:hover` menus). |
+| `browser_drag` | Drag from one element to another. |
+| `browser_drop` | Drop local files and/or MIME-typed data onto an element as if dragged from outside the page (not element→element). |
 | `browser_press_key` | Press a keyboard key (e.g. `Enter`, `Escape`). |
-| `browser_find` | Find elements on the page. |
+| `browser_find` | Search the current accessibility / page snapshot for text or a regex; returns matching refs/`target_id`s. Requires a prior `browser_snapshot`. |
 | `browser_snapshot` | Capture an accessibility snapshot of the page (the reference source for element-addressed actions). |
 | `browser_take_screenshot` | Take a screenshot of the page or an element. |
 | `browser_evaluate` | Evaluate a JavaScript expression on the page. |
@@ -32,7 +33,7 @@ Grouped by capability. `core` is always available; every other group must be req
 | `browser_wait_for` | Wait for text to appear/disappear or for a time interval. |
 | `browser_tabs` | Manage tabs (`list`, `new`, `close`, `select`). |
 | `browser_resize` | Resize the browser window/viewport. |
-| `browser_handle_dialog` | Accept or dismiss a browser dialog (alert/confirm/prompt). |
+| `browser_handle_dialog` | Accept or dismiss a browser dialog (alert/confirm/prompt). Arm before the action that opens a blocking dialog when needed. |
 | `browser_file_upload` | Provide files for an active file chooser. |
 | `browser_console_messages` | Read the page's console messages. |
 | `browser_network_request` / `browser_network_requests` | Inspect a single network request / list requests made by the page. |

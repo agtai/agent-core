@@ -28,6 +28,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     RuntimeSettings,
 )
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+    BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES,
     CORE_BROWSER_TOOL_NAMES,
     narrow_allowed_tools_for_browser_driver,
 )
@@ -256,14 +257,15 @@ def test_default_factory_forwards_registered_catalog_allowlist() -> None:
     allowed = mock_runtime_cls.call_args.kwargs["allowed_tool_names"]
     assert set(allowed) == set(BROWSER_CATALOG_RUNTIME_TOOL_NAMES)
     assert set(allowed) <= set(CORE_BROWSER_TOOL_NAMES)
-    # Ghost / deferred CORE names must not appear on BU.
-    for deferred in (
+    # Former deferred CORE tools are now registered on BU.
+    for name in (
         "browser_drop",
         "browser_find",
         "browser_handle_dialog",
         "browser_hover",
     ):
-        assert deferred not in allowed
+        assert name in allowed
+    assert not BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES
 
 
 @pytest.mark.parametrize(

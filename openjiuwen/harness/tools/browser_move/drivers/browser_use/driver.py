@@ -346,6 +346,59 @@ class BrowserUseDriver:
         self._driver_generation = act_result.driver_generation
         return act_result
 
+    async def hover(self, ref: ElementRef) -> ActResult:
+        transport = self._require_transport()
+        result = await transport.request("hover", {"ref": _ref_to_wire(ref)})
+        act_result = _act_result_from_wire(result)
+        self._driver_generation = act_result.driver_generation
+        return act_result
+
+    async def handle_dialog(self, *, accept: bool, prompt_text: str | None = None) -> ActResult:
+        transport = self._require_transport()
+        result = await transport.request(
+            "handle_dialog", {"accept": bool(accept), "prompt_text": prompt_text}
+        )
+        act_result = _act_result_from_wire(result)
+        self._driver_generation = act_result.driver_generation
+        return act_result
+
+    async def drop(
+        self,
+        ref: ElementRef,
+        *,
+        paths: Sequence[str] = (),
+        data: Sequence[dict[str, str]] = (),
+    ) -> ActResult:
+        from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
+
+        path_list = [str(path) for path in (paths or []) if str(path or "").strip()]
+        data_list = [dict(item) for item in (data or []) if isinstance(item, dict)]
+        if not path_list and not data_list:
+            return ActResult(
+                ok=False,
+                detail="drop requires at least one of paths or data",
+                document_changed=False,
+                driver_generation=self._driver_generation,
+            )
+        existing: list[str] = []
+        if path_list:
+            existing, path_error = resolve_upload_file_paths(path_list)
+            if path_error:
+                return ActResult(
+                    ok=False,
+                    detail=path_error,
+                    document_changed=False,
+                    driver_generation=self._driver_generation,
+                )
+        transport = self._require_transport()
+        result = await transport.request(
+            "drop",
+            {"ref": _ref_to_wire(ref), "paths": existing, "data": data_list},
+        )
+        act_result = _act_result_from_wire(result)
+        self._driver_generation = act_result.driver_generation
+        return act_result
+
     async def switch_tab(self, tab: TabRef) -> ActResult:
         transport = self._require_transport()
         result = await transport.request("switch_tab", {"tab": _tab_to_wire(tab)})

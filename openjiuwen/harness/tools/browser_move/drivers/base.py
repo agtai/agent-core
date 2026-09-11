@@ -277,6 +277,23 @@ class BrowserDriver(Protocol):
         delay_ms: int = 0,
     ) -> ActResult: ...
 
+    async def hover(self, ref: ElementRef) -> ActResult: ...
+
+    async def handle_dialog(
+        self,
+        *,
+        accept: bool,
+        prompt_text: str | None = None,
+    ) -> ActResult: ...
+
+    async def drop(
+        self,
+        ref: ElementRef,
+        *,
+        paths: Sequence[str] = (),
+        data: Sequence[dict[str, str]] = (),
+    ) -> ActResult: ...
+
     async def switch_tab(self, tab: TabRef) -> ActResult: ...
 
     async def close_tab(self, tab: TabRef) -> ActResult: ...

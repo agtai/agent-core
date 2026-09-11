@@ -36,14 +36,7 @@ CORE_BROWSER_TOOL_NAMES: tuple[str, ...] = (
 # CORE names that are intentionally NOT registered on the BrowserDriver (BU) path
 # until Protocol/sidecar can honor them honestly. They remain in CORE_BROWSER_TOOL_NAMES
 # for the legacy MCP capability catalog, but must not appear in BU allowed_tools.
-BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "browser_drop",  # no distinct BrowserDriver.drop; use browser_drag
-        "browser_find",  # no honest find schema without a dedicated driver API
-        "browser_handle_dialog",  # BrowserDriver has no dialog API
-        "browser_hover",  # BrowserDriver has no hover API
-    }
-)
+BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES: frozenset[str] = frozenset()
 
 ADVANCED_CODE_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code",)
 

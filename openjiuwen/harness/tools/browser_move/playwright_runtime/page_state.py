@@ -202,6 +202,7 @@ class BrowserPageState:
         self._interactive_target_ids: list[str] = []
         self._cards: list[Dict[str, Any]] = []
         self._target_counter = 0
+        self.ax_text: str = ""
 
     @property
     def generation_id(self) -> str:
@@ -217,6 +218,7 @@ class BrowserPageState:
         self.blockers.clear()
         self._interactive_target_ids.clear()
         self._cards.clear()
+        self.ax_text = ""
         self._trim_target_history()
 
     def observe(self, *, url: Any = "", title: Any = "") -> None:
@@ -353,6 +355,7 @@ class BrowserPageState:
     def register_ax_snapshot(self, value: Any) -> tuple[str, ...]:
         """Register native Playwright refs without translating them in the model."""
         text = value if isinstance(value, str) else str(value)
+        self.ax_text = text
         registered: list[str] = []
         for match in _AX_REF_LINE_RE.finditer(text):
             ref_value = _normalize_ref_value(match.group("ref"))
@@ -376,6 +379,129 @@ class BrowserPageState:
 
         self._update_blockers({}, [text[:4000]])
         return tuple(registered)
+
+    def has_searchable_snapshot(self) -> bool:
+        """True when the current generation has ax_text or interactive targets to search."""
+        if str(self.ax_text or "").strip():
+            return True
+        for target_id in self._interactive_target_ids:
+            target = self._targets.get(target_id)
+            if target is None or target.generation != self.generation:
+                continue
+            if any(str(value or "").strip() for value in (target.name, target.text, target.role, target.ref)):
+                return True
+        return False
+
+    def find_in_snapshot(
+        self,
+        query: str,
+        *,
+        regex: bool = False,
+        limit: int = 20,
+    ) -> list[Dict[str, Any]]:
+        """Search current-generation ax_text / interactives; empty list if nothing matches.
+
+        Callers must check :meth:`has_searchable_snapshot` first and fail closed
+        when False (no prior ``browser_snapshot`` / probe content).
+        """
+        needle = str(query or "")
+        if not needle:
+            return []
+        max_matches = max(1, min(100, int(limit or 20)))
+        pattern: re.Pattern[str] | None = None
+        if regex:
+            try:
+                pattern = re.compile(needle, re.IGNORECASE | re.MULTILINE)
+            except re.error as exc:
+                raise ValueError(f"invalid regex: {exc}") from exc
+
+        matches: list[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+
+        def _add(match: Dict[str, Any]) -> None:
+            if len(matches) >= max_matches:
+                return
+            key = (
+                f"{match.get('target_id') or ''}|{match.get('ref') or ''}|"
+                f"{match.get('context') or ''}"
+            )
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            matches.append(match)
+
+        def _text_matches(haystack: str) -> bool:
+            if pattern is not None:
+                return pattern.search(haystack) is not None
+            return needle.casefold() in haystack.casefold()
+
+        ax_text = str(self.ax_text or "")
+        if ax_text.strip():
+            lines = ax_text.splitlines()
+            for index, line in enumerate(lines):
+                if len(matches) >= max_matches:
+                    break
+                if not _text_matches(line):
+                    continue
+                ref_value = ""
+                role = ""
+                name = ""
+                line_match = _AX_REF_LINE_RE.search(line)
+                if line_match is not None:
+                    ref_value = _normalize_ref_value(line_match.group("ref"))
+                    role = str(line_match.group("role") or "").strip()
+                    name = str(line_match.group("name") or "").strip()
+                if not ref_value:
+                    tokens = _snapshot_ref_tokens(line)
+                    ref_value = tokens[0] if tokens else ""
+                target_id = ""
+                if ref_value:
+                    resolved = self._ref_targets.get(ref_value)
+                    target = self._targets.get(resolved or "")
+                    if target is not None and target.generation == self.generation:
+                        target_id = target.target_id
+                        role = role or target.role
+                        name = name or target.name or target.text
+                start = max(0, index - 1)
+                end = min(len(lines), index + 2)
+                context = "\n".join(lines[start:end])[:400]
+                _add(
+                    {
+                        "target_id": target_id,
+                        "ref": ref_value,
+                        "role": role,
+                        "name": name,
+                        "generation_id": self.generation_id,
+                        "context": context,
+                        "source": "ax_text",
+                    }
+                )
+
+        for target_id in self._interactive_target_ids:
+            if len(matches) >= max_matches:
+                break
+            target = self._targets.get(target_id)
+            if target is None or target.generation != self.generation:
+                continue
+            haystack = " ".join(
+                part
+                for part in (target.role, target.name, target.text, target.ref, target.selector)
+                if part
+            )
+            if not haystack or not _text_matches(haystack):
+                continue
+            _add(
+                {
+                    "target_id": target.target_id,
+                    "ref": target.ref,
+                    "role": target.role,
+                    "name": target.name or target.text,
+                    "generation_id": self.generation_id,
+                    "context": _compact_text(haystack, 240),
+                    "source": target.source or "interactive",
+                }
+            )
+        return matches
 
     def replace_ax_snapshot(self, value: Any) -> tuple[str, ...]:
         """Replace current-generation AX refs with refs from one complete snapshot."""
