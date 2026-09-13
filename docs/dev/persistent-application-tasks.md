@@ -91,7 +91,7 @@ They establish SDK/storage boundaries, not physical voice or cloud-model accepta
 
 ## Local distribution
 
-The branch package version is `0.1.17+livevoice.3`; official `0.1.17` does not
+The branch package version is `0.1.17+livevoice.4`; official `0.1.17` does not
 contain this addition and must not satisfy the consuming application's pin.
 JiuwenSwarm uses the sibling `../agent-core` editable uv source for local
 work. For wheel installation, install the matching SDK wheel together with
@@ -162,3 +162,65 @@ not provide this checkpoint/revision/UNKNOWN contract. Task remains responsible
 for authorized project mutations, durable attempts, outbox and verified effects;
 Work remains the lighter analysis lifecycle. They reuse contracts and execution
 primitives without pretending those different state meanings are interchangeable.
+
+## Code-level integration audit (2026-09-13)
+
+The current cleanup removes `LegacyProjectTaskService` and the unused `service`
+member of `ProjectExecutionBinding`. No production executor read that member;
+only historical scheduler fixtures used it. The consuming Host no longer passes
+or starts/stops a legacy carrier; SDK project execution and Host Agent cleanup
+remain the actual owners. Historical carrier bindings belong to test support.
+This is a paired development-branch `.4` change: external callers constructing
+`.3` bindings with `service=` or importing the removed protocol must update.
+No claim of compatibility with unknown direct `.3` consumers is made.
+
+The broader addition still does not replace Controller or Team task management.
+`TaskManager.get_state/load_state` copies Controller session task/index state;
+`TaskScheduler.cancel_task` requests executor cancellation and marks CANCELED.
+Team DAO assignment/dependency/review transactions own different coordination
+facts. Harness async tool completion also injects into its owning harness.
+None of these inspected paths establishes the application's durable outbox,
+exact attempt/effect settlement or Work checkpoint CAS. Existing Agent/tool
+execution is reused; durable delivery remains an added subsystem, whose wider
+management convergence is unproved.
+
+A root-registered checkpoint Rail replacement failed a real wrong-Agent tool
+case and was reverted. The final TaskCheckpointRail uses the existing native
+AgentCallbackManager's new scoped_agent_rail entry instead. Host supplies only
+cached-instance and session identity readers; its dynamic presentation-rail
+checkpoint callback fields have been removed. Physical voice, running-cancel
+user acceptance and current external-provider behavior are not established by
+these checks.
+
+### Execution-scoped native rails
+
+`openjiuwen.core.single_agent.agent_callback_manager.scoped_agent_rail` binds an
+AgentRail to the current Python execution context, including inherited async
+tasks. Ordinary callers without a scope keep their existing callback behavior.
+This opt-in facility never registers process-global callbacks or tools. Callback
+failures propagate. Nested scopes execute outer-to-inner, independent of normal
+registry priorities. After scope exit, inherited tasks fail closed, including
+when exit happens while a callback is suspended. Callers must keep the scope
+open through actual stream cleanup; it is not a sandbox against trusted Python
+code explicitly replacing its execution context.
+
+```python
+from openjiuwen.core.single_agent.agent_callback_manager import scoped_agent_rail
+from openjiuwen.core.single_agent.rail.base import AgentCallbackEvent
+
+# task_rail is a TaskCheckpointRail with application-owned identity adapters.
+with scoped_agent_rail(
+    task_rail,
+    before_events=frozenset({AgentCallbackEvent.BEFORE_TOOL_CALL}),
+):
+    # Consume and close the existing SDK Agent stream in this same scope.
+    ...
+```
+
+By default scoped hooks run after ordinary registered hooks. `before_events`
+selects hooks that must precede ordinary projection callbacks: Task tool-plan
+validation rejects before tool_call/history emission, while model adoption
+runs after ordinary model-context preprocessing. Hooks are trusted SDK code;
+this does not authorize arbitrary later hooks to rewrite protected arguments.
+The inspected Host hook only cleans call_goal for file tools. Applications
+using argument-rewriting hooks must preserve the same authorization boundary.

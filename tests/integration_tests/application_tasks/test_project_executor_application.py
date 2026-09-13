@@ -118,7 +118,6 @@ def _direct_binding(
     releases: list[str] | None = None,
 ) -> ProjectExecutionBinding:
     return ProjectExecutionBinding(
-        service=None,
         execution_agent=object(),
         project_executor=executor,
         effective_execution_root=str(project.resolve()),

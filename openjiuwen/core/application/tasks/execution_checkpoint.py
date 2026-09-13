@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openjiuwen.core.foundation.llm import AssistantMessage, ToolMessage
+from openjiuwen.core.single_agent.rail.base import AgentRail, ToolCallInputs
 
 _READ_ROUND_LIMIT = 6
 _READ_BATCH_TOOLS = frozenset({"read_file"})
@@ -140,6 +141,48 @@ def current_background_task_checkpoint(session_id: str) -> BackgroundTaskCheckpo
     if owner is not None and (owner.closed or owner.session_id != session_id):
         raise RuntimeError("BACKGROUND_TASK_CHECKPOINT_BINDING_MISMATCH")
     return owner
+
+
+class TaskCheckpointRail(AgentRail):
+    """Task policy on native callbacks; the application supplies identity facts.
+
+    Bind with scoped_agent_rail, not just to the root's callback registry: tool
+    callbacks can select a different Agent from their context. No Voice or Host
+    type is imported and this rail creates no execution or persistence owner.
+    """
+
+    def __init__(self, checkpoint, *, root_agent, binding_is_current, session_identity):
+        super().__init__()
+        self.checkpoint = checkpoint
+        self.root_agent = root_agent
+        self.binding_is_current = binding_is_current
+        self.session_identity = session_identity
+
+    async def before_model_call(self, ctx):
+        if self.checkpoint.closed or not self.binding_is_current():
+            raise RuntimeError("BACKGROUND_TASK_CHECKPOINT_STALE")
+        if ctx.agent is self.root_agent:
+            await self.checkpoint.adopt(ctx.context)
+            self.checkpoint.check_model_progress(ctx.context)
+
+    async def before_tool_call(self, ctx):
+        checkpoint = self.checkpoint
+        if checkpoint.file_plan is None:
+            return
+        try:
+            if (checkpoint.closed or not self.binding_is_current()
+                    or ctx.agent is not self.root_agent
+                    or self.session_identity(ctx) != checkpoint.session_id
+                    or not isinstance(ctx.inputs, ToolCallInputs)
+                    or ctx.inputs.tool_name != getattr(ctx.inputs.tool_call, "name", None)):
+                raise RuntimeError("FILE_EFFECT_TOOL_IDENTITY_MISMATCH")
+            arguments = ctx.inputs.tool_call.arguments
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            await checkpoint.file_plan.before_tool(ctx.inputs.tool_name, arguments)
+        except Exception as error:
+            checkpoint.failure_reason = getattr(error, "reason", "BACKGROUND_FILE_EFFECT_REJECTED")
+            raise
 
 
 def file_effect_plan_tool():

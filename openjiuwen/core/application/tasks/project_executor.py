@@ -264,16 +264,6 @@ class ProjectExecutionApplication(Protocol):
     def runtime_support_governance(self, root: Path) -> dict[str, object]: ...
 
 
-class LegacyProjectTaskService(Protocol):
-    async def run_task(
-        self, query: str, model: Any = None, pipeline: str | None = None, **kwargs: Any
-    ) -> dict[str, Any]: ...
-
-    async def get_scheduled_task_status(self, task_id: str, **kwargs: Any) -> dict[str, Any]: ...
-
-    async def cancel_scheduled_task(self, task_id: str, **kwargs: Any) -> dict[str, Any]: ...
-
-
 @dataclass(frozen=True, slots=True)
 class DirectStreamObservation:
     """Content-free metadata for one Direct file-tool stream event."""
@@ -308,7 +298,6 @@ class AttemptProjectExecutorLease:
 class ProjectExecutionBinding:
     """Trusted runtime objects for one exact server-resolved project context."""
 
-    service: LegacyProjectTaskService | None
     execution_agent: Any
     project_executor: Any
     effective_execution_root: str
@@ -6215,7 +6204,6 @@ __all__ = [
     "PROJECT_CODE_EFFECT_POLICY",
     "PROJECT_CODE_EXECUTOR",
     "PROJECT_CODE_PIPELINE",
-    "LegacyProjectTaskService",
     "ProjectExecutionBinding",
     "ProjectExecutionBindingResolver",
 ]

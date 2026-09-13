@@ -3,9 +3,56 @@
 """AgentCallbackManager Class Definition"""
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Optional
 
-from openjiuwen.core.single_agent.rail.base import AgentCallbackEvent, AgentRail, AnyAgentCallback, AgentCallbackContext
+from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentCallbackEvent, AgentRail, AnyAgentCallback
+
+
+@dataclass
+class _ExecutionRail:
+    callbacks: dict
+    before_events: frozenset[AgentCallbackEvent]
+    active: bool = True
+
+
+_execution_rails: ContextVar[tuple[_ExecutionRail, ...]] = ContextVar("agent_execution_rails", default=())
+
+
+def _require_active(scopes, event):
+    if any(event in owner.callbacks and not owner.active for owner in scopes):
+        from openjiuwen.core.runner.callback.errors import AbortError
+
+        raise AbortError("SCOPED_AGENT_RAIL_CLOSED")
+
+
+@contextmanager
+def scoped_agent_rail(rail: AgentRail, *, before_events: frozenset[AgentCallbackEvent] = frozenset()):
+    """Apply a trusted rail to this execution, including inherited async tasks.
+
+    Callbacks run after ordinary instance hooks unless their event is listed in
+    before_events (for guards that must also precede hook projections). Each
+    phase runs in outer-to-inner scope order, independent of registry priorities.
+    They propagate failures instead of using the ordinary callback error policy.
+    The scope is independent of ``ctx.agent``; guards must validate their exact
+    identity themselves. Exiting revokes inherited scopes, even in unfinished
+    child tasks. This is not a sandbox for code that replaces its Python context.
+    No tools are registered and no process-global callback registry is changed.
+    """
+    if not isinstance(rail, AgentRail):
+        raise TypeError("execution scope requires an AgentRail")
+    callbacks = dict(rail.get_callbacks())
+    if not isinstance(before_events, frozenset) or not before_events <= callbacks.keys():
+        raise ValueError("before_events must name callbacks implemented by the rail")
+    owner = _ExecutionRail(callbacks, before_events)
+    token = _execution_rails.set((*_execution_rails.get(), owner))
+    try:
+        yield
+    finally:
+        owner.active = False
+        _execution_rails.reset(token)
 
 
 class AgentCallbackManager:
@@ -111,7 +158,8 @@ class AgentCallbackManager:
         agent_event = self._get_agent_event(event)
         from openjiuwen.core.runner import Runner
 
-        return len(Runner.callback_framework.list_callbacks(agent_event)) > 0
+        return (any(event in owner.callbacks for owner in _execution_rails.get())
+                or len(Runner.callback_framework.list_callbacks(agent_event)) > 0)
 
     async def execute(
         self,
@@ -130,7 +178,19 @@ class AgentCallbackManager:
         from openjiuwen.core.runner import Runner
 
         agent_event = self._get_agent_event(event)
+        scopes = _execution_rails.get()
+        _require_active(scopes, event)
+        for owner in scopes:
+            if event in owner.before_events:
+                await owner.callbacks[event](ctx)
+                _require_active(scopes, event)
         await Runner.callback_framework.trigger(agent_event, ctx)
+        _require_active(scopes, event)
+        for owner in scopes:
+            callback = owner.callbacks.get(event)
+            if callback is not None and event not in owner.before_events:
+                await callback(ctx)
+                _require_active(scopes, event)
         return ctx
 
     def _get_agent_event(self, event: AgentCallbackEvent) -> str:
