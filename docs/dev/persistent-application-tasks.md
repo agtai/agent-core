@@ -91,7 +91,7 @@ They establish SDK/storage boundaries, not physical voice or cloud-model accepta
 
 ## Local distribution
 
-The branch package version is `0.1.17+livevoice.2`; official `0.1.17` does not
+The branch package version is `0.1.17+livevoice.3`; official `0.1.17` does not
 contain this addition and must not satisfy the consuming application's pin.
 JiuwenSwarm uses the sibling `../agent-core` editable uv source for local
 work. For wheel installation, install the matching SDK wheel together with
@@ -103,7 +103,7 @@ Host integration additionally exercises task creation/delivery, SQLite replay,
 adjust/cancel/recovery, project file effects, real SDK tool registration and
 source validation. A wheel-to-wheel import verifies the packaged Host uses the
 packaged SDK task implementation. Physical audio/cloud-model acceptance and
-migration of Work remain outside this change.
+migration of Work were outside that initial change. The Work follow-up is below.
 
 ## Project execution ownership (2026-09-13 follow-up)
 
@@ -134,3 +134,31 @@ execution, original-file/index preservation, cancel/adjust, partial effects and
 restart. Existing synchronous filesystem authority checks are retained during
 extraction; their four explicit lint exceptions avoid changing scheduling in a
 behavior-preserving migration. No cloud latency policy changes are included.
+
+## Work ownership (2026-09-13 follow-up)
+
+`WorkRuntime` and `SqliteWorkStore` own admitted analysis work, revisions,
+deduplication, exact-scope queries, cancellation settlement and checkpoint CAS.
+Admission is saved before scheduling the injected runner. Reopening a checkpoint
+whose process execution ownership was lost records UNKNOWN; it never replays
+Agent/tool effects or invents completion. Work and project Tasks can use the same
+SQLite file without creating a Task for every analysis.
+
+The application supplies the configured Agent runner and authorized context;
+its source/input journal and presentation receipts remain application-owned.
+Store initialization/validation hooks keep those tables in the same transaction
+without introducing application imports into the SDK. Existing wire fields,
+table names, bounds and error strings remain compatible.
+
+`execution_control` shares transient interaction control and read-only await
+settlement. Admitted Work clears the transient caller context, so stopping speech
+does not silently cancel accepted work. Persistent writes never use the read-only
+cancellation helper. `observation` owns bounded cursor validation for SDK waits
+and application queries; no Host package is required, including deferred calls.
+
+This extends SDK application execution, rather than replacing Controller tasks or
+AgentTeam AsyncToolRuntime. The latter owns per-harness background tools and does
+not provide this checkpoint/revision/UNKNOWN contract. Task remains responsible
+for authorized project mutations, durable attempts, outbox and verified effects;
+Work remains the lighter analysis lifecycle. They reuse contracts and execution
+primitives without pretending those different state meanings are interchangeable.

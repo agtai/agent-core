@@ -12,8 +12,16 @@ from .project_executor import DirectProjectCodeExecutorAdapter, ProjectExecution
 from .source import TaskSourceEvidence, register_source_codec
 from .task_result_reader import TaskResultReader
 from .task_store import SqliteTaskStore
+from .work_runtime import WorkControl, WorkRuntime, WorkSnapshot, WorkState, WorkViolation
+from .work_store import SqliteWorkStore
 
 __all__ = [
+    "WorkControl",
+    "WorkRuntime",
+    "WorkSnapshot",
+    "WorkState",
+    "WorkViolation",
+    "SqliteWorkStore",
     "DirectProjectCodeExecutorAdapter",
     "ProjectExecutionApplication",
     "ProjectTaskInvocation",
