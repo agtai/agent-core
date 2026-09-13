@@ -91,7 +91,7 @@ They establish SDK/storage boundaries, not physical voice or cloud-model accepta
 
 ## Local distribution
 
-The branch package version is `0.1.17+livevoice.1`; official `0.1.17` does not
+The branch package version is `0.1.17+livevoice.2`; official `0.1.17` does not
 contain this addition and must not satisfy the consuming application's pin.
 JiuwenSwarm uses the sibling `../agent-core` editable uv source for local
 work. For wheel installation, install the matching SDK wheel together with
@@ -104,3 +104,33 @@ adjust/cancel/recovery, project file effects, real SDK tool registration and
 source validation. A wheel-to-wheel import verifies the packaged Host uses the
 packaged SDK task implementation. Physical audio/cloud-model acceptance and
 migration of Work remain outside this change.
+
+## Project execution ownership (2026-09-13 follow-up)
+
+`DirectProjectCodeExecutorAdapter` now belongs to this SDK. It owns the attempt
+journal, exact dispatch/cancel/adjust handling, isolated Git checkout, protected
+file verification, apply/cleanup settlement and durable recovery. Existing
+database tables, profile identifiers and legacy serialized strings are retained.
+Their historical `live_voice`/`jiuwenswarm` spelling does not introduce an import
+dependency or a second implementation.
+
+Construct it with a `ProjectExecutionApplication` implementation. The application
+maps immutable `ProjectTaskInvocation` values to its Agent request, supplies the
+execution guard and protected runtime-support paths, and may supply telemetry.
+Project/configuration resolution remains behind `ProjectExecutionBindingResolver`.
+The SDK does not select a user's Agent, instantiate a JiuwenSwarm request, or
+grant project permissions. JiuwenSwarm's subclass supplies only this integration.
+
+`execution_checkpoint` provides one process-local checkpoint identity shared by
+executor, Agent callback and the file-effect declaration tool. Wrong-session or
+closed checkpoint access fails; adjustment adoption cannot forge user authority.
+`TaskResultReader` verifies exact Task/Attempt ownership and artifact hashes before
+bounded content disclosure. Dialogue context selection and voice playback remain
+application responsibilities.
+
+The SDK-only project test applies a real local Git/file result and reopens its
+attempt journal without replaying the Agent. Host regression covers current D2
+execution, original-file/index preservation, cancel/adjust, partial effects and
+restart. Existing synchronous filesystem authority checks are retained during
+extraction; their four explicit lint exceptions avoid changing scheduling in a
+behavior-preserving migration. No cloud latency policy changes are included.
