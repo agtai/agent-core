@@ -9,7 +9,7 @@ It does not replace the Controller, TeamAgent or Harness task APIs.
 
 | Existing capability | Code and call flow | Relationship to this addition |
 | --- | --- | --- |
-| Coroutine task management | `core/common/task_manager/manager.py:create_task/task_group` and `task.py:execute/cancel` | The existing structured-concurrency task group owns transient coroutines and propagates cancellation through an AnyIO cancel scope. Work keeps UNKNOWN and its physical reservation until actual settlement, and recovery must not rerun the Agent. Replacing those facts with coroutine completion would lose required semantics; no second coroutine-status projection is introduced. |
+| Coroutine task management | `core/runner/runner.py:get_root_task_group`; `core/common/background_tasks.py:create_background_task`; `task_manager/manager.py:create_task/task_group` and `task.py:execute/cancel` | Runner already owns a process-lifetime root group. Explicit binding can outlive a caller group; a native task can stay pending through shielded cleanup after cancel timeout. These capabilities are verified, so native ownership must not be described as missing. Work still owns durable UNKNOWN/CAS/replay and capacity facts. Integration of its orchestration coroutine with the native owner remains unimplemented; a native transient status cannot replace durable truth. |
 | Controller tasks | `core/controller/schema/task.py`; `TaskManager.add_task/get_state/load_state` maintains indexed session tasks; `TaskScheduler` selects a registered executor by task type and streams its output | Reuse for Controller execution. Its task/session state, pause and output events are not the durable command/attempt/outbox protocol. Do not map a scheduler cancellation boolean to a committed delivery result. |
 | Team tasks | `agent_teams/tools/task_manager.py`, `tools/database/task_dao.py`; task tools call the manager/DAO and publish team events for assignment, dependencies, completion and review | Reuse for team decomposition and coordination. A team's subtask ID is not automatically a user delivery ID or an execution attempt ID. No second team scheduler is added. |
 | Harness asynchronous tools | `agent_teams/harness/async_tools.py`; invoke launches an async tool, tracks status/output, and injects completion via the owning harness; `tools/tool_async.py` provides list/output/cancel | Retain as the async tool runtime. It does not by itself prove durable outbox delivery, project effects or safe restart/retry. No duplicate async-tool loop is added. |
@@ -291,3 +291,67 @@ is retained mode-specific code, not counted as eliminated behavior.
 Host consumers of this additive API require `0.1.17+livevoice.6`. There is no
 schema migration or change to older call defaults. Presentation/heard-history
 ACK policy remains an application responsibility; no SDK-to-Host dependency.
+
+
+### Work ownership audit correction
+
+`tests/integration_tests/application_tasks/test_work_native_task_ownership.py`
+uses the actual Runner root owner, TaskManager and BackgroundTask with real
+SQLite Work checkpoints. Inherited caller-group cancellation stops a native
+background task; explicit root binding preserves it. Current Work remains alive
+in both cases and stores its completed result. A second scenario shows native
+cancel returning while shielded cleanup keeps the handle pending, alongside
+Work persisting UNKNOWN, retaining capacity and rejecting replacement work until
+physical settlement. All three cases pass. The producers are controlled
+coroutines; this is not a full Runner.start, Host startup or Agent/Provider run.
+
+This corrects the earlier incomplete exclusion of native task management based
+on caller lifetime/cleanup capability. Runner root reuse is a concrete candidate.
+Before wiring Work to it, verify cancellation of the Work orchestration itself:
+AnyIO cancellation propagation, its independent runner and settlement futures,
+admission-before-scheduling failures, capacity retention, restart UNKNOWN and
+Host shutdown retry must retain current guarantees. No production adapter or
+new task group is introduced by these characterization tests.
+
+
+### Native Work owner implementation (2026-09-14, current working tree)
+
+The earlier audit-only paragraphs above are historical. HostWorkService now passes
+AgentRuntime.get_background_task_group into WorkRuntime; managed Host resolves
+Runner.get_root_task_group and rejects unavailable/unstarted ownership before
+admission is persisted. The existing root starts the Work orchestration directly.
+A Future only reports coroutine completion; no second business state is created.
+Custom initializer/standalone SDK ownership remains compatible. WorkStore and
+revision/CAS/capacity/restart UNKNOWN semantics remain necessary domain authority.
+This is root lifecycle reuse, not TaskManager registry or full Task/Work convergence.
+
+Native cancellation before first execution is checked before RUNNING/producer
+allocation (real root red/green test); closed-group scheduling retains UNKNOWN
+without executing or replaying the request. Independent producer/cleanup must
+settle before capacity or success is published. Cleanup-phase cancel/deadline
+uses existing bounds and publishes UNKNOWN while physical cleanup remains owned.
+No Voice timeout, database schema, project authorization or Task-card policy changed.
+
+SDK real native/SQLite: 11 passed (1.94s); Host existing Work regressions: 37 passed
+(7.10s); real Runner.start/stop + Host/SQLite probe: 1 passed (7.48s). The latter
+isolates external checkpointer/extensions, not Runner or Work. Read-only review
+found no remaining concrete blocker in the three production files; this is not
+full candidate acceptance. Paired wheel validation and final documentation/checks
+remain pending before local commit.
+
+Same-basis production delta this batch: Voice 0, Host +13, SDK +57 = +70.
+Current official-baseline net: Voice 112334, Host 48028, SDK 34056 = 194418;
+1262 fewer than audit start 195680. This batch is necessary ownership/settlement
+enhancement and Host adaptation, not relocation or bulk duplicate deletion.
+
+
+Final batch verification: SDK 11 passed (1.94s), Host 38 passed (10.00s).
+SDK .7 and Host matching pins built and installed to an isolated target;
+12 native/SQLite scenarios passed there, including real Runner start/stop.
+All 1016 Host / 2409 SDK installed Python files match current source bytes.
+An initial reused Host build directory resurrected deleted task_core.py;
+that artifact was rejected and a clean temporary source build passed the
+complete file comparison. No source rollback, repository cleanup or deployment.
+Ruff on changed SDK source/test and git diff --check passed. Third-party
+dependencies reused the local environment; no full dependency-resolution claim.
+This closes only this native-root/settlement batch, not the overall goal.

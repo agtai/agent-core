@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, TypeVar
 
+import anyio
+
 from .contracts import ContextRef, ErrorCode, ScopeRef, canonical_json_bytes
 from .execution_control import CURRENT_INTERACTION_CONTROL, read_only_operation
 
@@ -230,7 +232,7 @@ WorkRunner = Callable[[WorkControl], Awaitable[str]]
 class _Record:
     snapshot: WorkSnapshot
     control: WorkControl
-    operation: asyncio.Task[None] | None = None
+    operation: asyncio.Future[None] | None = None
     runner: asyncio.Task[str] | None = None
 
 
@@ -246,6 +248,7 @@ class WorkRuntime:
         timeout_seconds: float = 120.0,
         cancel_settlement_seconds: float = 1.0,
         observer: Callable[..., None] | None = None,
+        task_group_provider: Callable[[], anyio.abc.TaskGroup | None] | None = None,
     ) -> None:
         if (
             type(max_active) is not int
@@ -262,6 +265,7 @@ class WorkRuntime:
                     "deadlines must be positive and finite",
                 )
         self._observer = observer
+        self._task_group_provider = task_group_provider
         self._save = save
         self._max_active = max_active
         self._background_limit = max_active - reserved_foreground
@@ -438,6 +442,11 @@ class WorkRuntime:
                     self._observation_events.pop(scope, None)
 
     def _transition(self, record: _Record, state: WorkState, **fields) -> bool:
+        if fields.get("execution_settled") and (
+            (record.runner is not None and not record.runner.done())
+            or (record.control.settlement is not None and not record.control.settlement.done())
+        ):
+            fields["execution_settled"] = False
         if state not in {WorkState.COMPLETED, WorkState.SUPERSEDED}:
             fields.setdefault("result_text", None)
         updated = replace(
@@ -573,7 +582,7 @@ class WorkRuntime:
         occupied_by_work = {
             (r.snapshot.scope, r.snapshot.work_id): r
             for r in self._records.values()
-            if r.operation is not None and not r.operation.done() and not r.snapshot.execution_settled
+            if r.operation is not None and not r.snapshot.execution_settled
         }
         occupied = list(occupied_by_work.values())
         # A replacement shares its predecessor's reservation until settlement.
@@ -608,6 +617,7 @@ class WorkRuntime:
             updated_at=now,
             supersedes_revision=predecessor.snapshot.revision if predecessor else None,
         )
+        task_group = self._task_group_provider() if self._task_group_provider is not None else None
         self._persist(snapshot)
         record = _Record(snapshot, WorkControl(snapshot, asyncio.Event(), observer=self._observer))
         self._insert(record)
@@ -618,10 +628,26 @@ class WorkRuntime:
                 reason="SUPERSEDED_BY_NEW_REVISION",
             )
             predecessor.control.cancelled.set()
-        record.operation = asyncio.create_task(
-            self._run(record, runner, predecessor),
-            name=f"native-work:{snapshot.work_id}:{snapshot.revision}",
-        )
+        name = f"native-work:{snapshot.work_id}:{snapshot.revision}"
+        if task_group is None:
+            record.operation = asyncio.create_task(self._run(record, runner, predecessor), name=name)
+        else:
+            record.operation = asyncio.get_running_loop().create_future()
+
+            async def run_owned() -> None:
+                try:
+                    await self._run(record, runner, predecessor)
+                finally:
+                    if not record.operation.done():
+                        record.operation.set_result(None)
+
+            try:
+                task_group.start_soon(run_owned, name=name)
+            except RuntimeError:
+                self._transition(
+                    record, WorkState.UNKNOWN, reason="SERVICE_OWNERSHIP_LOST", execution_settled=True
+                )
+                record.operation.set_result(None)
         return record, True
 
     async def start(
@@ -704,6 +730,7 @@ class WorkRuntime:
     async def _run(self, record: _Record, runner: WorkRunner, predecessor: _Record | None) -> None:
         token = CURRENT_INTERACTION_CONTROL.set(None)
         try:
+            await anyio.lowlevel.checkpoint_if_cancelled()
             if predecessor is not None and predecessor.operation is not None:
                 try:
                     await asyncio.wait_for(asyncio.shield(predecessor.operation), timeout=self._timeout)
@@ -736,6 +763,7 @@ class WorkRuntime:
                 self._transition(record, WorkState.UNKNOWN, execution_settled=True)
                 return
             record.runner = asyncio.create_task(runner(record.control))
+            deadline = asyncio.get_running_loop().time() + self._timeout
             stop = asyncio.create_task(record.control.cancelled.wait())
             try:
                 done, _ = await asyncio.wait(
@@ -757,8 +785,30 @@ class WorkRuntime:
                         # Keep the physical slot occupied until the real runner
                         # settles. A timeout is never permission for more work.
                         await asyncio.gather(record.runner, return_exceptions=True)
-                        self._transition(record, WorkState.UNKNOWN, execution_settled=True)
                         return
+                if record.control.settlement is not None:
+                    cleanup_done, _ = await asyncio.wait(
+                        {record.control.settlement, stop},
+                        timeout=max(0, deadline - asyncio.get_running_loop().time()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if record.control.settlement not in cleanup_done:
+                        timed_out = timed_out or not cleanup_done
+                        record.control.cancelled.set()
+                        cleanup_done, _ = await asyncio.wait(
+                            {record.control.settlement}, timeout=self._cancel_timeout
+                        )
+                        if not cleanup_done:
+                            self._transition(
+                                record, WorkState.UNKNOWN,
+                                reason="CANCELLATION_OUTCOME_UNKNOWN", execution_settled=False,
+                            )
+                            return
+                    cleanup = await asyncio.gather(asyncio.shield(record.control.settlement), return_exceptions=True)
+                    if isinstance(cleanup[0], BaseException):
+                        raise WorkViolation(
+                            "EXECUTION_SETTLEMENT_UNCONFIRMED", "physical cleanup failed", ErrorCode.RESULT_UNKNOWN
+                        )
                 if record.snapshot.state is WorkState.UNKNOWN:
                     await asyncio.gather(record.runner, return_exceptions=True)
                     self._transition(
@@ -820,20 +870,27 @@ class WorkRuntime:
                 execution_settled=not unknown,
             )
         finally:
-            if record.control.settlement is not None:
-                # Agent bridge receipt can time out while actual Harness cleanup
-                # remains live. Keep this reservation until that owner settles.
-                settled = await asyncio.gather(asyncio.shield(record.control.settlement), return_exceptions=True)
-                if isinstance(settled[0], BaseException) and record.snapshot.state is not WorkState.UNKNOWN:
-                    self._transition(
-                        record,
-                        WorkState.UNKNOWN,
-                        reason="EXECUTION_SETTLEMENT_UNCONFIRMED",
-                        execution_settled=True,
-                    )
-                if record.snapshot.state is WorkState.UNKNOWN:
-                    self._transition(record, WorkState.UNKNOWN, execution_settled=True)
-            CURRENT_INTERACTION_CONTROL.reset(token)
+            try:
+                # Native task cancellation must not end the reservation before
+                # the separately owned producer and its physical cleanup settle.
+                with anyio.CancelScope(shield=True):
+                    if record.runner is not None and not record.runner.done():
+                        await asyncio.gather(asyncio.shield(record.runner), return_exceptions=True)
+                    if record.control.settlement is not None:
+                        settled = await asyncio.gather(
+                            asyncio.shield(record.control.settlement), return_exceptions=True
+                        )
+                        if isinstance(settled[0], BaseException) and record.snapshot.state is not WorkState.UNKNOWN:
+                            self._transition(
+                                record,
+                                WorkState.UNKNOWN,
+                                reason="EXECUTION_SETTLEMENT_UNCONFIRMED",
+                                execution_settled=True,
+                            )
+                    if record.snapshot.state in _TERMINAL and not record.snapshot.execution_settled:
+                        self._transition(record, record.snapshot.state, execution_settled=True)
+            finally:
+                CURRENT_INTERACTION_CONTROL.reset(token)
 
     async def close(self) -> tuple[WorkSnapshot, ...]:
         self._require_owner()
