@@ -324,11 +324,50 @@ def test_before_tool_call_canonicalizes_bare_mcp_tool_name() -> None:
     assert ctx.inputs.tool_name == "mcp_playwright-official_browser_click"
 
 
-def test_before_tool_call_keeps_runtime_browser_navigate_name() -> None:
+def test_before_tool_call_canonicalizes_browser_navigate_on_mcp_path() -> None:
+    """On the Playwright MCP path navigation must reach the server's primitive.
+
+    The local ``BrowserNavigateTool`` is only injected for BrowserDriver
+    backends, so leaving the name bare here would route to a tool that is not
+    registered. Matches upstream ``fd30965b4e`` behaviour.
+    """
+
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.service.allowed_tool_names = ("browser_navigate", "browser_click")
     runtime.service.mcp_cfg.server_name = "playwright-official"
     runtime.semantic_progress = {}
+    runtime.export_page_state.return_value = {"url": "about:blank"}
+    rail = BrowserRuntimeRail(runtime)
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        inputs=ToolCallInputs(
+            tool_call=ToolCall(id="navigate-1", type="function", name="browser_navigate", arguments="{}"),
+            tool_name="browser_navigate",
+            tool_args={"url": "https://example.com"},
+        ),
+        session=_FakeSession(),
+    )
+    ctx.session.update_state(
+        {
+            "__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state(
+                "Open https://example.com and report the title"
+            )
+        }
+    )
+
+    _run(rail.before_tool_call(ctx))
+
+    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_navigate"
+
+
+def test_before_tool_call_keeps_browser_navigate_bare_on_browser_driver() -> None:
+    """On the BrowserDriver path navigation stays bare and hits the local Tool."""
+
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.service.allowed_tool_names = ("browser_navigate", "browser_click")
+    runtime.service.mcp_cfg.server_name = "playwright-official"
+    runtime.semantic_progress = {}
+    runtime._uses_browser_driver.return_value = True
     runtime.export_page_state.return_value = {"url": "about:blank"}
     rail = BrowserRuntimeRail(runtime)
     ctx = AgentCallbackContext(
