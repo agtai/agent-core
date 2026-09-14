@@ -727,6 +727,19 @@ _TaskReadSnapshot = tuple[
     PersistentAttemptRecord,
     PersistentAdmissionRecord | None,
 ]
+@dataclass(frozen=True, slots=True)
+class TaskAuthorityReadSnapshot:
+    """One immutable database view; constituent models retain their own validation."""
+
+    task: PersistentTaskRecord
+    attempt: PersistentAttemptRecord
+    admission: PersistentAdmissionRecord | None
+    event_head: PersistentTaskEvent
+    result_availability: TaskResultAvailability
+    result: TaskResultRecord | None
+    result_reason: str
+
+
 _OUTBOX_BINDING_SELECT = """
     SELECT o.*, a.attempt_id AS canonical_attempt_id,
            a.task_id AS attempt_task_id,
@@ -12129,15 +12142,8 @@ class SqliteTaskStore:
             ).fetchall()
             return tuple(self._task_from_row(row) for row in rows)
 
-    def list_tasks_page(
-        self,
-        scope: ScopeRef,
-        *,
-        cursor: str | None = None,
-        limit: int = _DEFAULT_TASK_PAGE_LIMIT,
-    ) -> tuple[tuple[PersistentTaskRecord, ...], str | None, bool]:
-        """Read one bounded, restart-stable keyset page in exact Task scope."""
-
+    @staticmethod
+    def _task_page_scope(scope: ScopeRef, cursor: str | None, limit: int) -> str:
         if type(limit) is not int or not 1 <= limit <= _MAX_TASK_PAGE_LIMIT:
             raise FormalTaskViolation(
                 "INVALID_TASK_PAGE_LIMIT",
@@ -12152,39 +12158,48 @@ class SqliteTaskStore:
                 "task.list cursor must be one bounded Task identity",
                 ErrorCode.INVALID_ARGUMENT,
             )
-        scope_key = _scope_key(scope)
+        return _scope_key(scope)
+
+    def _task_page_rows(self, connection, scope: ScopeRef, scope_key: str, cursor: str | None, limit: int):
+        if cursor is None:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE scope_key=?
+                ORDER BY created_at, task_id
+                LIMIT ?
+                """,
+                (scope_key, limit + 1),
+            ).fetchall()
+        else:
+            anchor = self._require_task_row(connection, cursor, scope)
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE scope_key=?
+                  AND (created_at>? OR (created_at=? AND task_id>?))
+                ORDER BY created_at, task_id
+                LIMIT ?
+                """,
+                (
+                    scope_key,
+                    anchor["created_at"],
+                    anchor["created_at"],
+                    anchor["task_id"],
+                    limit + 1,
+                ),
+            ).fetchall()
+        return rows
+
+    def list_tasks_page(
+        self, scope: ScopeRef, *, cursor: str | None = None, limit: int = _DEFAULT_TASK_PAGE_LIMIT,
+    ) -> tuple[tuple[PersistentTaskRecord, ...], str | None, bool]:
+        """Read one bounded, restart-stable keyset page in exact Task scope."""
+        scope_key = self._task_page_scope(scope, cursor, limit)
         with self._reader() as connection:
-            if cursor is None:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE scope_key=?
-                    ORDER BY created_at, task_id
-                    LIMIT ?
-                    """,
-                    (scope_key, limit + 1),
-                ).fetchall()
-            else:
-                anchor = self._require_task_row(connection, cursor, scope)
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE scope_key=?
-                      AND (created_at>? OR (created_at=? AND task_id>?))
-                    ORDER BY created_at, task_id
-                    LIMIT ?
-                    """,
-                    (
-                        scope_key,
-                        anchor["created_at"],
-                        anchor["created_at"],
-                        anchor["task_id"],
-                        limit + 1,
-                    ),
-                ).fetchall()
+            rows = self._task_page_rows(connection, scope, scope_key, cursor, limit)
             has_more = len(rows) > limit
-            page_rows = rows[:limit]
-            tasks = tuple(self._task_from_row(row) for row in page_rows)
+            tasks = tuple(self._task_from_row(row) for row in rows[:limit])
             next_cursor = tasks[-1].task_id if has_more and tasks else None
             return tasks, next_cursor, has_more
 
@@ -12197,50 +12212,9 @@ class SqliteTaskStore:
     ) -> tuple[tuple[_TaskReadSnapshot, ...], str | None, bool]:
         """Read one Task page and every current Attempt from one snapshot."""
 
-        if type(limit) is not int or not 1 <= limit <= _MAX_TASK_PAGE_LIMIT:
-            raise FormalTaskViolation(
-                "INVALID_TASK_PAGE_LIMIT",
-                f"task.list limit must be between 1 and {_MAX_TASK_PAGE_LIMIT}",
-                ErrorCode.INVALID_ARGUMENT,
-            )
-        if cursor is not None and (
-            type(cursor) is not str or not cursor.strip() or "\x00" in cursor or len(cursor) > 256
-        ):
-            raise FormalTaskViolation(
-                "INVALID_TASK_LIST_CURSOR",
-                "task.list cursor must be one bounded Task identity",
-                ErrorCode.INVALID_ARGUMENT,
-            )
-        scope_key = _scope_key(scope)
+        scope_key = self._task_page_scope(scope, cursor, limit)
         with self._snapshot_reader() as connection:
-            if cursor is None:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE scope_key=?
-                    ORDER BY created_at, task_id
-                    LIMIT ?
-                    """,
-                    (scope_key, limit + 1),
-                ).fetchall()
-            else:
-                anchor = self._require_task_row(connection, cursor, scope)
-                rows = connection.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE scope_key=?
-                      AND (created_at>? OR (created_at=? AND task_id>?))
-                    ORDER BY created_at, task_id
-                    LIMIT ?
-                    """,
-                    (
-                        scope_key,
-                        anchor["created_at"],
-                        anchor["created_at"],
-                        anchor["task_id"],
-                        limit + 1,
-                    ),
-                ).fetchall()
+            rows = self._task_page_rows(connection, scope, scope_key, cursor, limit)
             has_more = len(rows) > limit
             page_rows = rows[:limit]
             self._hit("list_task_read_snapshots_page.after_tasks")
@@ -12250,6 +12224,35 @@ class SqliteTaskStore:
             )
             next_cursor = snapshots[-1][0].task_id if has_more and snapshots else None
             return snapshots, next_cursor, has_more
+
+    def list_task_authority_snapshots_page(
+        self, scope: ScopeRef, *, cursor: str | None = None, limit: int = _DEFAULT_TASK_PAGE_LIMIT,
+    ) -> tuple[tuple[TaskAuthorityReadSnapshot, ...], str | None, bool]:
+        """Read Task, current Attempt, admission, event head and result atomically.
+
+        Uses the same keyset paging and row decoders as ordinary Task reads.
+        This is a read-only database snapshot, not a second lifecycle cache.
+        """
+        scope_key = self._task_page_scope(scope, cursor, limit)
+        with self._snapshot_reader() as connection:
+            rows = self._task_page_rows(connection, scope, scope_key, cursor, limit)
+            has_more = len(rows) > limit
+            self._hit("list_task_authority_snapshots_page.after_tasks")
+            snapshots = []
+            for row in rows[:limit]:
+                task, attempt, admission = self._task_read_snapshot_from_rows(
+                    row, self._task_read_attempt_row(connection, row))
+                event_row = connection.execute(
+                    "SELECT * FROM task_events WHERE task_id=? AND seq=?",
+                    (task.task_id, task.event_head),
+                ).fetchone()
+                if event_row is None:
+                    raise self._corrupt("Task authority snapshot lost its event head")
+                availability, result, reason = self._task_result_for_row(connection, row)
+                snapshots.append(TaskAuthorityReadSnapshot(
+                    task, attempt, admission, self._event_from_row(event_row), availability, result, reason))
+            next_cursor = snapshots[-1].task.task_id if has_more and snapshots else None
+            return tuple(snapshots), next_cursor, has_more
 
     def get_attempt(self, attempt_id: str) -> PersistentAttemptRecord:
         with self._reader() as connection:

@@ -224,3 +224,26 @@ runs after ordinary model-context preprocessing. Hooks are trusted SDK code;
 this does not authorize arbitrary later hooks to rewrite protected arguments.
 The inspected Host hook only cleans call_goal for file tools. Applications
 using argument-rewriting hooks must preserve the same authorization boundary.
+
+
+### Atomic application authority reads (.5)
+
+`SqliteTaskStore.list_task_authority_snapshots_page(scope, cursor=None, limit=...)`
+returns `(snapshots, next_cursor, has_more)`. Each `TaskAuthorityReadSnapshot`
+contains the Task, current Attempt/admission, canonical event head and result
+availability/record/reason from one SQLite read transaction. It reuses ordinary
+keyset paging and existing row decoders. A missing event head fails closed;
+this reader neither repairs storage nor authorizes a command.
+
+An application may project product permissions and result digests from this
+snapshot without polling the Task page twice for convergence. Later mutations
+remain subject to their existing command preconditions. Ordinary page APIs retain
+their signatures and behavior; a sequence of separate pages is not one atomic
+collection snapshot. Callers requiring a complete bounded collection must reject
+`has_more`/a next cursor, as the paired Host adapter does.
+
+Real SQLite tests cover concurrent completion/insertion between task and auxiliary
+reads, original pagination/attempt isolation, wrong subject/project/session,
+invalid bounds, missing event heads and no read-side writes. Pair the Host's new
+aggregate consumer with `0.1.17+livevoice.5`; `.4` lacks this method. There is no
+persisted schema migration or reverse Host dependency.
