@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | feature |
 | 日期 | 2026-09-11 |
-| 范围 | `openjiuwen/harness/tools/browser_move/playwright_runtime/` |
+| 范围 | `openjiuwen/harness/tools/browser_move/runtime/` |
 | 测试基线 | `uv run pytest tests/unit_tests/harness/tools/browser_move -q` → 616 passed, 4 skipped |
 | 关联 spec | 无（本子系统当前无对应 spec，见「已知遗留」） |
 
@@ -42,7 +42,7 @@
 
 ### 1. 单一真相源：`tool_semantics.py`
 
-新建 `playwright_runtime/tool_semantics.py`，明确回答问题 (b)：
+新建 `runtime/tool_semantics.py`，明确回答问题 (b)：
 
 - `SEMANTICALLY_NEUTRAL_TOOL_NAMES`：无条件中立的工具名集合。
 - `tool_is_semantically_neutral(tool_name, tool_args)`：含参数条件判断（脚本、tabs、batch）。

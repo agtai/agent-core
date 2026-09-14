@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | feature |
 | 日期 | 2026-09-11 |
-| 范围 | `openjiuwen/harness/tools/browser_move/playwright_runtime/tool_semantics.py`、`.../runtime.py`、`run_bu_prompt.py`、`tests/unit_tests/harness/tools/browser_move/` |
+| 范围 | `openjiuwen/harness/tools/browser_move/runtime/tool_semantics.py`、`.../runtime.py`、`openjiuwen/harness/tools/browser_move/lab/run_bu_prompt.py`、`tests/unit_tests/harness/tools/browser_move/` |
 | 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动前 616 passed / 4 skipped，改动后 **678 passed / 4 skipped** |
 | 关联 feature | [[F_02_browser-semantic-neutrality]]（本文解决其「已知遗留 1」） |
 | 关联 spec | 无（`browser_move` 子系统仍无对应 spec，见 F_02 已知遗留 2） |
