@@ -13,23 +13,22 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from typing import Final, TypeAlias
 
 from openjiuwen.core.application.tasks.contracts import (
     MAX_SAFE_INTEGER,
-    Assurance,
     ScopeRef,
     canonical_json_bytes,
 )
+from openjiuwen.core.application.tasks.durability import durability_identity
 from openjiuwen.core.application.tasks.durability.durability_identity import (
-    DurabilityIdentityViolation,
     DurabilityProfileBinding,
 )
 
 EXTERNAL_EFFECT_FACT_CONTRACT_VERSION: Final = "live-voice.d2-effect-fact.v1"
 MAX_EXTERNAL_EFFECT_FACT_BYTES: Final = 65_536
 
-_MAX_TEXT_BYTES = 512
 _MAX_OBSERVATIONS = 1_024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -60,25 +59,24 @@ class EffectSettlementKind(StrEnum):
     MANUAL_REQUIRED = "manual_required"
 
 
-def _text(value: object, field_name: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_TEXT",
-            f"{field_name} must be a non-empty exact string",
-        )
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_TEXT",
-            f"{field_name} must contain valid Unicode scalar values",
-        ) from error
-    if len(encoded) > _MAX_TEXT_BYTES:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_TEXT",
-            f"{field_name} is outside the bounded range",
-        )
-    return value
+_text = partial(
+    durability_identity._text, violation=ExternalEffectContractViolation,
+    reason="INVALID_EFFECT_TEXT",
+)
+
+
+_scope = partial(
+    durability_identity._scope, violation=ExternalEffectContractViolation,
+    reason="INVALID_EFFECT_SCOPE",
+    field_name="effect scope",
+)
+
+
+_profile = partial(
+    durability_identity._profile, violation=ExternalEffectContractViolation,
+    reason="INVALID_EFFECT_PROFILE",
+    field_name="effect profile binding",
+)
 
 
 def _positive(value: object, field_name: str) -> int:
@@ -106,42 +104,6 @@ def _digest(value: object, field_name: str) -> str:
             f"{field_name} must be lowercase SHA-256",
         )
     return value
-
-
-def _scope(value: object) -> ScopeRef:
-    if type(value) is not ScopeRef:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_SCOPE",
-            "effect scope must be exact",
-        )
-    try:
-        checked = ScopeRef.from_dict(value.to_dict())
-    except (TypeError, ValueError) as error:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_SCOPE",
-            "effect scope is invalid",
-        ) from error
-    if checked.assurance is not Assurance.AUTHENTICATED:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_SCOPE",
-            "effect scope must be authenticated",
-        )
-    return checked
-
-
-def _profile(value: object) -> DurabilityProfileBinding:
-    if type(value) is not DurabilityProfileBinding:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_PROFILE",
-            "effect profile binding must be exact",
-        )
-    try:
-        return DurabilityProfileBinding.from_dict(value.to_dict())
-    except DurabilityIdentityViolation as error:
-        raise ExternalEffectContractViolation(
-            "INVALID_EFFECT_PROFILE",
-            "effect profile binding is invalid",
-        ) from error
 
 
 def _sha256(value: bytes) -> str:

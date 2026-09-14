@@ -15,23 +15,22 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Final
 
 from openjiuwen.core.application.tasks.contracts import (
     MAX_SAFE_INTEGER,
-    Assurance,
     ScopeRef,
     canonical_json_bytes,
 )
+from openjiuwen.core.application.tasks.durability import durability_identity
 from openjiuwen.core.application.tasks.durability.durability_identity import (
-    DurabilityIdentityViolation,
     DurabilityProfileBinding,
 )
 
 EXECUTOR_RECOVERY_FACTS_VERSION: Final = "live-voice.executor-recovery-facts.v1"
 MAX_EXECUTOR_RECOVERY_FACTS_BYTES: Final = 32_768
 
-_MAX_TEXT_BYTES = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UTC_TIMESTAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$")
 
@@ -42,25 +41,24 @@ class ExecutorRecoveryFactsViolation(ValueError):
         self.reason = reason
 
 
-def _text(value: object, field_name: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_TEXT",
-            f"{field_name} must be a non-empty exact string",
-        )
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_TEXT",
-            f"{field_name} must contain valid Unicode scalar values",
-        ) from error
-    if len(encoded) > _MAX_TEXT_BYTES:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_TEXT",
-            f"{field_name} is outside the bounded range",
-        )
-    return value
+_text = partial(
+    durability_identity._text, violation=ExecutorRecoveryFactsViolation,
+    reason="INVALID_RECOVERY_TEXT",
+)
+
+
+_scope = partial(
+    durability_identity._scope, violation=ExecutorRecoveryFactsViolation,
+    reason="INVALID_RECOVERY_SCOPE",
+    field_name="recovery facts scope",
+)
+
+
+_profile = partial(
+    durability_identity._profile, violation=ExecutorRecoveryFactsViolation,
+    reason="INVALID_RECOVERY_PROFILE",
+    field_name="recovery profile binding",
+)
 
 
 def _nonnegative(value: object, field_name: str) -> int:
@@ -79,42 +77,6 @@ def _digest(value: object, field_name: str) -> str:
             f"{field_name} must be lowercase SHA-256",
         )
     return value
-
-
-def _scope(value: object) -> ScopeRef:
-    if type(value) is not ScopeRef:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_SCOPE",
-            "recovery facts scope must be exact",
-        )
-    try:
-        checked = ScopeRef.from_dict(value.to_dict())
-    except (TypeError, ValueError) as error:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_SCOPE",
-            "recovery facts scope is invalid",
-        ) from error
-    if checked.assurance is not Assurance.AUTHENTICATED:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_SCOPE",
-            "recovery facts scope must be authenticated",
-        )
-    return checked
-
-
-def _profile(value: object) -> DurabilityProfileBinding:
-    if type(value) is not DurabilityProfileBinding:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_PROFILE",
-            "recovery profile binding must be exact",
-        )
-    try:
-        return DurabilityProfileBinding.from_dict(value.to_dict())
-    except DurabilityIdentityViolation as error:
-        raise ExecutorRecoveryFactsViolation(
-            "INVALID_RECOVERY_PROFILE",
-            "recovery profile binding is invalid",
-        ) from error
 
 
 def _timestamp_key(value: object, field_name: str) -> tuple[datetime, int]:

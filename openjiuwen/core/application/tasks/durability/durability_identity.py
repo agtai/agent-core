@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
+from openjiuwen.core.application.tasks.contracts import Assurance, ScopeRef
+
 DURABILITY_PROFILE_BINDING_VERSION: Final = "live-voice.durability-profile-binding.v1"
 
 _MAX_DURABILITY_TEXT_BYTES = 512
@@ -25,22 +27,26 @@ class DurabilityIdentityViolation(ValueError):
         self.reason = reason
 
 
-def _text(value: object, field_name: str) -> str:
+def _text(
+    value: object, field_name: str, *,
+    violation: type[ValueError] = DurabilityIdentityViolation,
+    reason: str = "INVALID_DURABILITY_PROFILE",
+) -> str:
     if type(value) is not str or not value.strip():
-        raise DurabilityIdentityViolation(
-            "INVALID_DURABILITY_PROFILE",
+        raise violation(
+            reason,
             f"{field_name} must be a non-empty exact string",
         )
     try:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError as error:
-        raise DurabilityIdentityViolation(
-            "INVALID_DURABILITY_PROFILE",
+        raise violation(
+            reason,
             f"{field_name} must contain valid Unicode scalar values",
         ) from error
     if len(encoded) > _MAX_DURABILITY_TEXT_BYTES:
-        raise DurabilityIdentityViolation(
-            "INVALID_DURABILITY_PROFILE",
+        raise violation(
+            reason,
             f"{field_name} is outside the bounded range",
         )
     return value
@@ -53,6 +59,46 @@ def _digest(value: object, field_name: str) -> str:
             f"{field_name} must be lowercase SHA-256",
         )
     return value
+
+
+def _scope(
+    value: object, *, violation: type[ValueError], reason: str, field_name: str,
+) -> ScopeRef:
+    if type(value) is not ScopeRef:
+        raise violation(
+            reason,
+            f"{field_name} must be exact",
+        )
+    try:
+        checked = ScopeRef.from_dict(value.to_dict())
+    except (TypeError, ValueError) as error:
+        raise violation(
+            reason,
+            f"{field_name} is invalid",
+        ) from error
+    if checked.assurance is not Assurance.AUTHENTICATED:
+        raise violation(
+            reason,
+            f"{field_name} must be authenticated",
+        )
+    return checked
+
+
+def _profile(
+    value: object, *, violation: type[ValueError], reason: str, field_name: str,
+) -> DurabilityProfileBinding:
+    if type(value) is not DurabilityProfileBinding:
+        raise violation(
+            reason,
+            f"{field_name} must be exact",
+        )
+    try:
+        return DurabilityProfileBinding.from_dict(value.to_dict())
+    except DurabilityIdentityViolation as error:
+        raise violation(
+            reason,
+            f"{field_name} is invalid",
+        ) from error
 
 
 @dataclass(frozen=True, slots=True)

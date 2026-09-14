@@ -9,6 +9,7 @@ It does not replace the Controller, TeamAgent or Harness task APIs.
 
 | Existing capability | Code and call flow | Relationship to this addition |
 | --- | --- | --- |
+| Coroutine task management | `core/common/task_manager/manager.py:create_task/task_group` and `task.py:execute/cancel` | The existing structured-concurrency task group owns transient coroutines and propagates cancellation through an AnyIO cancel scope. Work keeps UNKNOWN and its physical reservation until actual settlement, and recovery must not rerun the Agent. Replacing those facts with coroutine completion would lose required semantics; no second coroutine-status projection is introduced. |
 | Controller tasks | `core/controller/schema/task.py`; `TaskManager.add_task/get_state/load_state` maintains indexed session tasks; `TaskScheduler` selects a registered executor by task type and streams its output | Reuse for Controller execution. Its task/session state, pause and output events are not the durable command/attempt/outbox protocol. Do not map a scheduler cancellation boolean to a committed delivery result. |
 | Team tasks | `agent_teams/tools/task_manager.py`, `tools/database/task_dao.py`; task tools call the manager/DAO and publish team events for assignment, dependencies, completion and review | Reuse for team decomposition and coordination. A team's subtask ID is not automatically a user delivery ID or an execution attempt ID. No second team scheduler is added. |
 | Harness asynchronous tools | `agent_teams/harness/async_tools.py`; invoke launches an async tool, tracks status/output, and injects completion via the owning harness; `tools/tool_async.py` provides list/output/cancel | Retain as the async tool runtime. It does not by itself prove durable outbox delivery, project effects or safe restart/retry. No duplicate async-tool loop is added. |
@@ -247,3 +248,14 @@ reads, original pagination/attempt isolation, wrong subject/project/session,
 invalid bounds, missing event heads and no read-side writes. Pair the Host's new
 aggregate consumer with `0.1.17+livevoice.5`; `.4` lacks this method. There is no
 persisted schema migration or reverse Host dependency.
+
+
+### Shared durability validation
+
+Checkpoint, effect, recovery and verified-prefix values reuse the existing
+`durability_identity` text, authenticated-scope and profile validators. Each binds
+its own exception type, reason and field label. Removed duplicate algorithms do
+not change accepted values, canonical encoding, error causes, persistent schema
+or public exports. Exact strings and the 512-byte UTF-8 bound remain distinct
+from transport identity rules. Validation never grants recovery or dispatch
+permission; Store transactions and executor fences remain authoritative.

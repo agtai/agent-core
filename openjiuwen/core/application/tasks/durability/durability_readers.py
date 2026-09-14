@@ -12,14 +12,15 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Final, TypeAlias
 
 from openjiuwen.core.application.tasks.contracts import (
     MAX_SAFE_INTEGER,
-    Assurance,
     ScopeRef,
     canonical_json_bytes,
 )
+from openjiuwen.core.application.tasks.durability import durability_identity
 from openjiuwen.core.application.tasks.durability.durability_checkpoint import (
     MAX_D1_CHECKPOINT_WIRE_BYTES,
     D1Checkpoint,
@@ -36,7 +37,6 @@ from openjiuwen.core.application.tasks.durability.durability_effects import (
     effect_fact_from_bytes,
 )
 from openjiuwen.core.application.tasks.durability.durability_identity import (
-    DurabilityIdentityViolation,
     DurabilityProfileBinding,
 )
 
@@ -45,7 +45,6 @@ MAX_DURABILITY_PREFIX_ROWS: Final = 1_024
 MAX_DURABILITY_PREFIX_ITEM_BYTES: Final = MAX_D1_CHECKPOINT_WIRE_BYTES
 MAX_DURABILITY_PREFIX_BYTES: Final = 8_388_608
 
-_MAX_TEXT_BYTES = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -55,61 +54,24 @@ class DurabilityPrefixViolation(ValueError):
         self.reason = reason
 
 
-def _text(value: object, field_name: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            f"{field_name} must be a non-empty exact string",
-        )
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            f"{field_name} must contain valid Unicode scalar values",
-        ) from error
-    if len(encoded) > _MAX_TEXT_BYTES:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            f"{field_name} is outside the bounded range",
-        )
-    return value
+_text = partial(
+    durability_identity._text, violation=DurabilityPrefixViolation,
+    reason="INVALID_DURABILITY_BINDING",
+)
 
 
-def _scope(value: object) -> ScopeRef:
-    if type(value) is not ScopeRef:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            "durability read scope must be exact",
-        )
-    try:
-        checked = ScopeRef.from_dict(value.to_dict())
-    except (TypeError, ValueError) as error:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            "durability read scope is invalid",
-        ) from error
-    if checked.assurance is not Assurance.AUTHENTICATED:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            "durability read scope must be authenticated",
-        )
-    return checked
+_scope = partial(
+    durability_identity._scope, violation=DurabilityPrefixViolation,
+    reason="INVALID_DURABILITY_BINDING",
+    field_name="durability read scope",
+)
 
 
-def _profile(value: object) -> DurabilityProfileBinding:
-    if type(value) is not DurabilityProfileBinding:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            "durability read profile must be exact",
-        )
-    try:
-        return DurabilityProfileBinding.from_dict(value.to_dict())
-    except DurabilityIdentityViolation as error:
-        raise DurabilityPrefixViolation(
-            "INVALID_DURABILITY_BINDING",
-            "durability read profile is invalid",
-        ) from error
+_profile = partial(
+    durability_identity._profile, violation=DurabilityPrefixViolation,
+    reason="INVALID_DURABILITY_BINDING",
+    field_name="durability read profile",
+)
 
 
 def _digest(value: object) -> str:
