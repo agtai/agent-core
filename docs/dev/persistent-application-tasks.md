@@ -259,3 +259,35 @@ not change accepted values, canonical encoding, error causes, persistent schema
 or public exports. Exact strings and the 512-byte UTF-8 bound remain distinct
 from transport identity rules. Validation never grants recovery or dispatch
 permission; Store transactions and executor fences remain authoritative.
+
+
+### Shared subscription lifecycle and durable consumption (.6)
+
+`TaskEventSubscription` now also reads the existing Store consumer authority
+pages with `enabled=True, authority_atomic_replay=True, consumer_scope=True,
+presentation_class="text"` (or `"voice"`). JiuwenSwarm's
+`TaskEventAuthorityProgressSource` directly constructs this SDK reader for all
+three modes; its separate consumer subscription implementation is removed.
+The Store remains the only owner of persisted cursors and canonical event facts.
+The reader never ACKs a presentation or changes a Task/outbox record.
+
+| Mode | Start position | Read management | Cancellation of next_event |
+|---|---|---|---|
+| Default live-only | Current Store head | Existing background tail | Detaches reader |
+| Authority prefix, no presentation_class | Validated current-attempt prefix | Prefix then existing background tail | Detaches reader |
+| Authority consumer pages | Durable text/voice watermark | Demand pages, frozen head while paging | Cancels that wait; reader remains active |
+
+Consumer pages preserve idempotent `start()` results, bounded rolling identity
+validation, delayed ACK advancement through an already-read prefix, and replay
+across historical attempts. Only the current terminal closes that stream.
+`consumer_cursor_baseline()` returns the Store-proven cursor after start;
+`consumer_terminal_closes_stream(event)` distinguishes current from historical
+terminal events for the application projection. Both are read-only.
+Queue, authorization, state snapshots, close intent and owner-loop handling reuse
+the existing SDK manager. Initialization and close intent share its lock; a close
+that wins before queue allocation prevents event delivery. Cursor page validation
+is retained mode-specific code, not counted as eliminated behavior.
+
+Host consumers of this additive API require `0.1.17+livevoice.6`. There is no
+schema migration or change to older call defaults. Presentation/heard-history
+ACK policy remains an application responsibility; no SDK-to-Host dependency.

@@ -4,8 +4,9 @@
 
 The default reader deliberately starts at the Store's current event head and is
 live-only.  The authority replay mode instead consumes one Store-owned atomic
-prefix/cursor snapshot before reading its durable suffix.  Neither mode exposes
-a caller-selected cursor or lets a consumer fabricate lifecycle history.
+prefix/cursor snapshot before reading its durable suffix. With presentation_class,
+it reads bounded pages from the Store-owned durable consumer watermark on demand.
+No mode exposes a caller-selected cursor or fabricated lifecycle history.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -39,6 +41,8 @@ from openjiuwen.core.application.tasks.formal_task_models import (
     PersistentTaskRecord,
     TaskAuthorizationGrant,
     TaskEventAuthoritySnapshot,
+    TaskEventConsumerAuthorityPage,
+    TaskEventConsumerCursorBaseline,
     utc_now,
 )
 
@@ -177,6 +181,7 @@ class TaskEventSubscription:
         poll_interval: float = 0.05,
         authority_atomic_replay: bool = False,
         consumer_scope: bool = False,
+        presentation_class: str | None = None,
         clock: Callable[[], str] = utc_now,
     ) -> None:
         if type(task_id) is not str or not task_id.strip():
@@ -207,6 +212,17 @@ class TaskEventSubscription:
             raise _violation(
                 "INVALID_TASK_EVENT_AUTHORITY_MODE",
                 "TaskEvent consumer scope mode must be boolean",
+                ErrorCode.INVALID_ARGUMENT,
+            )
+        if presentation_class is not None and (
+            type(presentation_class) is not str
+            or presentation_class not in {"text", "voice"}
+            or not consumer_scope
+            or not authority_atomic_replay
+        ):
+            raise _violation(
+                "INVALID_TASK_EVENT_AUTHORITY_MODE",
+                "a presentation cursor requires consumer scope and authority replay",
                 ErrorCode.INVALID_ARGUMENT,
             )
         if type(queue_capacity) is not int or queue_capacity <= 0:
@@ -242,6 +258,7 @@ class TaskEventSubscription:
         self._poll_interval = float(poll_interval)
         self._authority_atomic_replay = authority_atomic_replay
         self._consumer_scope = consumer_scope
+        self._presentation_class = presentation_class
         self._clock = clock
 
         # Locks contain no background work.  Queue, Events and worker are created
@@ -271,6 +288,10 @@ class TaskEventSubscription:
         self._attempt_outcome: str | None = None
         self._seen_event_ids: dict[str, bytes] = {}
         self._seen_sequences: dict[int, bytes] = {}
+        self._validation_order: deque[tuple[str, int]] = deque()
+        self._cursor_baseline: TaskEventConsumerCursorBaseline | None = None
+        self._frozen_head: int | None = None
+        self._terminal_close_seq: int | None = None
         self._source_reads = 0
         self._terminal_event_seen = False
         self._terminal_event_delivered = False
@@ -279,7 +300,7 @@ class TaskEventSubscription:
         self._discarded_events = 0
 
     async def start(self) -> bool:
-        """Start at the current Store head; return false only for off/idempotent start."""
+        """Start the configured feed; consumer-page repeats preserve their original result."""
 
         async with self._lifecycle_lock:
             if not self._enabled:
@@ -287,6 +308,9 @@ class TaskEventSubscription:
                     self._state = TaskEventSubscriptionState.DISABLED
                     self._close_reason = "feature_off"
                 return False
+            if self._presentation_class is not None and self._state is not TaskEventSubscriptionState.NEW:
+                # Consumer pages preserve their existing idempotent-start result.
+                return self._state in {TaskEventSubscriptionState.ACTIVE, TaskEventSubscriptionState.CLOSED}
             if self._state in {
                 TaskEventSubscriptionState.ACTIVE,
                 TaskEventSubscriptionState.TERMINAL_PENDING,
@@ -318,6 +342,8 @@ class TaskEventSubscription:
                 )
 
             try:
+                if self._presentation_class is not None:
+                    return await self._start_consumer_replay()
                 if self._authority_atomic_replay:
                     return await self._start_authority_atomic_replay()
                 return await self._start_authorized_baseline()
@@ -326,6 +352,198 @@ class TaskEventSubscription:
                 # resource-free NEW reader on the loop used by a failed start.
                 self._cleanup_preallocation_start_failure(current_loop)
                 raise
+
+    async def _consumer_page(self, *, initial: bool) -> TaskEventConsumerAuthorityPage:
+        reader = getattr(self._source, "consumer_progress_authority_page", None)
+        if not callable(reader):
+            raise _violation(
+                "TASK_EVENT_AUTHORITY_HANDOFF_UNAVAILABLE",
+                "TaskEvent source does not own consumer authority pages",
+                ErrorCode.UNAVAILABLE,
+            )
+        cursor = {} if initial else {"after_seq": self._last_seq, "through_seq": self._frozen_head}
+        page = await asyncio.to_thread(
+            reader, self._task_id, self._scope, presentation_class=self._presentation_class,
+            limit=min(self._queue_capacity, self._validation_capacity), **cursor,
+        )
+        self._source_reads += 1
+        self._authorize_current_read()
+        return page
+
+    async def _start_consumer_replay(self) -> bool:
+        page = await self._consumer_page(initial=True)
+        if self._settle_start_close_intent():
+            return False
+        self._validate_consumer_page(page, initial=True)
+        with self._close_intent_lock:
+            if self._close_requested:
+                self._state = TaskEventSubscriptionState.CLOSED
+                self._close_reason = self._close_request_reason or "consumer_detached"
+                return False
+            self._queue = asyncio.Queue(maxsize=self._queue_capacity)
+            self._changed = asyncio.Event()
+            self._start_head_seq = page.head_seq
+            self._segment_start_seq = page.start_seq
+            self._attempt_id = page.attempt.attempt_id
+            self._attempt_number = page.attempt.attempt_number
+            self._last_seq = page.page_after_seq
+            self._cursor_baseline = page.cursor_baseline
+            self._accept_consumer_page(page)
+            if page.task.state is FormalTaskState.TERMINAL and self._queue.empty() and self._last_seq >= page.head_seq:
+                self._state = TaskEventSubscriptionState.CLOSED
+                self._close_reason = "already_consumed_terminal"
+            else:
+                self._state = TaskEventSubscriptionState.ACTIVE
+            return True
+
+    async def _poll_consumer_page(self) -> None:
+        # Demand-driven: no background worker may race the presentation ACK.
+        self._authorize_current_read()
+        try:
+            page = await self._consumer_page(initial=False)
+            if self._close_was_requested():
+                self._request_detach(self._close_intent_reason())
+                return
+            self._validate_consumer_page(page, initial=False)
+            with self._close_intent_lock:
+                closed = self._close_requested
+                if not closed:
+                    self._accept_consumer_page(page)
+            if closed:
+                self._request_detach(self._close_intent_reason())
+                return
+        except FormalTaskViolation as error:
+            self._fail(error)
+            raise
+        assert self._queue is not None
+        if not self._queue.empty():
+            return
+        if page.task.state is FormalTaskState.TERMINAL:
+            self._state = TaskEventSubscriptionState.CLOSED
+            self._close_reason = "already_consumed_terminal"
+            return
+        assert self._changed is not None
+        self._changed.clear()
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=self._poll_interval)
+        except TimeoutError:
+            pass
+
+    def _validate_consumer_page(
+        self,
+        page: TaskEventConsumerAuthorityPage,
+        *,
+        initial: bool,
+    ) -> None:
+        if (
+            type(page) is not TaskEventConsumerAuthorityPage
+            or page.task.task_id != self._task_id
+            or page.presentation_class != self._presentation_class
+            or not self._scope_matches(page.task.scope)
+        ):
+            raise FormalTaskViolation(
+                "TASK_EVENT_SOURCE_PROTOCOL_VIOLATION",
+                "consumer TaskEvent page does not bind its authorized Task",
+                ErrorCode.PROTOCOL_VIOLATION,
+            )
+        if initial:
+            return
+        previous_cursor = self._cursor_baseline
+        current_cursor = page.cursor_baseline
+        # The Store page has already atomically verified the durable watermark
+        # against its exact TaskEvent identity.  This subscription therefore
+        # retains only the bounded scalar proof that it read the complete prefix;
+        # requiring the event to remain in the rolling fingerprint window would
+        # reject a legitimate delayed ACK after bounded validation eviction.
+        cursor_advanced_through_read_prefix = (
+            previous_cursor is not None
+            and current_cursor.watermark > previous_cursor.watermark
+            and self._last_seq is not None
+            and current_cursor.watermark <= self._last_seq
+        )
+        if (
+            page.page_after_seq != self._last_seq
+            or previous_cursor is None
+            or current_cursor.watermark < previous_cursor.watermark
+            or (
+                current_cursor.watermark == previous_cursor.watermark
+                and current_cursor != previous_cursor
+            )
+            or (
+                current_cursor.watermark > previous_cursor.watermark
+                and not cursor_advanced_through_read_prefix
+            )
+            or (self._frozen_head is not None and page.head_seq != self._frozen_head)
+        ):
+            raise FormalTaskViolation(
+                "TASK_EVENT_CONSUMER_CURSOR_STALE",
+                "consumer TaskEvent page changed its Attempt or frozen cursor",
+                ErrorCode.STALE,
+            )
+
+    def _accept_consumer_page(self, page: TaskEventConsumerAuthorityPage) -> None:
+        assert self._queue is not None
+        accepted: list[PersistentTaskEvent] = []
+        ids = dict(self._seen_event_ids)
+        sequences = dict(self._seen_sequences)
+        order = deque(self._validation_order)
+        for event in page.events:
+            canonical = canonical_json_bytes(event.to_dict())
+            if event.event_id in ids or event.seq in sequences:
+                raise FormalTaskViolation(
+                    "TASK_EVENT_SOURCE_PROTOCOL_VIOLATION",
+                    "consumer TaskEvent page reused an accepted identity",
+                    ErrorCode.PROTOCOL_VIOLATION,
+                )
+            if len(ids) >= self._validation_capacity:
+                old_event_id, old_seq = order.popleft()
+                ids.pop(old_event_id, None)
+                sequences.pop(old_seq, None)
+            ids[event.event_id] = canonical
+            sequences[event.seq] = canonical
+            order.append((event.event_id, event.seq))
+            accepted.append(event)
+        if self._queue.qsize() + len(accepted) > self._queue_capacity:
+            raise FormalTaskViolation(
+                "TASK_EVENT_SUBSCRIPTION_BACKPRESSURE",
+                "consumer TaskEvent page exceeds its bounded queue",
+                ErrorCode.UNAVAILABLE,
+            )
+        self._seen_event_ids = ids
+        self._seen_sequences = sequences
+        self._validation_order = order
+        for event in accepted:
+            self._queue.put_nowait(event)
+        self._cursor_baseline = page.cursor_baseline
+        self._last_seq = (
+            page.events[-1].seq if page.events else page.page_after_seq
+        )
+        self._frozen_head = page.head_seq if page.has_more else None
+        self._terminal_event_seen = self._terminal_event_seen or any(
+            event.event_type == "task.terminal" for event in page.events
+        )
+        terminal_head = page.terminal_head_event
+        if terminal_head is not None and terminal_head.seq == page.head_seq:
+            self._terminal_close_seq = terminal_head.seq
+
+    def consumer_terminal_closes_stream(self, event: PersistentTaskEvent) -> bool:
+        """Whether this terminal ends the current consumer stream, not an older attempt."""
+        return (
+            self._presentation_class is not None
+            and event.event_type == "task.terminal"
+            and event.seq == self._terminal_close_seq
+        )
+
+    def consumer_cursor_baseline(self) -> TaskEventConsumerCursorBaseline:
+        baseline = self._cursor_baseline
+        if baseline is None:
+            raise FormalTaskViolation(
+                "TASK_EVENT_CONSUMER_CURSOR_UNAVAILABLE",
+                "consumer cursor is unavailable before source activation",
+                ErrorCode.CONFLICT,
+            )
+        return baseline
+
 
     async def _start_authority_atomic_replay(self) -> bool:
         snapshot_reader = getattr(self._source, "event_authority_snapshot", None)
@@ -519,6 +737,8 @@ class TaskEventSubscription:
         return True
 
     def _start_authority_tail_if_ready(self) -> None:
+        if self._presentation_class is not None:
+            return
         if (
             not self._authority_atomic_replay
             or self._state is not TaskEventSubscriptionState.ACTIVE
@@ -657,10 +877,13 @@ class TaskEventSubscription:
                         try:
                             self._authorize_current_read()
                         except FormalTaskViolation as error:
-                            self._fail(error)
+                            if self._presentation_class is None:
+                                self._fail(error)
                             raise
                         event = queue.get_nowait()
-                        if event.event_type == "task.terminal":
+                        if event.event_type == "task.terminal" and (
+                            self._presentation_class is None or event.seq == self._terminal_close_seq
+                        ):
                             self._terminal_event_delivered = True
                             self._state = TaskEventSubscriptionState.CLOSED
                             self._close_reason = "terminal_event_delivered"
@@ -673,6 +896,9 @@ class TaskEventSubscription:
                         TaskEventSubscriptionState.CLOSED,
                     }:
                         raise StopAsyncIteration
+                    if self._presentation_class is not None and self._state is TaskEventSubscriptionState.ACTIVE:
+                        await self._poll_consumer_page()
+                        continue
                     changed = self._changed
                     if changed is None:
                         raise _violation(
@@ -691,6 +917,8 @@ class TaskEventSubscription:
                         continue
                     await changed.wait()
             except asyncio.CancelledError:
+                if self._presentation_class is not None:
+                    raise  # Cancelling one demand read does not detach the consumer.
                 self._remember_close_intent("consumer_cancelled")
                 self._request_detach(self._close_intent_reason())
                 raise
