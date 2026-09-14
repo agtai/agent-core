@@ -20,22 +20,22 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_processor import (
     BrowserStateContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_rail import (
     BrowserWorkingContextRail,
 )
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     DEFAULT_BROWSER_CAPABILITIES,
     narrow_allowed_tools_for_browser_driver,
     resolve_browser_capabilities,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserInstanceConfig,
     RuntimeSettings,
     build_browser_guardrails,
@@ -43,12 +43,12 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     build_runtime_settings,
     resolve_browser_driver_backend,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
     BrowserAgentRuntime,
     BrowserRuntimeRail,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
     build_browser_runtime_tools,
 )
 

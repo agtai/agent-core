@@ -37,7 +37,7 @@ from openjiuwen.harness.execution_subject import (
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.prompts.tools import ToolCardBuildOptions, build_tool_card
 try:
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
+    from openjiuwen.harness.tools.browser_move.runtime.browser_logging import (
         browser_agent_log_info,
     )
 except Exception:  # pragma: no cover - browser runtime is optional here
