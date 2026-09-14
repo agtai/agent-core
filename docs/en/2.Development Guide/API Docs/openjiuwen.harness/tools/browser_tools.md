@@ -113,9 +113,9 @@ Session-state access — cookies, localStorage, sessionStorage, and Playwright s
 
 ## Runtime Helper Tools
 
-Module: `openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools`
+Module: `openjiuwen.harness.tools.browser_move.runtime.runtime_tools`
 
-Deterministic helpers backed by the shared [`BrowserAgentRuntime`](../subagents/browser_agent.md#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowseragentruntime). They are always injected, regardless of the capability selection.
+Deterministic helpers backed by the shared [`BrowserAgentRuntime`](../subagents/browser_agent.md#class-openjiuwenharnesstoolsbrowser_moveruntimeruntimebrowseragentruntime). They are always injected, regardless of the capability selection.
 
 | Tool | Description |
 |---|---|
