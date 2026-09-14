@@ -481,7 +481,9 @@ class TaskEventSubscription:
             self._last_seq = snapshot.start_seq
             self._attempt_id = task.attempt_id
             self._previous_attempt_id = (
-                None if attempt.attempt_number == 1 else str(genesis.details["retry_of_attempt_id"])
+                None
+                if attempt.attempt_number == 1
+                else str(genesis.details["producer_attempt_id" if recovery_boundary else "retry_of_attempt_id"])
             )
             self._attempt_number = attempt.attempt_number
             self._segment_start_seq = snapshot.start_seq
