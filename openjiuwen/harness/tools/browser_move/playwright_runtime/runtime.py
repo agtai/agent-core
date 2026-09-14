@@ -833,6 +833,165 @@ class BrowserAgentRuntime:
             )
         return payload
 
+    async def _get_playwright_mcp_tool(self, tool_name: str) -> Any:
+        """Resolve a registered Playwright MCP tool through Runner.resource_mgr."""
+        server_id = str(getattr(self._service.mcp_cfg, "server_id", "") or "").strip()
+        server_name = str(getattr(self._service.mcp_cfg, "server_name", "") or "").strip()
+
+        # When this runtime is bound to a specific browser identity, the cfg
+        # server_id is already unique; the generic fallbacks below could resolve
+        # the legacy/unkeyed server, so they are skipped to keep isolation.
+        keyed = bool(self._instance and self._instance.key)
+
+        server_id_candidates = [
+            server_id,
+            server_id.replace("-", "_"),
+            server_id.replace("_", "-"),
+        ]
+        if not keyed:
+            server_id_candidates += [
+                "playwright_official_stdio",
+                "playwright-official-stdio",
+                "playwright",
+            ]
+
+        server_name_candidates = [
+            server_name,
+            server_name.replace("-", "_"),
+            server_name.replace("_", "-"),
+        ]
+        if not keyed:
+            server_name_candidates += [
+                "playwright-official",
+                "playwright_official",
+                "playwright",
+            ]
+
+        def _first_tool(value: Any) -> Any:
+            if isinstance(value, list):
+                return next((item for item in value if item is not None), None)
+            return value
+
+        tried: list[str] = []
+
+        for candidate in server_id_candidates:
+            if not candidate:
+                continue
+
+            tried.append(f"server_id={candidate}")
+
+            tool = None
+            try:
+                tool = await Runner.resource_mgr.get_mcp_tool(
+                    name=tool_name,
+                    server_id=candidate,
+                    skip_if_tag_not_exists=True,
+                    ignore_exception=True,
+                )
+                tool = _first_tool(tool)
+            except Exception:
+                logger.debug(
+                    "Failed to resolve MCP tool %s using server_id=%s",
+                    tool_name,
+                    candidate,
+                    exc_info=True,
+                )
+
+            if tool is not None:
+                return tool
+
+        for candidate in server_name_candidates:
+            if not candidate:
+                continue
+
+            tried.append(f"server_name={candidate}")
+
+            tool = None
+            try:
+                tool = await Runner.resource_mgr.get_mcp_tool(
+                    name=tool_name,
+                    server_name=candidate,
+                    skip_if_tag_not_exists=True,
+                    ignore_exception=True,
+                )
+                tool = _first_tool(tool)
+            except Exception:
+                logger.debug(
+                    "Failed to resolve MCP tool %s using server_name=%s",
+                    tool_name,
+                    candidate,
+                    exc_info=True,
+                )
+
+            if tool is not None:
+                return tool
+
+        raise RuntimeError(f"Registered Playwright MCP tool not found: {tool_name}. Tried {', '.join(tried)}")
+
+    async def _get_playwright_run_code_tool(self) -> tuple[Any, str]:
+        """Resolve browser_run_code_unsafe, with browser_run_code as compatibility fallback."""
+        try:
+            return await self._get_playwright_mcp_tool("browser_run_code_unsafe"), "browser_run_code_unsafe"
+        except RuntimeError:
+            logger.debug(
+                "browser_run_code_unsafe is unavailable; falling back to browser_run_code",
+                exc_info=True,
+            )
+
+        return await self._get_playwright_mcp_tool("browser_run_code"), "browser_run_code"
+
+    async def _call_playwright_run_code_unsafe(self, js_code: str) -> Any:
+        """Execute a compact runtime RPC over the registered Playwright transport."""
+        total_started_at = time.perf_counter()
+        resolution_started_at = time.perf_counter()
+        tool, tool_name = await self._get_playwright_run_code_tool()
+        resolution_elapsed_ms = int(max(0.0, (time.perf_counter() - resolution_started_at) * 1000))
+
+        invoke_started_at = time.perf_counter()
+        result = await tool.invoke({"code": js_code})
+        invoke_elapsed_ms = int(max(0.0, (time.perf_counter() - invoke_started_at) * 1000))
+
+        success = getattr(result, "success", None)
+        if success is False:
+            error = str(getattr(result, "error", "") or "").strip()
+            raise RuntimeError(error or f"{tool_name} failed")
+
+        data = getattr(result, "data", None)
+        if data is not None:
+            payload = data
+        else:
+            payload = result
+        transport_response_size_bytes = len(str(payload).encode("utf-8", "ignore"))
+        compact_payload = self._compact_run_code_payload(payload)
+        return {
+            "__browser_compact_rpc__": True,
+            "payload": compact_payload,
+            "rpc_metrics": {
+                "tool_name": tool_name,
+                "tool_resolution_elapsed_ms": resolution_elapsed_ms,
+                "transport_invoke_elapsed_ms": invoke_elapsed_ms,
+                "rpc_total_elapsed_ms": int(max(0.0, (time.perf_counter() - total_started_at) * 1000)),
+                "script_size_bytes": len(js_code.encode("utf-8", "ignore")),
+                "transport_response_size_bytes": transport_response_size_bytes,
+                "response_size_bytes": len(str(compact_payload).encode("utf-8", "ignore")),
+            },
+        }
+
+    async def _call_playwright_tool(self, tool_name: str, inputs: Dict[str, Any]) -> Any:
+        """Invoke one registered Playwright MCP tool and unwrap its result data."""
+        tool = await self._get_playwright_mcp_tool(tool_name)
+        result = await tool.invoke(inputs)
+
+        success = getattr(result, "success", None)
+        if success is False:
+            error = str(getattr(result, "error", "") or "").strip()
+            raise RuntimeError(error or f"{tool_name} failed")
+
+        data = getattr(result, "data", None)
+        if data is not None:
+            return data
+        return result
+
     async def ensure_runtime_ready(self) -> None:
         _ACTIVE_BROWSER_RUNTIMES.add(self)
         await self._service.ensure_runtime_ready()
