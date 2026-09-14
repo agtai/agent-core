@@ -18,13 +18,13 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserInstanceConfig,
     BrowserRunGuardrails,
     build_playwright_mcp_config,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.profiles import BrowserProfile
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
+from openjiuwen.harness.tools.browser_move.runtime.profiles import BrowserProfile
+from openjiuwen.harness.tools.browser_move.runtime.service import BrowserService
 
 
 def _seed_live_profile(svc: BrowserService, *, port: int = 63668) -> None:

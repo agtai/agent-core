@@ -18,18 +18,18 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
     PROMPT_ATTACHMENT_PRESERVE_TAIL_METADATA_KEY,
     PromptAttachmentManager,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_processor import (
     BrowserStateContextProcessor,
     BrowserStateContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context import (
     BROWSER_TASK_STATE_KEY,
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
+from openjiuwen.harness.tools.browser_move.runtime.probes import (
     build_browser_state_metadata_js,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BrowserAgentRuntime,
 )
 
@@ -874,7 +874,7 @@ async def test_processor_requires_replan_for_semantic_loop_even_when_dom_changes
         def update_state(self, value):
             self.state.update(value)
 
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserRuntimeRail
+    from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserRuntimeRail
 
     session = Session()
     state["semantic_progress"]["revision"] = 1

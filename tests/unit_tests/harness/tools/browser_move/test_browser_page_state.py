@@ -11,10 +11,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.page_state import (
+from openjiuwen.harness.tools.browser_move.runtime.page_state import (
     BrowserPageState,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BrowserAgentRuntime,
 )
 

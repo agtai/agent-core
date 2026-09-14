@@ -14,9 +14,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.drivers import errors as driver_errors
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import wire
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.transport import SidecarTransport
+from openjiuwen.harness.tools.browser_move.backends.contract import errors as driver_errors
+from openjiuwen.harness.tools.browser_move.backends.browser_use.sidecar import wire
+from openjiuwen.harness.tools.browser_move.backends.browser_use.transport import SidecarTransport
 
 # asyncio StreamReader default; screenshot NDJSON replies routinely exceed this.
 _DEFAULT_STREAM_LIMIT = 64 * 1024
@@ -133,16 +133,16 @@ async def test_start_passes_max_line_bytes_as_stream_limit() -> None:
 
     with (
         patch(
-            "openjiuwen.harness.tools.browser_move.drivers.browser_use.transport.discover_sidecar_python",
+            "openjiuwen.harness.tools.browser_move.backends.browser_use.transport.discover_sidecar_python",
             return_value=Path("/fake/browser-use-python"),
         ),
         patch(
-            "openjiuwen.harness.tools.browser_move.drivers.browser_use.transport.asyncio.create_subprocess_exec",
+            "openjiuwen.harness.tools.browser_move.backends.browser_use.transport.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
             return_value=fake_proc,
         ) as mock_exec,
         patch(
-            "openjiuwen.harness.tools.browser_move.drivers.browser_use.transport.asyncio.ensure_future",
+            "openjiuwen.harness.tools.browser_move.backends.browser_use.transport.asyncio.ensure_future",
             side_effect=lambda coro: (coro.close(), None)[1],
         ),
     ):

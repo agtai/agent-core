@@ -14,17 +14,17 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.clients.streamable_http_client import (
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.clients.streamable_http_client import (
     BrowserMoveStreamableHttpClient,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime import browser_tools as browser_tools_module
-from openjiuwen.harness.tools.browser_move.playwright_runtime.agents import (
+from openjiuwen.harness.tools.browser_move.runtime import browser_tools as browser_tools_module
+from openjiuwen.harness.tools.browser_move.runtime.agents import (
     ensure_execute_signature_compat,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools import (
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools import (
     build_browser_runtime_mcp_config,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     DEFAULT_BROWSER_TIMEOUT_S,
     DEFAULT_GUARDRAIL_MAX_FAILURES,
     DEFAULT_GUARDRAIL_MAX_STEPS,
@@ -34,7 +34,7 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     build_runtime_settings,
     parse_command_args,
 )
-from openjiuwen.harness.tools.browser_move.utils.parsing import extract_json_object
+from openjiuwen.harness.tools.browser_move.shared.parsing import extract_json_object
 
 
 def _run(coro: Any) -> Any:
@@ -202,7 +202,7 @@ def test_build_browser_runtime_mcp_config_stdio_defaults() -> None:
     assert cfg.server_path == "stdio://playwright-runtime-wrapper"
     assert cfg.params["cwd"] == str(Path.cwd().resolve())
     args = cfg.params["args"]
-    assert args[:2] == ["-m", "openjiuwen.harness.tools.browser_move.playwright_runtime_mcp_server"]
+    assert args[:2] == ["-m", "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.mcp_server"]
     assert "--transport" in args
     assert "stdio" in args
     assert "--no-banner" in args
@@ -382,7 +382,7 @@ def test_local_browser_runtime_server_logs_are_written_under_runtime_log_dir() -
                 return_value=None,
             ),
             patch(
-                "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.subprocess.Popen",
+                "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools.subprocess.Popen",
                 return_value=process,
             ) as mock_popen,
         ):

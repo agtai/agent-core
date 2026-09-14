@@ -12,10 +12,10 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openjiuwen.harness.tools.browser_move.drivers.base import ActResult, SelectorRef
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.driver import BrowserUseDriver
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
-from openjiuwen.harness.tools.browser_move.utils.upload_paths import resolve_upload_file_paths
+from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
+from openjiuwen.harness.tools.browser_move.backends.browser_use.driver import BrowserUseDriver
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.shared.upload_paths import resolve_upload_file_paths
 
 
 def _run(coro):
@@ -141,7 +141,7 @@ def test_resolve_upload_file_paths_uses_browser_upload_root_for_basename() -> No
         target = root / "staged_upload.txt"
         target.write_text("staged", encoding="utf-8")
         with patch(
-            "openjiuwen.harness.tools.browser_move.utils.upload_paths.resolve_upload_root",
+            "openjiuwen.harness.tools.browser_move.shared.upload_paths.resolve_upload_root",
             return_value=root.resolve(),
         ):
             existing, err = resolve_upload_file_paths(["staged_upload.txt"])

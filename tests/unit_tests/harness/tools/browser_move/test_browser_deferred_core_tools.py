@@ -18,15 +18,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.drivers.base import ActResult, SelectorRef
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.driver import BrowserUseDriver
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import wire
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
+from openjiuwen.harness.tools.browser_move.backends.browser_use.driver import BrowserUseDriver
+from openjiuwen.harness.tools.browser_move.backends.browser_use.sidecar import wire
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.page_state import BrowserPageState
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.page_state import BrowserPageState
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
     BrowserAgentRuntime,
 )
@@ -37,7 +37,7 @@ _SIDECAR_DIR = (
     / "harness"
     / "tools"
     / "browser_move"
-    / "drivers"
+    / "backends"
     / "browser_use"
     / "sidecar"
 )

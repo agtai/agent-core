@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from run_bu_prompt import (
+from openjiuwen.harness.tools.browser_move.lab.run_bu_prompt import (
     DEFAULT_QUERY,
     build_arg_parser,
     resolve_conversation_id,

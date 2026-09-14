@@ -23,10 +23,10 @@ from urllib.request import urlopen
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.drivers.base import IndexRef, NodeRef, SelectorRef
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.driver import BrowserUseDriver
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.transport import discover_sidecar_python
-from openjiuwen.harness.tools.browser_move.drivers.errors import DriverUnsupported
+from openjiuwen.harness.tools.browser_move.backends.contract.base import IndexRef, NodeRef, SelectorRef
+from openjiuwen.harness.tools.browser_move.backends.browser_use.driver import BrowserUseDriver
+from openjiuwen.harness.tools.browser_move.backends.browser_use.transport import discover_sidecar_python
+from openjiuwen.harness.tools.browser_move.backends.contract.errors import DriverUnsupported
 
 
 def _sidecar_available() -> bool:

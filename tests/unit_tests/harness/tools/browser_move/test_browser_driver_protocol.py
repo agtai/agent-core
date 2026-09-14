@@ -11,9 +11,9 @@ import sys
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.drivers.base import BrowserDriver
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.driver import BrowserUseDriver
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import wire
+from openjiuwen.harness.tools.browser_move.backends.contract.base import BrowserDriver
+from openjiuwen.harness.tools.browser_move.backends.browser_use.driver import BrowserUseDriver
+from openjiuwen.harness.tools.browser_move.backends.browser_use.sidecar import wire
 
 from tests.unit_tests.harness.tools.browser_move.fakes.fake_driver import FakeDriver, assert_is_browser_driver
 
@@ -51,7 +51,7 @@ def test_importing_browser_use_driver_does_not_load_browser_use_package() -> Non
     import importlib
 
     importlib.reload(
-        importlib.import_module("openjiuwen.harness.tools.browser_move.drivers.browser_use.driver")
+        importlib.import_module("openjiuwen.harness.tools.browser_move.backends.browser_use.driver")
     )
     added = set(sys.modules) - snapshot
     browser_use_modules = [name for name in added if name == "browser_use" or name.startswith("browser_use.")]

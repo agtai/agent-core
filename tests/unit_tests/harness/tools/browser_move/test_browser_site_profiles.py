@@ -4,7 +4,7 @@ import json
 import logging
 from pathlib import Path
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
     BrowserSelectorCache,
     apply_site_card_semantics,
     builtin_site_profiles,

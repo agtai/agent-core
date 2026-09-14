@@ -23,20 +23,20 @@ from openjiuwen.harness.subagents.browser_agent import (
     build_browser_agent_config,
     create_browser_agent,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserRunGuardrails,
     RuntimeSettings,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES,
     CORE_BROWSER_TOOL_NAMES,
     narrow_allowed_tools_for_browser_driver,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
     BrowserRuntimeRail,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_rail import (
     BrowserWorkingContextRail,
 )
 

@@ -8,9 +8,9 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from openjiuwen.core.foundation.tool import McpServerConfig, Tool, ToolCard
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
     BrowserBatchInteractTool,
     BrowserCancelTool,
     BrowserClearCancelTool,
@@ -230,7 +230,7 @@ def test_navigate_tool_rejects_non_integer_timeout() -> None:
 
 
 def test_runtime_navigate_calls_driver_navigate() -> None:
-    from openjiuwen.harness.tools.browser_move.drivers.base import NavResult
+    from openjiuwen.harness.tools.browser_move.backends.contract.base import NavResult
 
     runtime = _make_runtime()
     driver = AsyncMock()
@@ -404,7 +404,7 @@ def test_runtime_evaluate_rejects_document_dumps() -> None:
 
 
 def test_runtime_select_option_calls_driver() -> None:
-    from openjiuwen.harness.tools.browser_move.drivers.base import ActResult, SelectorRef
+    from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
 
     runtime = _make_runtime()
     driver = AsyncMock()
@@ -476,7 +476,7 @@ def test_close_snapshot_drag_upload_tools_call_runtime() -> None:
 
 
 def test_runtime_click_calls_driver_click() -> None:
-    from openjiuwen.harness.tools.browser_move.drivers.base import ActResult, SelectorRef
+    from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
 
     runtime = _make_runtime()
     driver = AsyncMock()
@@ -502,7 +502,7 @@ def test_runtime_click_calls_driver_click() -> None:
 
 
 def test_runtime_navigate_back_calls_driver_go_back() -> None:
-    from openjiuwen.harness.tools.browser_move.drivers.base import NavResult
+    from openjiuwen.harness.tools.browser_move.backends.contract.base import NavResult
 
     runtime = _make_runtime()
     driver = AsyncMock()

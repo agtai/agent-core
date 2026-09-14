@@ -9,17 +9,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.probes import (
     build_interactive_probe_js,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
     builtin_site_profiles,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BrowserAgentRuntime,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
     BrowserProbeInteractivesTool,
 )
 

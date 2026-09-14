@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import mapping
+from openjiuwen.harness.tools.browser_move.backends.browser_use.sidecar import mapping
 
 
 def _node(
