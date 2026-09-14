@@ -1,15 +1,17 @@
 # Persistent application tasks
 
-This addition is based on `b5f189ba1054a338d8fa3e009b13053776340e44`, the
-AgentCore revision pinned by the consuming JiuwenSwarm branch. It extracts the
-existing durable delivery implementation into `openjiuwen.core.application.tasks`.
-It does not replace the Controller, TeamAgent or Harness task APIs.
+The extraction baseline is `b5f189ba1054a338d8fa3e009b13053776340e44`. The current
+paired development version is `0.1.17+livevoice.9`. Initial extraction alone did not
+establish native integration. Work orchestration and formal project attempts now
+run through the existing TaskManager under the consuming Host Runner root. Their
+durable business state remains in the application stores. Controller, TeamAgent
+and Harness task APIs retain their own semantics and existing consumers.
 
 ## Capability comparison and reuse decisions
 
 | Existing capability | Code and call flow | Relationship to this addition |
 | --- | --- | --- |
-| Coroutine task management | `core/runner/runner.py:get_root_task_group`; `core/common/background_tasks.py:create_background_task`; `task_manager/manager.py:create_task/task_group` and `task.py:execute/cancel` | Runner already owns a process-lifetime root group. Explicit binding can outlive a caller group; a native task can stay pending through shielded cleanup after cancel timeout. These capabilities are verified, so native ownership must not be described as missing. Work still owns durable UNKNOWN/CAS/replay and capacity facts. Integration of its orchestration coroutine with the native owner remains unimplemented; a native transient status cannot replace durable truth. |
+| Coroutine task management | `core/runner/runner.py:get_root_task_group`; `core/common/background_tasks.py:create_background_task`; `task_manager/manager.py:create_task/task_group` and `task.py:execute/cancel` | Runner already owns a process-lifetime root group. Explicit binding can outlive a caller group; a native task can stay pending through shielded cleanup after cancel timeout. These capabilities are verified, so native ownership must not be described as missing. Work still owns durable UNKNOWN/CAS/replay and capacity facts. WorkRuntime now calls TaskManager.create_task for its orchestration; DirectProjectCodeExecutorAdapter does so for its actual _run_attempt coroutine. Both detach the native parent identity from the Voice caller. Native transient status cannot replace durable truth. |
 | Controller tasks | `core/controller/schema/task.py`; `TaskManager.add_task/get_state/load_state` maintains indexed session tasks; `TaskScheduler` selects a registered executor by task type and streams its output | Reuse for Controller execution. Its task/session state, pause and output events are not the durable command/attempt/outbox protocol. Do not map a scheduler cancellation boolean to a committed delivery result. |
 | Team tasks | `agent_teams/tools/task_manager.py`, `tools/database/task_dao.py`; task tools call the manager/DAO and publish team events for assignment, dependencies, completion and review | Reuse for team decomposition and coordination. A team's subtask ID is not automatically a user delivery ID or an execution attempt ID. No second team scheduler is added. |
 | Harness asynchronous tools | `agent_teams/harness/async_tools.py`; invoke launches an async tool, tracks status/output, and injects completion via the owning harness; `tools/tool_async.py` provides list/output/cancel | Retain as the async tool runtime. It does not by itself prove durable outbox delivery, project effects or safe restart/retry. No duplicate async-tool loop is added. |
@@ -24,12 +26,17 @@ existing Controller or TeamAgent consumers now automatically use this store.
 
 ## Ownership and flow
 
+This shows the normal Host project-execution path. The injected FormalExecutor
+contract also supports application implementations with their own execution owner;
+the SDK does not force every consumer through the Host Runner.
+
 ```mermaid
 flowchart TD
   A[Application authorization and context] --> C[PersistentTaskCore]
   C <--> S[SqliteTaskStore: commands / tasks / attempts / outbox]
   C -->|exact dispatch / cancel / adjust| E[Application FormalExecutor]
-  E --> R[Existing Agent / Controller / Team / Harness execution]
+  E --> N[Native TaskManager under application Runner root]
+  N --> R[Application-supplied existing Agent / Harness execution]
   R --> E
   E -->|observations and recovery facts| C
   S --> F[Authorized task event subscription]
@@ -59,10 +66,13 @@ projection. Its `NativeTaskSource` implements `TaskSourceEvidence` and registers
 the existing source version during module initialization. SDK code has no
 JiuwenSwarm import and contains no Realtime client, microphone, turn ledger or UI.
 
-The concrete project executor remains in JiuwenSwarm because it resolves its
-project registry, configured Agent facade, tool registration and local project
-baseline. Moving that adapter unchanged would introduce an SDK-to-application
-dependency. It uses the SDK's task/durability contracts and existing Agent rails.
+The project execution algorithm belongs to SDK DirectProjectCodeExecutorAdapter:
+checkout, attempt journal, apply, effect verification and cleanup. JiuwenSwarm
+supplies ProjectExecutionApplication and binding resolution for its project
+registry, configured Agent facade, permissions and tool registration. AgentServer
+passes AgentRuntime.ensure_background_task_group through the P3 factory; the SDK
+uses that root without importing the Host. Standalone/custom consumers may retain
+the existing asyncio mode, using the same attempt algorithm and durable authority.
 
 Applications instantiate `SqliteTaskStore(path)` and
 `PersistentTaskCore(store, executor)`, validate their entrypoint, then call
@@ -92,7 +102,7 @@ They establish SDK/storage boundaries, not physical voice or cloud-model accepta
 
 ## Local distribution
 
-The branch package version is `0.1.17+livevoice.4`; official `0.1.17` does not
+The current branch package version is `0.1.17+livevoice.9`; official `0.1.17` does not
 contain this addition and must not satisfy the consuming application's pin.
 JiuwenSwarm uses the sibling `../agent-core` editable uv source for local
 work. For wheel installation, install the matching SDK wheel together with
@@ -293,7 +303,7 @@ schema migration or change to older call defaults. Presentation/heard-history
 ACK policy remains an application responsibility; no SDK-to-Host dependency.
 
 
-### Work ownership audit correction
+### Historical Work ownership characterization (superseded by .8 below)
 
 `tests/integration_tests/application_tasks/test_work_native_task_ownership.py`
 uses the actual Runner root owner, TaskManager and BackgroundTask with real
@@ -314,7 +324,7 @@ Host shutdown retry must retain current guarantees. No production adapter or
 new task group is introduced by these characterization tests.
 
 
-### Native Work owner implementation (2026-09-14, current working tree)
+### Historical native-root implementation (.7; superseded by .8 below)
 
 The earlier audit-only paragraphs above are historical. HostWorkService now passes
 AgentRuntime.get_background_task_group into WorkRuntime; managed Host resolves
@@ -336,8 +346,9 @@ SDK real native/SQLite: 11 passed (1.94s); Host existing Work regressions: 37 pa
 (7.10s); real Runner.start/stop + Host/SQLite probe: 1 passed (7.48s). The latter
 isolates external checkpointer/extensions, not Runner or Work. Read-only review
 found no remaining concrete blocker in the three production files; this is not
-full candidate acceptance. Paired wheel validation and final documentation/checks
-remain pending before local commit.
+full candidate acceptance. At that intermediate checkpoint paired wheel validation
+remained pending; its
+completed result is recorded in the final .7 batch paragraph below.
 
 Same-basis production delta this batch: Voice 0, Host +13, SDK +57 = +70.
 Current official-baseline net: Voice 112334, Host 48028, SDK 34056 = 194418;
@@ -357,7 +368,7 @@ dependencies reused the local environment; no full dependency-resolution claim.
 This closes only this native-root/settlement batch, not the overall goal.
 
 
-### Native TaskManager integration (2026-09-14, .8 working tree)
+### Native TaskManager integration (.8, retained in .9)
 
 Work now calls the existing TaskManager.create_task inside the Host-owned Runner
 root. The native registry, coroutine execution, cancellation scope and task events
@@ -390,7 +401,8 @@ the updated two root/native cancellation cases (1.61s) and three callback cases
 (1.64s). Host Work regressions: 38 passed (10.23s). Counts overlap. Independent
 read-only review found no concrete blocker in the current integration. Ruff passed
 with existing ASYNC109 API-parameter warnings excluded; no timeout policy changed.
-Pair build/install and final documentation checks remain pending before commit.
+The final .8 paired validation below supersedes the intermediate pending build
+and documentation status.
 
 Same accounting: Voice 112334, Host 48028, SDK 34134, combined net194496;
 this batch +78 (existing native enhancements +40, Work ownership adapter +38),
