@@ -1961,16 +1961,51 @@ class BrowserRuntimeHealthTool(Tool):
             yield None
 
 
+def _runtime_uses_browser_driver(runtime: "BrowserAgentRuntime") -> bool:
+    """True when ``runtime`` drives Chrome through a BrowserDriver backend.
+
+    Mirrors the defensive lookup in ``controllers/action.py`` so lightweight
+    test doubles without the predicate keep the Playwright MCP path.
+    """
+
+    uses = getattr(runtime, "_uses_browser_driver", None)
+    if callable(uses):
+        try:
+            return bool(uses())
+        except Exception:
+            return False
+    return bool(uses)
+
+
 def build_browser_runtime_tools(
     runtime: "BrowserAgentRuntime",
     language: str = "cn",
 ) -> List[Tool]:
     """Build model-facing browser tools backed by ``BrowserAgentRuntime``.
 
-    On the BrowserDriver path this returns only registered CORE catalog tools
-    plus session-control exceptions (cancel / clear_cancel). Probe / batch /
-    custom_action helpers remain as internal runtime APIs and are not injected.
+    The returned set depends on which backend drives Chrome:
+
+    * **Playwright MCP** — deterministic helper tools only. Low-level actions
+      (click / type / navigate / ...) are served by the MCP server's own
+      primitives, which the browser subagent calls directly. Injecting the
+      local CORE catalog here would shadow those primitives with methods that
+      require a :class:`BrowserDriver` the MCP path never creates.
+    * **BrowserDriver (browser_use)** — the registered CORE catalog plus
+      session-control exceptions (cancel / clear_cancel). Probe / batch /
+      custom_action helpers stay internal runtime APIs on this path.
     """
+
+    if not _runtime_uses_browser_driver(runtime):
+        return [
+            BrowserCancelTool(runtime, language),
+            BrowserClearCancelTool(runtime, language),
+            BrowserProbeInteractivesTool(runtime, language),
+            BrowserProbeCardsTool(runtime, language),
+            BrowserBatchInteractTool(runtime, language),
+            BrowserCustomActionTool(runtime, language),
+            BrowserListActionsTool(runtime, language),
+            BrowserRuntimeHealthTool(runtime, language),
+        ]
 
     return [
         BrowserNavigateTool(runtime, language),
