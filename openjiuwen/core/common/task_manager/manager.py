@@ -21,6 +21,8 @@ import anyio
 
 from openjiuwen.core.common.logging import (
     LogEventType,
+)
+from openjiuwen.core.common.logging import (
     runner_logger as logger,
 )
 from openjiuwen.core.common.task_manager.context import (
@@ -80,6 +82,7 @@ class TaskManager:
             timeout: Optional[float] = None,
             metadata: Optional[Dict] = None,
             catch_exceptions: bool = False,
+            on_scheduled: Optional[Callable[[Task], None]] = None,
     ) -> Task:
         """Create and register a new coroutine task.
 
@@ -120,6 +123,8 @@ class TaskManager:
             timeout: Optional timeout in seconds
             metadata: Optional dict of metadata to attach to the task
             catch_exceptions: Whether to catch exceptions in the task
+            on_scheduled: Optional synchronous ownership receipt, called after scheduling
+                and before asynchronous creation observers. Errors do not undo scheduling.
 
         Returns:
             The created Task object
@@ -157,6 +162,8 @@ class TaskManager:
 
         # Use task.execute() to run the coroutine
         tg.start_soon(task.execute, coro, callback_trigger, catch_exceptions)
+        if on_scheduled is not None:
+            on_scheduled(task)
 
         await self._trigger_event(TaskManagerEvents.TASK_CREATED, task)
         logger.debug("Created task", event_type=LogEventType.CORO_MANAGER_TASK_STATUS_CHANGED,
@@ -711,6 +718,7 @@ async def create_task(
         timeout: Optional[float] = None,
         metadata: Optional[Dict] = None,
         catch_exceptions: bool = False,
+        on_scheduled: Optional[Callable[[Task], None]] = None,
 ) -> Task:
     """Create a task using the global TaskManager (convenience function).
 
@@ -745,6 +753,7 @@ async def create_task(
         timeout=timeout,
         metadata=metadata,
         catch_exceptions=catch_exceptions,
+        on_scheduled=on_scheduled,
     )
 
 

@@ -20,6 +20,70 @@ SCOPE = ScopeRef("owner-probe", "project", "session", Assurance.AUTHENTICATED)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["running", "created", "completed_created"])
+async def test_native_callback_failure_retains_work_truth_without_stopping_root(tmp_path, monkeypatch, phase):
+    from openjiuwen.core.common.task_manager.manager import TaskManager
+    from openjiuwen.core.runner.callback.errors import AbortError
+    from openjiuwen.core.runner.callback.framework import AsyncCallbackFramework
+
+    monkeypatch.setattr(TaskManager, "_instance", None)
+    manager = get_task_manager()
+    manager._callback_framework = AsyncCallbackFramework()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    owner, store = _work(tmp_path, task_group_provider=lambda: root)
+
+    async def run(_control):
+        calls.append("executed")
+        started.set()
+        await release.wait()
+        return "late result"
+
+    async def reject(task, **_kwargs):
+        if task.group == "application-work":
+            if phase != "running":
+                await started.wait()
+            if phase == "completed_created":
+                release.set()
+                await task.wait()
+            raise AbortError("native observer failed")
+
+    await (manager.on_running(reject) if phase == "running" else manager.on_created(reject))
+    try:
+        async with _runner_root() as root:
+            work = await owner.start(**_inputs(), runner=run)
+            record = owner._records[(SCOPE, work.work_id, 1)]
+            try:
+                expected = WorkState.COMPLETED if phase == "completed_created" else WorkState.UNKNOWN
+                for _ in range(100):
+                    if record.snapshot.state is expected:
+                        break
+                    await asyncio.sleep(0.001)
+                assert record.snapshot.state is expected
+                assert not root.cancel_scope.cancel_called
+                assert calls == ([] if phase == "running" else ["executed"])
+                if phase == "created":
+                    assert not record.snapshot.execution_settled
+                    before = store.restore()
+                    with pytest.raises(WorkViolation) as full:
+                        await owner.start(**_inputs("replacement"), runner=run)
+                    assert full.value.reason == "NATIVE_WORK_CAPACITY_FULL"
+                    assert store.restore() == before
+                release.set()
+                await asyncio.wait_for(record.operation, 2)
+                final = record.snapshot
+                assert final.state is expected and final.execution_settled
+                assert final.result_text == ("late result" if phase == "completed_created" else None)
+                assert await owner.start(**_inputs(), runner=run) == final
+                assert SqliteWorkStore(store.database_path).restore() == (final,)
+            finally:
+                release.set()
+    finally:
+        release.set()
+        await owner.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "cleanup_failure", "cleanup_cancel"])
 async def test_independent_cleanup_keeps_sqlite_unsettled_and_capacity_reserved(tmp_path, outcome):
     owner, store = _work(tmp_path)
@@ -250,11 +314,16 @@ async def test_native_handle_retains_cleanup_but_durable_unknown_is_separate(tmp
 
 
 @pytest.mark.asyncio
-async def test_work_orchestration_native_cancel_keeps_physical_reservation(tmp_path):
+@pytest.mark.parametrize("cancel_owner", ["root", "native"])
+async def test_work_orchestration_native_cancel_keeps_physical_reservation(tmp_path, cancel_owner):
+    from openjiuwen.core.common.task_manager.context import _current_task_id, get_current_task_id
+
     owner, store = _work(tmp_path, task_group_provider=lambda: root)
     started, release = asyncio.Event(), asyncio.Event()
+    native_tasks = []
 
     async def run(_control):
+        native_tasks.append(get_task_manager().registry.get(get_current_task_id()))
         started.set()
         await release.wait()
         return "late physical result"
@@ -262,10 +331,22 @@ async def test_work_orchestration_native_cancel_keeps_physical_reservation(tmp_p
     work = None
     try:
         async with _runner_root() as root:
-            work = await owner.start(**_inputs(), runner=run)
+            parent_token = _current_task_id.set("voice-parent")
+            try:
+                work = await owner.start(**_inputs(), runner=run)
+            finally:
+                _current_task_id.reset(parent_token)
             await asyncio.wait_for(started.wait(), 2)
             try:
-                root.cancel_scope.cancel()
+                native = native_tasks[0]
+                assert native is not None and native.group == "application-work"
+                assert native.parent_task_id is None
+                await get_task_manager().cascade_cancel("voice-parent", reason="voice-closed")
+                assert not native.get_cancel_scope().cancel_called
+                if cancel_owner == "root":
+                    root.cancel_scope.cancel()
+                else:
+                    assert await native.cancel(cascade=False, reason="native-owner-cancel")
                 for _ in range(100):
                     if owner.query(scope=SCOPE, work_id=work.work_id).state is WorkState.UNKNOWN:
                         break

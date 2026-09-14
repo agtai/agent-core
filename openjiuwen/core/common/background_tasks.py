@@ -33,6 +33,7 @@ class BackgroundTask:
         self._manager_task: Optional["Task"] = None
         self._asyncio_task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
+        self._creation_error: Optional[BaseException] = None
 
     @classmethod
     def from_asyncio_task(cls, task: asyncio.Task, *, group: str) -> "BackgroundTask":
@@ -50,6 +51,8 @@ class BackgroundTask:
         return self._group
 
     def done(self) -> bool:
+        if self._creation_error is not None:
+            return True
         if self._manager_task is not None:
             return self._manager_task.is_terminal
         if self._asyncio_task is not None:
@@ -58,6 +61,8 @@ class BackgroundTask:
 
     async def wait(self) -> Any:
         await self._ready.wait()
+        if self._creation_error is not None:
+            raise self._creation_error
         if self._manager_task is not None:
             return await self._manager_task.wait()
         return await self._asyncio_task
@@ -124,8 +129,26 @@ def start_background_task(
     handle = BackgroundTask(group=group)
 
     async def _create() -> None:
-        task = await create_task(coro, name=name, group=group, catch_exceptions=True)
-        handle.set_manager_task(task)
+        scheduled = None
+
+        def retain(task) -> None:
+            nonlocal scheduled
+            scheduled = task
+
+        try:
+            task = await create_task(
+                coro, name=name, group=group, catch_exceptions=True, on_scheduled=retain
+            )
+        except BaseException as error:
+            if scheduled is not None:
+                handle.set_manager_task(scheduled)
+            else:
+                coro.close()
+                handle._creation_error = error
+                handle._ready.set()
+            raise
+        else:
+            handle.set_manager_task(task)
 
     tg.start_soon(_create)
     return handle

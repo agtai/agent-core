@@ -355,3 +355,58 @@ complete file comparison. No source rollback, repository cleanup or deployment.
 Ruff on changed SDK source/test and git diff --check passed. Third-party
 dependencies reused the local environment; no full dependency-resolution claim.
 This closes only this native-root/settlement batch, not the overall goal.
+
+
+### Native TaskManager integration (2026-09-14, .8 working tree)
+
+Work now calls the existing TaskManager.create_task inside the Host-owned Runner
+root. The native registry, coroutine execution, cancellation scope and task events
+manage that orchestration. Its parent task identity is explicitly detached from
+the Voice caller; a real cascade_cancel probe confirms caller closure does not
+cancel accepted Work. The existing completion Future is only an asyncio waiting
+adapter, not another execution state or durable result ledger. WorkStore remains
+the business authority for revision/CAS, UNKNOWN/no replay and physical settlement.
+A native coroutine may finish while the durable Work outcome is UNKNOWN: these
+are distinct facts, and native task entries never create formal product Task cards.
+
+The existing native Task lifecycle now covers failed/cancelled start callbacks,
+closes unstarted coroutines and restores task context. TaskManager's optional
+synchronous on_scheduled receipt retains the actual Task before asynchronous
+creation callbacks; their existing order and exception propagation are unchanged.
+The existing synchronous BackgroundTask helper uses it, so already-returned
+handles no longer hang after creation failure. The asynchronous create helper
+still raises creation errors as before; Work retains ownership through the receipt.
+No separate native task registry or new scheduler framework was added.
+
+Real Work integration exposed logging's deepcopy of AbortError failing while
+handling the original exception. Existing BaseLogEvent serialization now excludes
+only the exception object from deepcopy, retaining its prior string/error fields
+and deep-copying all other data. Native callback failure before Work starts has
+zero body effects; failure after start produces UNKNOWN and holds capacity through
+cleanup; a late observer failure does not erase an already settled real result.
+
+Verification: 84 SDK/native/message-queue/SQLite tests passed (6.81s), followed by
+the updated two root/native cancellation cases (1.61s) and three callback cases
+(1.64s). Host Work regressions: 38 passed (10.23s). Counts overlap. Independent
+read-only review found no concrete blocker in the current integration. Ruff passed
+with existing ASYNC109 API-parameter warnings excluded; no timeout policy changed.
+Pair build/install and final documentation checks remain pending before commit.
+
+Same accounting: Voice 112334, Host 48028, SDK 34134, combined net194496;
+this batch +78 (existing native enhancements +40, Work ownership adapter +38),
+1184 fewer than initial195680. Native files now counted contain 2306 baseline
+lines in total, not new code; current SDK affected-file total36440 is not its net
+addition. No relocation or bulk duplicate deletion is claimed. Logging belongs
+to shared module attribution; M4+M5 and M7+M9 remain merged. Task/Work business
+management and broader full-goal closure remain incomplete.
+
+
+Final .8 paired validation: clean Host/SDK source snapshots built and installed
+without dependency resolution. All 1016 Host / 2409 SDK Python files match both
+snapshots and current source bytes; 24 installed native/SQLite/Host scenarios
+passed, including the actual native registry cancellation and callback-failure
+paths. Explicit nonempty Voice parent context and native cascade_cancel leave
+Work alive. No fresh Provider, physical audio or OS restart is claimed. The
+asynchronous create helper's original error propagation is deliberately retained;
+Work and the synchronous helper now retain the scheduled task when it matters.
+This closes this native-management execution boundary only, not the full goal.

@@ -8,9 +8,10 @@ from typing import Any, Callable, Coroutine, Dict, Optional
 
 import anyio
 
-from openjiuwen.core.common.logging import LogEventType, runner_logger as logger
+from openjiuwen.core.common.logging import LogEventType
+from openjiuwen.core.common.logging import runner_logger as logger
 from openjiuwen.core.common.task_manager.context import _current_task_id
-from openjiuwen.core.common.task_manager.types import TaskStatus, TERMINAL_STATES
+from openjiuwen.core.common.task_manager.types import TERMINAL_STATES, TaskStatus
 
 
 @dataclass
@@ -142,15 +143,16 @@ class Task:
             self.status = TaskStatus.RUNNING
             self.started_at = datetime.now(timezone.utc)
 
-            # Trigger event
-            if callback_trigger:
-                await callback_trigger(self, "running")
-
+            coro_started = False
             try:
                 result = None
                 with anyio.CancelScope() as cancel_scope:
                     self.set_cancel_scope(cancel_scope)
+                    if callback_trigger:
+                        await callback_trigger(self, "running")
+                    await anyio.lowlevel.checkpoint_if_cancelled()
 
+                    coro_started = True
                     if self.timeout:
                         with anyio.fail_after(self.timeout):
                             result = await coro
@@ -213,6 +215,8 @@ class Task:
                 raise
 
             finally:
+                if not coro_started:
+                    coro.close()
                 self.set_done()
                 self.clear_cancel_scope()
                 _current_task_id.reset(token)
