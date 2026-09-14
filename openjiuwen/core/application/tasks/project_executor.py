@@ -5530,10 +5530,17 @@ class DirectProjectCodeExecutorAdapter:
                         now=self._clock(),
                     )
                     return
-                code = error.reason if isinstance(error, FormalTaskViolation) else str(error)
+                from .file_effect_plan import FileEffectPlanError
+
+                cause = error.__cause__
+                reported_error = cause if isinstance(cause, FileEffectPlanError) else error
+                code = reported_error.reason if isinstance(reported_error, (FormalTaskViolation, FileEffectPlanError)) else str(error)
                 if code.startswith("EXECUTION_TARGET_NOT_BOUND:"):
                     code = "EXECUTION_TARGET_NOT_BOUND"
-                if code not in {
+                file_plan_failure = isinstance(reported_error, FileEffectPlanError) and re.fullmatch(
+                    r"FILE_EFFECT_[A-Z_]{1,64}", code
+                ) is not None
+                if not file_plan_failure and code not in {
                     "EXECUTION_TARGET_NOT_BOUND",
                     "EXECUTOR_CAPABILITY_UNAVAILABLE",
                     "EXECUTOR_INITIALIZATION_FAILED",
@@ -5541,6 +5548,11 @@ class DirectProjectCodeExecutorAdapter:
                     "PROJECT_AGENT_CLEANUP_PENDING",
                     "PROJECT_EXECUTOR_AGENT_ERROR",
                     "BACKGROUND_TASK_READ_NO_PROGRESS",
+                    "BACKGROUND_TASK_CHECKPOINT_BINDING_MISMATCH",
+                    "BACKGROUND_TASK_CHECKPOINT_STALE",
+                    "BACKGROUND_TASK_CHECKPOINT_UNAVAILABLE",
+                    "BACKGROUND_FILE_EFFECT_REJECTED",
+                    "FILE_EFFECT_TOOL_IDENTITY_MISMATCH",
                     "PROJECT_EXECUTOR_INCOMPLETE",
                     "FORBIDDEN_GIT_HEAD_CHANGE",
                     "RUNTIME_SUPPORT_PATH_MUTATED",
@@ -5557,6 +5569,17 @@ class DirectProjectCodeExecutorAdapter:
                     "TASK_ADJUSTMENT_REJECTED",
                 }:
                     code = "PROJECT_EXECUTOR_FAILED"
+                # Preserve a useful failure location without logging model/tool
+                # arguments, exception messages or other private payloads.
+                failure_frame = reported_error.__traceback__
+                while failure_frame is not None and failure_frame.tb_next is not None:
+                    failure_frame = failure_frame.tb_next
+                logger.error(
+                    "Project attempt failed: attempt_id=%s reason=%s exception_type=%s function=%s line=%s",
+                    item.attempt_id, code, type(reported_error).__name__,
+                    failure_frame.tb_frame.f_code.co_name if failure_frame is not None else "unknown",
+                    failure_frame.tb_lineno if failure_frame is not None else 0,
+                )
                 await asyncio.to_thread(
                     self._journal.finish,
                     item.attempt_id,

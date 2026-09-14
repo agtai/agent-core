@@ -54,6 +54,50 @@ class Application:
         return {"policy": dict(FORMAL_RUNTIME_SUPPORT_POLICY), "application_paths": {}}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_error", ["direct", "latched", None])
+async def test_project_failure_preserves_safe_reason_without_private_exception(tmp_path, caplog, file_error):
+    from openjiuwen.core.application.tasks.file_effect_plan import FileEffectPlanError
+
+    project = tmp_path / "project"
+    _git_project(project)
+    before = (project / "README.md").read_bytes()
+
+    class FailingAgent:
+        async def process_background_code_task_stream(self, request):
+            if file_error == "latched":
+                from openjiuwen.core.application.tasks.execution_checkpoint import BackgroundTaskCheckpoint
+                checkpoint = BackgroundTaskCheckpoint(request.session_id, None)
+                checkpoint.failure_reason = "FILE_EFFECT_UNPLANNED_DELTA"
+                checkpoint.failure_cause = FileEffectPlanError(checkpoint.failure_reason)
+                checkpoint.raise_if_failed()
+            if file_error == "direct":
+                raise FileEffectPlanError("FILE_EFFECT_UNPLANNED_DELTA")
+            raise RuntimeError("private-model-payload-must-not-be-logged")
+            yield  # pragma: no cover -- protocol is an async iterator
+
+    class Resolver:
+        async def resolve(self, spec, *, for_dispatch):
+            return _direct_binding(project, FailingAgent())
+
+    executor = DirectProjectCodeExecutorAdapter(Resolver(), tmp_path / "attempts.db",
+        application=Application(), clock=lambda: "2026-08-05T12:00:00Z")
+    try:
+        await executor.dispatch(_item(project))
+        async with asyncio.timeout(30):
+            await asyncio.gather(*(asyncio.shield(task) for task in tuple(executor._running.values())))
+        record = executor._journal.get("attempt-1")
+        assert record.outcome.value == "failed"
+        assert record.error == ("FILE_EFFECT_UNPLANNED_DELTA" if file_error else "PROJECT_EXECUTOR_FAILED")
+        assert record.result_text is None
+        assert (project / "README.md").read_bytes() == before
+        assert not (project / "result.txt").exists()
+        assert "private-model-payload-must-not-be-logged" not in caplog.text
+        assert "Project attempt failed:" in caplog.text
+    finally:
+        await executor.close()
+
+
 def _git(project: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(project), *args],

@@ -105,6 +105,7 @@ class BackgroundTaskCheckpoint:
     closed: bool = False
     file_plan: Any | None = None
     failure_reason: str | None = field(default=None, init=False)
+    failure_cause: Exception | None = field(default=None, init=False, repr=False)
     _read_progress: BackgroundReadProgress = field(default_factory=BackgroundReadProgress, init=False)
 
     def check_model_progress(self, context: Any) -> None:
@@ -117,7 +118,7 @@ class BackgroundTaskCheckpoint:
 
     def raise_if_failed(self) -> None:
         if self.failure_reason is not None:
-            raise RuntimeError(self.failure_reason)
+            raise RuntimeError(self.failure_reason) from self.failure_cause
 
 
 _current: ContextVar[BackgroundTaskCheckpoint | None] = ContextVar("background_task_model_checkpoint", default=None)
@@ -182,6 +183,7 @@ class TaskCheckpointRail(AgentRail):
             await checkpoint.file_plan.before_tool(ctx.inputs.tool_name, arguments)
         except Exception as error:
             checkpoint.failure_reason = getattr(error, "reason", "BACKGROUND_FILE_EFFECT_REJECTED")
+            checkpoint.failure_cause = error
             raise
 
 
