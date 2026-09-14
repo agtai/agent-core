@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from openjiuwen.harness.tools.browser_move.drivers.base import (
+from openjiuwen.harness.tools.browser_move.backends.contract.base import (
     ActResult,
     Box,
     BrowserDriver,
@@ -26,7 +26,7 @@ from openjiuwen.harness.tools.browser_move.drivers.base import (
     TabRef,
     TextRef,
 )
-from openjiuwen.harness.tools.browser_move.drivers.errors import (
+from openjiuwen.harness.tools.browser_move.backends.contract.errors import (
     DriverNotConnected,
     StaleIndexError,
     StaleNodeError,

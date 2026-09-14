@@ -10,12 +10,12 @@ import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserInstanceConfig,
     BrowserRunGuardrails,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.profiles import BrowserProfile
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
+from openjiuwen.harness.tools.browser_move.runtime.profiles import BrowserProfile
+from openjiuwen.harness.tools.browser_move.runtime.service import BrowserService
 
 from openjiuwen.core.foundation.tool import McpServerConfig
 
@@ -464,7 +464,7 @@ def test_run_task_once_uses_fresh_worker_conversation_ids() -> None:
             )
         }
 
-    with patch("openjiuwen.harness.tools.browser_move.playwright_runtime.service.Runner.run_agent", fake_run_agent):
+    with patch("openjiuwen.harness.tools.browser_move.runtime.service.Runner.run_agent", fake_run_agent):
         first = _run(service.run_task_once(task="Open page", session_id="session-1", request_id="req-1"))
         second = _run(service.run_task_once(task="Open page", session_id="session-1", request_id="req-1"))
 
@@ -484,7 +484,7 @@ def test_ensure_managed_driver_started_reuses_healthy_existing_driver() -> None:
         healthy_driver.is_endpoint_ready.return_value = True
         setattr(service, "_managed_driver", healthy_driver)
 
-        with patch("openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver") as mock_cls:
+        with patch("openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver") as mock_cls:
             await getattr(service, "_ensure_managed_driver_started")()
 
         assert getattr(service, "_managed_driver") is healthy_driver
@@ -521,7 +521,7 @@ def test_ensure_managed_driver_started_replaces_stale_driver() -> None:
                 side_effect=lambda browser_profile, select=False: browser_profile,
             ),
             patch(
-                "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
                 return_value=new_driver,
             ),
         ):
@@ -567,7 +567,7 @@ def test_ensure_runtime_ready_refreshes_mcp_binding_after_managed_browser_restar
                 side_effect=lambda browser_profile, select=False: browser_profile,
             ),
             patch(
-                "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
                 return_value=new_driver,
             ),
             patch.object(service, "_refresh_mcp_server_binding", AsyncMock()) as refresh_binding,
@@ -663,7 +663,7 @@ def test_existing_profile_browser_binary_is_cleared_for_auto_detection() -> None
                 side_effect=lambda browser_profile, select=False: browser_profile,
             ),
             patch(
-                "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
                 return_value=new_driver,
             ),
         ):

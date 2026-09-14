@@ -24,18 +24,18 @@ from openjiuwen.core.single_agent.rail.base import (
 )
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context import (
     BROWSER_TASK_STATE_KEY,
     BROWSER_TOOL_MEMORY_METADATA_KEY,
     BROWSER_WORKING_MEMORY_RECORD_BEGIN,
     BROWSER_WORKING_MEMORY_RECORD_END,
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessor,
     BrowserWorkingContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_rail import (
     BrowserWorkingContextRail,
 )
 

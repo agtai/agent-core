@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.semantic_state import (
+from openjiuwen.harness.tools.browser_move.runtime.semantic_state import (
     SemanticStateTracker,
     build_semantic_state,
 )

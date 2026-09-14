@@ -19,14 +19,14 @@ from typing import Dict
 import pytest
 
 from openjiuwen.harness.tools.browser_move import REPO_ROOT
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     MISSING_API_KEY_MESSAGE,
     build_runtime_settings,
     load_repo_dotenv,
 )
 
 
-SERVER_MODULE = "openjiuwen.harness.tools.browser_move.playwright_runtime_mcp_server"
+SERVER_MODULE = "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.mcp_server"
 
 
 def _system_tests_enabled() -> bool:
@@ -120,7 +120,7 @@ async def _run_browser_tools_check(query: str, session_id: str) -> Dict[str, obj
     from openjiuwen.core.runner import Runner
     from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAgentConfig
     from openjiuwen.core.single_agent.schema.agent_card import AgentCard
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools import (
+    from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools import (
         build_browser_runtime_mcp_config,
         register_browser_runtime_mcp_server,
     )

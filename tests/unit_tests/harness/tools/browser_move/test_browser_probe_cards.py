@@ -13,19 +13,19 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.probes import (
     build_browser_state_metadata_js,
     build_card_probe_js,
     build_interactive_probe_js,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
     builtin_site_profiles,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BrowserAgentRuntime,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
     BrowserProbeCardsTool,
 )
 
@@ -365,10 +365,10 @@ def test_build_card_probe_js_accepts_site_profiles_and_selector_cache_records() 
 
 
 def test_runtime_probe_cards_unwraps_result_field_and_records_cache(tmp_path, monkeypatch) -> None:
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
         BrowserSelectorCache,
     )
-    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+    import openjiuwen.harness.tools.browser_move.runtime.runtime as runtime_module
 
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
@@ -517,10 +517,10 @@ def test_build_card_probe_js_extracts_article_metadata_fields() -> None:
 
 def test_runtime_probe_cards_records_rejected_cache_attempt(tmp_path, monkeypatch) -> None:
     import json
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
         BrowserSelectorCache,
     )
-    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+    import openjiuwen.harness.tools.browser_move.runtime.runtime as runtime_module
 
     cache_path = tmp_path / "selector_cache.json"
     cache_path.write_text(

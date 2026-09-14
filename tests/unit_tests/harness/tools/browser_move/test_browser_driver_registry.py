@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.drivers.errors import DriverUnsupported
-from openjiuwen.harness.tools.browser_move.drivers.registry import (
+from openjiuwen.harness.tools.browser_move.backends.contract.errors import DriverUnsupported
+from openjiuwen.harness.tools.browser_move.backends.contract.registry import (
     create_browser_driver,
     register_browser_driver,
     registered_backends,

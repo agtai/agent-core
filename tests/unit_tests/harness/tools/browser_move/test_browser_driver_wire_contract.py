@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import inspect
 
-from openjiuwen.harness.tools.browser_move.drivers import errors as driver_errors
-from openjiuwen.harness.tools.browser_move.drivers.base import BrowserDriver
-from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import wire
+from openjiuwen.harness.tools.browser_move.backends.contract import errors as driver_errors
+from openjiuwen.harness.tools.browser_move.backends.contract.base import BrowserDriver
+from openjiuwen.harness.tools.browser_move.backends.browser_use.sidecar import wire
 
 
 def _browser_driver_public_method_names() -> set[str]:

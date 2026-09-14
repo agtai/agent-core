@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     ADVANCED_CODE_BROWSER_TOOL_NAMES,
     CORE_BROWSER_TOOL_NAMES,
     UNSAFE_DEV_BROWSER_TOOL_NAMES,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     _BATCH_EXPLICIT_SELECTOR_OPS,
     _BATCH_SAFE_READ_SELECTOR_OPS,
     BrowserRuntimeRail,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.tool_semantics import (
+from openjiuwen.harness.tools.browser_move.runtime.tool_semantics import (
     BATCH_READ_ONLY_OPS,
     SEMANTICALLY_NEUTRAL_TOOL_NAMES,
     batch_steps_are_read_only,

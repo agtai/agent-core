@@ -13,13 +13,13 @@ from typing import Any
 import pytest
 from unittest.mock import AsyncMock
 
-from openjiuwen.harness.tools.browser_move.drivers.base import IndexRef, NodeRef, SelectorRef
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserInstanceConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.page_state import (
+from openjiuwen.harness.tools.browser_move.backends.contract.base import IndexRef, NodeRef, SelectorRef
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserInstanceConfig
+from openjiuwen.harness.tools.browser_move.runtime.page_state import (
     BrowserPageState,
     BrowserTarget,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
 
 from tests.unit_tests.harness.tools.browser_move.fakes.fake_driver import FakeDriver
 

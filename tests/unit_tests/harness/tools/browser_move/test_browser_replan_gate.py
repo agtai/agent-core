@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context import (
     BROWSER_TASK_STATE_KEY,
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserRuntimeRail
-from openjiuwen.harness.tools.browser_move.playwright_runtime.semantic_state import SemanticStateTracker
-from openjiuwen.harness.tools.browser_move.playwright_runtime.tool_semantics import tool_is_semantically_neutral
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.runtime.semantic_state import SemanticStateTracker
+from openjiuwen.harness.tools.browser_move.runtime.tool_semantics import tool_is_semantically_neutral
 
 
 class _FakeSession:

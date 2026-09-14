@@ -21,7 +21,7 @@ _SIDECAR_DIR = (
     / "harness"
     / "tools"
     / "browser_move"
-    / "drivers"
+    / "backends"
     / "browser_use"
     / "sidecar"
 )

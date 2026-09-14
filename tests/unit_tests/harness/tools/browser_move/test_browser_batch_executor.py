@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.batch_executor import execute_batch
+from openjiuwen.harness.tools.browser_move.runtime.batch_executor import execute_batch
 from tests.unit_tests.harness.tools.browser_move.fakes.fake_driver import FakeDriver
 
 
@@ -135,7 +135,7 @@ def test_mid_sequence_failure_yields_per_step_error_without_aborting_optional_ta
         async def _click(ref, **kwargs):  # type: ignore[no-untyped-def]
             css = getattr(ref, "css", "")
             if css == "#boom":
-                from openjiuwen.harness.tools.browser_move.drivers.base import ActResult
+                from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult
 
                 return ActResult(ok=False, detail="click intercepted", document_changed=False, driver_generation=1)
             return await original_click(ref, **kwargs)
@@ -170,7 +170,7 @@ def test_continue_on_error_keeps_going() -> None:
         async def _click(ref, **kwargs):  # type: ignore[no-untyped-def]
             css = getattr(ref, "css", "")
             if css == "#boom":
-                from openjiuwen.harness.tools.browser_move.drivers.base import ActResult
+                from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult
 
                 return ActResult(ok=False, detail="boom", document_changed=False, driver_generation=1)
             return await original_click(ref, **kwargs)
@@ -202,7 +202,7 @@ def test_continue_on_error_keeps_going() -> None:
     ],
 )
 def test_validation_still_owned_by_action_module(steps: list[dict[str, Any]]) -> None:
-    from openjiuwen.harness.tools.browser_move.controllers.action import validate_batch_steps
+    from openjiuwen.harness.tools.browser_move.runtime.controllers.action import validate_batch_steps
 
     errors = validate_batch_steps(steps)
     assert errors

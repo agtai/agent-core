@@ -17,16 +17,16 @@ from openjiuwen.core.foundation.llm.schema.message import ToolMessage, UserMessa
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.single_agent.ability_manager import AbilityManager
 from openjiuwen.core.single_agent.prompts.builder import SystemPromptBuilder
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     CORE_BROWSER_TOOL_NAMES,
     resolve_browser_capabilities,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_working_context import (
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime import runtime as runtime_module
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import MAX_ITERATION_MESSAGE
+from openjiuwen.harness.tools.browser_move.runtime import runtime as runtime_module
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.runtime.service import MAX_ITERATION_MESSAGE
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail
 from openjiuwen.core.single_agent.rail.base import InvokeInputs, ModelCallInputs, ToolCallInputs
