@@ -83,6 +83,7 @@ class TaskManager:
             metadata: Optional[Dict] = None,
             catch_exceptions: bool = False,
             on_scheduled: Optional[Callable[[Task], None]] = None,
+            finalizer: Optional[Callable[[Task], Awaitable[None]]] = None,
     ) -> Task:
         """Create and register a new coroutine task.
 
@@ -125,6 +126,8 @@ class TaskManager:
             catch_exceptions: Whether to catch exceptions in the task
             on_scheduled: Optional synchronous ownership receipt, called after scheduling
                 and before asynchronous creation observers. Errors do not undo scheduling.
+            finalizer: Optional resource cleanup owned by the scheduled task. Runs
+                even when startup fails, before waiters observe settlement.
 
         Returns:
             The created Task object
@@ -161,7 +164,7 @@ class TaskManager:
                 await self._trigger_event(event_type, task)
 
         # Use task.execute() to run the coroutine
-        tg.start_soon(task.execute, coro, callback_trigger, catch_exceptions)
+        tg.start_soon(task.execute, coro, callback_trigger, catch_exceptions, finalizer)
         if on_scheduled is not None:
             on_scheduled(task)
 

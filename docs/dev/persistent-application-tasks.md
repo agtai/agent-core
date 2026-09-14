@@ -410,3 +410,66 @@ Work alive. No fresh Provider, physical audio or OS restart is claimed. The
 asynchronous create helper's original error propagation is deliberately retained;
 Work and the synchronous helper now retain the scheduled task when it matters.
 This closes this native-management execution boundary only, not the full goal.
+
+
+### Formal project attempts use the native execution owner (.9)
+
+DirectProjectCodeExecutorAdapter accepts an optional asynchronous task_group_provider.
+Host AgentServer passes AgentRuntime.ensure_background_task_group through the P3
+factory. This lazily starts the existing Runner and returns its root; a configured
+provider error is propagated before Agent acquisition or journal creation. Existing
+standalone consumers and custom Host initializers may omit/provide None, retaining
+their asyncio execution mode. Both modes use the same _run_attempt, journal, project
+mutation and recovery algorithm; no second business task registry was introduced.
+
+In the normal Host path TaskManager directly executes that coroutine, detached from
+the requesting Voice task identity. The synchronous on_scheduled receipt transfers
+resources and releases the dispatch lock before asynchronous creation observers.
+Otherwise an observer awaiting completion could deadlock adjustment/cleanup under
+that lock. Native Task's optional finalizer runs shielded even when a startup callback
+prevented coroutine entry; nested finalization still unlocks and wakes admission if
+a context-release callback raises. The exception remains observable through Task.wait.
+
+Task.is_settled and BackgroundTask.is_settled expose physical lifecycle completion;
+existing is_terminal/done status behavior is unchanged. Project waits use settlement,
+not a potentially early terminal status. Their timeout observers cannot cancel the
+native execution. Work and formal attempts now use the same native registry, task
+execution, cancellation scopes and lifecycle events. WorkStore/TaskStore remain the
+business authorities; native cancellation or completion alone does not authorize
+replaying an effect, creating a formal card, or rewriting a business outcome.
+
+AnyIO level cancellation requires explicit ownership shields: checkout/seed thread
+completion, durable preparation, the reserve/apply/artifact/effect-settlement critical
+section and resource handoff. Preparation is followed by a cancellation checkpoint
+before reserve/apply. Actual D2 tests distinguish an accepted caller's cancellation
+from native cancellation before apply. A completed file mutation may be published as
+completed_cleanup_pending while isolated cleanup still owns its resources; physical
+settlement is a separate fact. Independent cleanup coordinators, journal/CAS leases,
+OS locks and effect records are retained because cancelling a coroutine cannot stop
+Git/thread side effects or establish their durable result.
+
+This is an execution-owner integration, not deletion of the application Task/Work
+semantics. Source tests cover real Git and SQLite/D2 with controlled lower Agents;
+external checkpointer/extensions are isolated. No new Provider/audio, physical-device
+or full OS restart acceptance is implied. The complete LiveVoice integration audit
+and product closure remain partial. Companion Host pins .9 and repairs the stale
+editable SDK version in uv.lock; transitive dependency resolution is not claimed.
+
+
+Final .9 boundary evidence: SDK 44 passed (39.49s), existing native API 10 passed
+(2.32s), Host project regressions 21 passed (50.71s), lazy Host/factory checks4
+(14.64s), real Host/D2 checks2 (13.54s). Counts are distinct within those groups;
+later focused checks/installed probes overlap and are not added as new coverage.
+The 21-test run preceded restoring the old standalone dispatch exception behavior;
+the affected cancellation/acquisition paths are rechecked separately in evidence.
+Independent review findings were fixed; final scoped Ruff/diff/link checks pass,
+with six pre-existing AgentServer lint findings verified unchanged against HEAD.
+
+Clean paired wheels were built and installed in an isolated temporary target.
+All1016 Host and2409 SDK Python files match current source bytes;25 installed
+scenarios pass, including actual D2 facts, project files and native lifecycle.
+The initial probe's test-support import setup failed before scenarios; corrected
+test-only namespaces ran without importing production source outside the installed
+target. No whole-environment dependency resolution or deployment was performed.
+The SDK source was rebuilt after restoring standalone exception compatibility;
+only the final .9 wheel SHA in evidence is accepted. Full goal remains partial.

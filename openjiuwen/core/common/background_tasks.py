@@ -59,6 +59,15 @@ class BackgroundTask:
             return self._asyncio_task.done()
         return False
 
+    @property
+    def is_settled(self) -> bool:
+        """Physical owner completion, including native terminal callbacks."""
+        if self._creation_error is not None:
+            return True
+        if self._manager_task is not None:
+            return self._manager_task.is_settled
+        return self._asyncio_task is not None and self._asyncio_task.done()
+
     async def wait(self) -> Any:
         await self._ready.wait()
         if self._creation_error is not None:

@@ -34,6 +34,8 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any, Protocol
 
+import anyio
+
 from openjiuwen.core.application.tasks.durability.durability_authority import (
     DurabilityMutationAuthorization,
     _durability_authorization_payload_digest,
@@ -88,6 +90,9 @@ from openjiuwen.core.application.tasks.formal_task_models import (
     utc_now,
 )
 from openjiuwen.core.application.tasks.task_store import SqliteTaskStore
+from openjiuwen.core.common.task_manager.context import _current_task_id, reset_task_group, set_task_group
+from openjiuwen.core.common.task_manager.manager import get_task_manager
+from openjiuwen.core.common.task_manager.task import Task as NativeTask
 
 from .contracts import (
     Assurance,
@@ -2924,6 +2929,7 @@ class DirectProjectCodeExecutorAdapter:
         stream_observer: DirectStreamObserver | None = None,
         durability_store: SqliteTaskStore | None = None,
         application: ProjectExecutionApplication,
+        task_group_provider: Callable[[], Awaitable[anyio.abc.TaskGroup | None]] | None = None,
     ) -> None:
         if (
             isinstance(heartbeat_interval, bool)
@@ -2967,6 +2973,7 @@ class DirectProjectCodeExecutorAdapter:
         ).resolve(strict=False):
             raise ValueError("durability_store must use the same canonical Direct journal database")
         self._application = application
+        self._task_group_provider = task_group_provider
         self._resolver = resolver
         self._journal = _DirectProjectAttemptJournal(database)
         self._durability_store = durability_store
@@ -2980,7 +2987,7 @@ class DirectProjectCodeExecutorAdapter:
         self._stream_observer_lock = RLock() if stream_observer is not None else None
         self._stream_observer_failure_count = 0
         self._owner_id = f"direct-project-executor-{uuid.uuid4().hex}"
-        self._running: dict[str, asyncio.Task[None]] = {}
+        self._running: dict[str, asyncio.Task[None] | NativeTask] = {}
         self._applying: set[str] = set()
         self._interruptions: dict[str, tuple[str, str]] = {}
         self._retained_worktree_cleanups: dict[str, _RetainedAttemptCleanup] = {}
@@ -3061,7 +3068,7 @@ class DirectProjectCodeExecutorAdapter:
     def has_live_workers(self) -> bool:
         """Report whether an attempt can still touch its isolated checkout."""
 
-        return any(not worker.done() for worker in self._running.values())
+        return any(not self._worker_done(worker) for worker in self._running.values())
 
     @classmethod
     def durability_profile_binding(cls, selection: PersistedExecutorSelection) -> DurabilityProfileBinding:
@@ -4400,7 +4407,7 @@ class DirectProjectCodeExecutorAdapter:
         if self._closed:
             return _verdict(ready=False, reason="EXECUTOR_CLOSED")
         worker = self._running.get(attempt_id)
-        if worker is not None and not worker.done():
+        if worker is not None and not self._worker_done(worker):
             return _verdict(ready=False, reason="ATTEMPT_WORKER_LIVE")
         if attempt_id in self._applying:
             return _verdict(ready=False, reason="ATTEMPT_APPLY_IN_PROGRESS")
@@ -4539,8 +4546,19 @@ class DirectProjectCodeExecutorAdapter:
 
     @profiled("executor.dispatch", "item")
     async def dispatch(self, item: PersistentOutboxItem) -> ExecutorDeliveryResult:
-        async with self._lifecycle_lock:
-            return await self._dispatch(item)
+        await self._lifecycle_lock.acquire()
+        locked = True
+
+        def handoff():
+            nonlocal locked
+            if locked:
+                locked = False
+                self._lifecycle_lock.release()
+
+        try:
+            return await self._dispatch(item, handoff=handoff)
+        finally:
+            handoff()
 
     def _require_project_available(self, item: PersistentOutboxItem, root: Path) -> None:
         """Defer before inspecting a project still owned by an earlier attempt.
@@ -4581,7 +4599,7 @@ class DirectProjectCodeExecutorAdapter:
                 ErrorCode.UNAVAILABLE,
             )
 
-    async def _dispatch(self, item: PersistentOutboxItem) -> ExecutorDeliveryResult:
+    async def _dispatch(self, item: PersistentOutboxItem, *, handoff: Callable[[], None]) -> ExecutorDeliveryResult:
         self._require_item(item, expected_kind=OutboxKind.ATTEMPT_DISPATCH)
         self._selection_binding(item.selection, require_current_profile=True)
         self._d2_binding_for_item(item)
@@ -4634,6 +4652,7 @@ class DirectProjectCodeExecutorAdapter:
             )
 
         await asyncio.to_thread(self._require_project_available, item, root)
+        task_group = await self._task_group_provider() if self._task_group_provider is not None else None
         before_tree = await asyncio.to_thread(_project_tree_fingerprint, root)
         before_content = await asyncio.to_thread(_project_content_fingerprint, root)
         before_head = await asyncio.to_thread(_git_head, root)
@@ -4644,8 +4663,52 @@ class DirectProjectCodeExecutorAdapter:
         worker_owns_release = False
         ownership: _AttemptOwnershipLock | None = None
         worker_owns_ownership = False
-        worker: asyncio.Task[None] | None = None
+        worker: asyncio.Task[None] | NativeTask | None = None
         worker_started = asyncio.Event()
+        body_entered = False
+
+        async def run_owned_attempt():
+            nonlocal body_entered
+            if item.attempt_id in self._interruptions:
+                return
+            body_entered = True
+            await self._run_attempt(item, binding, release, worker_started, ownership)
+
+        def scheduled(native):
+            nonlocal worker, worker_owns_release, worker_owns_ownership
+            worker = native
+            self._running[item.attempt_id] = native
+            worker_owns_release = worker_owns_ownership = True
+            # Creation observers may await execution, which itself uses this
+            # lock for adjustment cutoff/cleanup. The exact owner is published
+            # before releasing admission; observers must not hold that lock.
+            handoff()
+
+        async def finalize(native):
+            try:
+                if not body_entered:
+                    raw_status, error = self._interruptions.get(
+                        item.attempt_id, ("startup_failed", "EXECUTOR_STARTUP_FAILED")
+                    )
+                    await asyncio.to_thread(
+                        self._journal.finish, item.attempt_id, owner_id=self._owner_id,
+                        outcome=(TerminalOutcome.CANCELLED if error.startswith("TASK_CANCEL_ACKNOWLEDGED")
+                                 else TerminalOutcome.INTERRUPTED),
+                        raw_status=raw_status, summary=None, error=error, now=self._clock(),
+                    )
+            finally:
+                try:
+                    if not body_entered:
+                        try:
+                            if release is not None:
+                                release()
+                        finally:
+                            ownership.release()
+                finally:
+                    worker_started.set()
+                    if self._running.get(item.attempt_id) is native:
+                        self._running.pop(item.attempt_id, None)
+                    self._interruptions.pop(item.attempt_id, None)
         try:
             binding.validate(item.spec, for_dispatch=True)
             assert binding.dispatch_fence is not None
@@ -4723,20 +4786,36 @@ class DirectProjectCodeExecutorAdapter:
                     "direct Executor attempt is unavailable",
                     ErrorCode.NOT_FOUND,
                 )
-            worker = asyncio.create_task(
-                self._run_attempt(
-                    item,
-                    binding,
-                    release,
-                    worker_started,
-                    ownership,
-                ),
-                name=f"live-voice-d0-project-{item.attempt_id}",
-            )
-            self._running[item.attempt_id] = worker
-            worker.add_done_callback(partial(self._settle_worker, item.attempt_id))
-            worker_owns_release = True
-            worker_owns_ownership = True
+            if task_group is None:
+                worker = asyncio.create_task(
+                    self._run_attempt(item, binding, release, worker_started, ownership),
+                    name=f"application-project-{item.attempt_id}",
+                )
+                self._running[item.attempt_id] = worker
+                worker.add_done_callback(partial(self._settle_worker, item.attempt_id))
+                worker_owns_release = worker_owns_ownership = True
+            else:
+                group_token = set_task_group(task_group)
+                parent_token = _current_task_id.set(None)
+                coro = run_owned_attempt()
+                try:
+                    await get_task_manager().create_task(
+                        coro, name=f"application-project-{item.attempt_id}",
+                        group="application-project", catch_exceptions=True,
+                        on_scheduled=scheduled, finalizer=finalize,
+                    )
+                except BaseException:
+                    if worker is None:
+                        coro.close()
+                    elif not self._worker_done(worker):
+                        self._interruptions.setdefault(
+                            item.attempt_id, ("dispatch_interrupted", "EXECUTOR_DISPATCH_INTERRUPTED")
+                        )
+                        self._cancel_worker(worker)
+                    raise
+                finally:
+                    _current_task_id.reset(parent_token)
+                    reset_task_group(group_token)
             await worker_started.wait()
             current = await asyncio.to_thread(self._journal.get, item.attempt_id)
             assert current is not None
@@ -4751,17 +4830,18 @@ class DirectProjectCodeExecutorAdapter:
                     "dispatch_interrupted",
                     "EXECUTOR_DISPATCH_INTERRUPTED",
                 )
-                worker.cancel()
-                done, _pending = await asyncio.wait(
+                self._cancel_worker(worker)
+                done, _pending = await self._wait_workers(
                     {worker},
                     timeout=self._cancel_timeout,
                 )
                 for settled in done:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
-                        settled.result()
+                        self._worker_result(settled)
             current = await asyncio.to_thread(self._journal.get, item.attempt_id)
             if (
-                current is not None
+                not isinstance(worker, NativeTask)
+                and current is not None
                 and current.state is not FormalAttemptState.TERMINAL
                 and current.owner_id == self._owner_id
             ):
@@ -4779,7 +4859,8 @@ class DirectProjectCodeExecutorAdapter:
         except Exception:
             current = await asyncio.to_thread(self._journal.get, item.attempt_id)
             if (
-                current is not None
+                not isinstance(worker, NativeTask)
+                and current is not None
                 and current.state is not FormalAttemptState.TERMINAL
                 and current.owner_id == self._owner_id
             ):
@@ -5101,14 +5182,15 @@ class DirectProjectCodeExecutorAdapter:
             record = await asyncio.to_thread(self._journal.get, item.attempt_id)
             assert record is not None
             target_root = Path(record.project_root)
-            created_parent, created_worktree = await asyncio.to_thread(
-                _create_attempt_worktree,
-                target_root,
-                item.attempt_id,
-                record.before_head,
-            )
-            worktree_parent = created_parent
-            worktree = created_worktree
+            with anyio.CancelScope(shield=True):
+                created_parent, created_worktree = await asyncio.to_thread(
+                    _create_attempt_worktree,
+                    target_root,
+                    item.attempt_id,
+                    record.before_head,
+                )
+                worktree_parent = created_parent
+                worktree = created_worktree
             # Publish the checkout owner before the deadline watchdog may
             # cancel this coroutine.  A cancelled ``to_thread`` cannot stop a
             # Git subprocess, so starting earlier could strand an unowned
@@ -5117,12 +5199,14 @@ class DirectProjectCodeExecutorAdapter:
                 self._heartbeat(item.attempt_id),
                 name=f"live-voice-d0-heartbeat-{item.attempt_id}",
             )
-            await asyncio.to_thread(
-                _seed_attempt_worktree,
-                target_root,
-                created_worktree,
-                record.before_tree,
-            )
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            with anyio.CancelScope(shield=True):
+                await asyncio.to_thread(
+                    _seed_attempt_worktree,
+                    target_root,
+                    created_worktree,
+                    record.before_tree,
+                )
             await asyncio.to_thread(_reject_git_visible_symlinks, created_worktree)
             seeded_support = await asyncio.to_thread(_target_support_fingerprints, created_worktree)
             if await asyncio.to_thread(
@@ -5336,207 +5420,219 @@ class DirectProjectCodeExecutorAdapter:
                 before_head=record.before_head,
                 protected_support=before_support,
             )
-            durable_effect = await self._prepare_d2_project_effect(
-                item=item,
-                record=record,
-                patch=patch,
-                expected_tree=expected_tree,
-                before_support=before_support,
-                result_text=(chat_final if result_artifacts else None),
-                result_artifacts=(result_artifacts if chat_final is not None else ()),
-                file_plan=frozen_file_plan,
-            )
-            reserved, completion_record = await asyncio.to_thread(
-                self._journal.reserve_completion,
-                item.attempt_id,
-                owner_id=self._owner_id,
-                expected_tree=expected_tree,
-                now=self._clock(),
-                result_text=(chat_final if result_artifacts else None),
-                result_artifacts=(result_artifacts if chat_final is not None else ()),
-            )
-            if not reserved:
-                if completion_record.state is FormalAttemptState.TERMINAL:
-                    return
-                await asyncio.to_thread(
-                    self._journal.finish,
-                    item.attempt_id,
-                    owner_id=self._owner_id,
-                    cleanup_pending=worktree is not None,
-                    outcome=TerminalOutcome.CANCELLED,
-                    raw_status="cancelled",
-                    summary=None,
-                    error="TASK_CANCEL_ACKNOWLEDGED",
-                    now=self._clock(),
-                )
-                return
-            self._applying.add(item.attempt_id)
-            try:
-                durable_external_call_started = durable_effect is not None
-                await asyncio.to_thread(
-                    _apply_attempt_patch,
-                    target_root,
-                    patch,
+            with anyio.CancelScope(shield=True):
+                durable_effect = await self._prepare_d2_project_effect(
+                    item=item,
+                    record=record,
+                    patch=patch,
                     expected_tree=expected_tree,
-                    before_tree=record.before_tree,
-                    before_head=record.before_head,
-                    protected_support=before_support,
+                    before_support=before_support,
+                    result_text=(chat_final if result_artifacts else None),
+                    result_artifacts=(result_artifacts if chat_final is not None else ()),
                     file_plan=frozen_file_plan,
                 )
-                if result_artifacts:
-                    applied_artifacts = await asyncio.to_thread(
-                        _applied_result_artifacts,
-                        target_root,
-                        result_artifacts,
-                    )
-                    await asyncio.to_thread(
-                        self._journal.seal_applied_result,
-                        item.attempt_id,
-                        owner_id=self._owner_id,
-                        result_artifacts=applied_artifacts,
-                        now=self._clock(),
-                    )
-                await self._settle_d2_project_effect(
-                    item=item,
-                    binding=durable_effect,
-                    expected_tree=expected_tree,
-                )
-            finally:
-                self._applying.discard(item.attempt_id)
-            completion_pending = True
-        except asyncio.CancelledError:
-            worker_cancelled = True
-            interruption = self._interruptions.get(item.attempt_id)
-            raw_status, error = interruption if interruption is not None else ("cancelled", "TASK_CANCEL_ACKNOWLEDGED")
-            user_cancel = error.startswith("TASK_CANCEL_ACKNOWLEDGED")
-            await asyncio.to_thread(
-                self._journal.finish,
-                item.attempt_id,
-                owner_id=self._owner_id,
-                cleanup_pending=worktree is not None,
-                outcome=(TerminalOutcome.CANCELLED if user_cancel else TerminalOutcome.INTERRUPTED),
-                raw_status=raw_status,
-                summary=None,
-                error=error,
-                now=self._clock(),
-            )
-            raise
-        except Exception as error:  # noqa: BLE001 -- persist stable terminal truth
-            if durable_external_call_started:
-                await asyncio.to_thread(
-                    self._journal.finish,
+            # Preparing durable intent does not win completion. Cancellation
+            # observed before the reserve/apply critical section forbids apply.
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            with anyio.CancelScope(shield=True):
+                reserved, completion_record = await asyncio.to_thread(
+                    self._journal.reserve_completion,
                     item.attempt_id,
                     owner_id=self._owner_id,
-                    cleanup_pending=worktree is not None,
-                    outcome=TerminalOutcome.INTERRUPTED,
-                    raw_status="effect_ack_unknown",
-                    summary=None,
-                    error="DURABILITY_EFFECT_ACK_UNKNOWN",
+                    expected_tree=expected_tree,
                     now=self._clock(),
+                    result_text=(chat_final if result_artifacts else None),
+                    result_artifacts=(result_artifacts if chat_final is not None else ()),
                 )
-                return
-            code = error.reason if isinstance(error, FormalTaskViolation) else str(error)
-            if code.startswith("EXECUTION_TARGET_NOT_BOUND:"):
-                code = "EXECUTION_TARGET_NOT_BOUND"
-            if code not in {
-                "EXECUTION_TARGET_NOT_BOUND",
-                "EXECUTOR_CAPABILITY_UNAVAILABLE",
-                "EXECUTOR_INITIALIZATION_FAILED",
-                "EXECUTOR_INITIALIZATION_MUTATED_TARGET",
-                "PROJECT_AGENT_CLEANUP_PENDING",
-                "PROJECT_EXECUTOR_AGENT_ERROR",
-                "BACKGROUND_TASK_READ_NO_PROGRESS",
-                "PROJECT_EXECUTOR_INCOMPLETE",
-                "FORBIDDEN_GIT_HEAD_CHANGE",
-                "RUNTIME_SUPPORT_PATH_MUTATED",
-                "NO_EFFECTIVE_TARGET_CHANGE",
-                "PROJECT_WORKTREE_UNAVAILABLE",
-                "PROJECT_WORKTREE_BASELINE_MISMATCH",
-                "PROJECT_CHANGE_CAPTURE_FAILED",
-                "PROJECT_CHANGE_APPLICATION_FAILED",
-                "PROJECT_CHANGE_ATTRIBUTION_FAILED",
-                "EXECUTION_TARGET_CHANGED_DURING_ATTEMPT",
-                "PROJECT_WORKTREE_CLEANUP_PENDING",
-                "PROJECT_WORKTREE_CLEANUP_TARGET_UNSAFE",
-                "EXECUTION_TARGET_SYMLINK_UNSAFE",
-                "TASK_ADJUSTMENT_REJECTED",
-            }:
-                code = "PROJECT_EXECUTOR_FAILED"
-            await asyncio.to_thread(
-                self._journal.finish,
-                item.attempt_id,
-                owner_id=self._owner_id,
-                cleanup_pending=worktree is not None,
-                outcome=TerminalOutcome.FAILED,
-                raw_status="failed",
-                summary=None,
-                error=code,
-                now=self._clock(),
-            )
-        finally:
-            started.set()
-            file_plan = self._file_plan_sessions.pop(item.attempt_id, None)
-            if file_plan is not None:
-                await file_plan.close()
-            await self._reject_runtime_adjustments(
-                item.attempt_id,
-                adjustment_checkpoint,
-            )
-            if heartbeat is not None:
-                heartbeat.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await heartbeat
-            if worktree_parent is not None and worktree is not None:
-                cleanup = _RetainedAttemptCleanup(
-                    root=Path(binding.effective_execution_root),
-                    parent=worktree_parent,
-                    worktree=worktree,
-                    ownership=ownership,
-                    completion_pending=completion_pending,
-                    agent_release=attempt_agent_release,
-                    agent_acquire=attempt_agent_acquire,
-                )
-                # Publish cleanup ownership before the first await.  A caller
-                # cancellation may leave the coordinator running, but can never
-                # make the checkout appear orphaned and therefore deletable.
-                self._retained_worktree_cleanups[item.attempt_id] = cleanup
-                completion_pending = False
-                cleanup_cancellation: asyncio.CancelledError | None = None
-                try:
-                    coordinator = self._ensure_attempt_cleanup_coordinator(
-                        item.attempt_id,
-                        cleanup,
-                    )
-                    await asyncio.shield(coordinator)
-                except asyncio.CancelledError as exc:
-                    cleanup_cancellation = exc
-                except Exception:
-                    pass
-                else:
-                    self._retained_worktree_cleanups.pop(item.attempt_id, None)
-                if item.attempt_id in self._retained_worktree_cleanups:
-                    await asyncio.to_thread(
-                        self._journal.mark_cleanup_pending,
-                        item.attempt_id,
-                    )
-                    if cleanup_cancellation is not None and not worker_cancelled:
-                        raise cleanup_cancellation
-            else:
-                if completion_pending:
+                if not reserved:
+                    if completion_record.state is FormalAttemptState.TERMINAL:
+                        return
                     await asyncio.to_thread(
                         self._journal.finish,
                         item.attempt_id,
                         owner_id=self._owner_id,
-                        outcome=TerminalOutcome.COMPLETED,
-                        raw_status="completed",
-                        summary=("project Code Agent completed with a Git-visible target change"),
-                        error=None,
+                        cleanup_pending=worktree is not None,
+                        outcome=TerminalOutcome.CANCELLED,
+                        raw_status="cancelled",
+                        summary=None,
+                        error="TASK_CANCEL_ACKNOWLEDGED",
                         now=self._clock(),
                     )
+                    return
+                self._applying.add(item.attempt_id)
+                try:
+                    durable_external_call_started = durable_effect is not None
+                    await asyncio.to_thread(
+                        _apply_attempt_patch,
+                        target_root,
+                        patch,
+                        expected_tree=expected_tree,
+                        before_tree=record.before_tree,
+                        before_head=record.before_head,
+                        protected_support=before_support,
+                        file_plan=frozen_file_plan,
+                    )
+                    if result_artifacts:
+                        applied_artifacts = await asyncio.to_thread(
+                            _applied_result_artifacts,
+                            target_root,
+                            result_artifacts,
+                        )
+                        await asyncio.to_thread(
+                            self._journal.seal_applied_result,
+                            item.attempt_id,
+                            owner_id=self._owner_id,
+                            result_artifacts=applied_artifacts,
+                            now=self._clock(),
+                        )
+                    await self._settle_d2_project_effect(
+                        item=item,
+                        binding=durable_effect,
+                        expected_tree=expected_tree,
+                    )
+                finally:
+                    self._applying.discard(item.attempt_id)
+                completion_pending = True
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                worker_cancelled = True
+                interruption = self._interruptions.get(item.attempt_id)
+                if interruption is None and isinstance(self._running.get(item.attempt_id), NativeTask):
+                    interruption = ("interrupted", "EXECUTOR_NATIVE_OWNER_INTERRUPTED")
+                raw_status, error = (
+                    interruption if interruption is not None else ("cancelled", "TASK_CANCEL_ACKNOWLEDGED")
+                )
+                user_cancel = error.startswith("TASK_CANCEL_ACKNOWLEDGED")
+                await asyncio.to_thread(
+                    self._journal.finish,
+                    item.attempt_id,
+                    owner_id=self._owner_id,
+                    cleanup_pending=worktree is not None,
+                    outcome=(TerminalOutcome.CANCELLED if user_cancel else TerminalOutcome.INTERRUPTED),
+                    raw_status=raw_status,
+                    summary=None,
+                    error=error,
+                    now=self._clock(),
+                )
+                raise
+        except Exception as error:  # noqa: BLE001 -- persist stable terminal truth
+            with anyio.CancelScope(shield=True):
+                if durable_external_call_started:
+                    await asyncio.to_thread(
+                        self._journal.finish,
+                        item.attempt_id,
+                        owner_id=self._owner_id,
+                        cleanup_pending=worktree is not None,
+                        outcome=TerminalOutcome.INTERRUPTED,
+                        raw_status="effect_ack_unknown",
+                        summary=None,
+                        error="DURABILITY_EFFECT_ACK_UNKNOWN",
+                        now=self._clock(),
+                    )
+                    return
+                code = error.reason if isinstance(error, FormalTaskViolation) else str(error)
+                if code.startswith("EXECUTION_TARGET_NOT_BOUND:"):
+                    code = "EXECUTION_TARGET_NOT_BOUND"
+                if code not in {
+                    "EXECUTION_TARGET_NOT_BOUND",
+                    "EXECUTOR_CAPABILITY_UNAVAILABLE",
+                    "EXECUTOR_INITIALIZATION_FAILED",
+                    "EXECUTOR_INITIALIZATION_MUTATED_TARGET",
+                    "PROJECT_AGENT_CLEANUP_PENDING",
+                    "PROJECT_EXECUTOR_AGENT_ERROR",
+                    "BACKGROUND_TASK_READ_NO_PROGRESS",
+                    "PROJECT_EXECUTOR_INCOMPLETE",
+                    "FORBIDDEN_GIT_HEAD_CHANGE",
+                    "RUNTIME_SUPPORT_PATH_MUTATED",
+                    "NO_EFFECTIVE_TARGET_CHANGE",
+                    "PROJECT_WORKTREE_UNAVAILABLE",
+                    "PROJECT_WORKTREE_BASELINE_MISMATCH",
+                    "PROJECT_CHANGE_CAPTURE_FAILED",
+                    "PROJECT_CHANGE_APPLICATION_FAILED",
+                    "PROJECT_CHANGE_ATTRIBUTION_FAILED",
+                    "EXECUTION_TARGET_CHANGED_DURING_ATTEMPT",
+                    "PROJECT_WORKTREE_CLEANUP_PENDING",
+                    "PROJECT_WORKTREE_CLEANUP_TARGET_UNSAFE",
+                    "EXECUTION_TARGET_SYMLINK_UNSAFE",
+                    "TASK_ADJUSTMENT_REJECTED",
+                }:
+                    code = "PROJECT_EXECUTOR_FAILED"
+                await asyncio.to_thread(
+                    self._journal.finish,
+                    item.attempt_id,
+                    owner_id=self._owner_id,
+                    cleanup_pending=worktree is not None,
+                    outcome=TerminalOutcome.FAILED,
+                    raw_status="failed",
+                    summary=None,
+                    error=code,
+                    now=self._clock(),
+                )
+        finally:
+            with anyio.CancelScope(shield=True):
+                started.set()
+                file_plan = self._file_plan_sessions.pop(item.attempt_id, None)
+                if file_plan is not None:
+                    await file_plan.close()
+                await self._reject_runtime_adjustments(
+                    item.attempt_id,
+                    adjustment_checkpoint,
+                )
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await heartbeat
+                if worktree_parent is not None and worktree is not None:
+                    cleanup = _RetainedAttemptCleanup(
+                        root=Path(binding.effective_execution_root),
+                        parent=worktree_parent,
+                        worktree=worktree,
+                        ownership=ownership,
+                        completion_pending=completion_pending,
+                        agent_release=attempt_agent_release,
+                        agent_acquire=attempt_agent_acquire,
+                    )
+                    # Publish cleanup ownership before the first await.  A caller
+                    # cancellation may leave the coordinator running, but can never
+                    # make the checkout appear orphaned and therefore deletable.
+                    self._retained_worktree_cleanups[item.attempt_id] = cleanup
                     completion_pending = False
-                ownership.release()
-            if release is not None:
-                release()
+                    cleanup_cancellation: asyncio.CancelledError | None = None
+                    try:
+                        coordinator = self._ensure_attempt_cleanup_coordinator(
+                            item.attempt_id,
+                            cleanup,
+                        )
+                        await asyncio.shield(coordinator)
+                    except asyncio.CancelledError as exc:
+                        cleanup_cancellation = exc
+                    except Exception:
+                        pass
+                    else:
+                        self._retained_worktree_cleanups.pop(item.attempt_id, None)
+                    if item.attempt_id in self._retained_worktree_cleanups:
+                        await asyncio.to_thread(
+                            self._journal.mark_cleanup_pending,
+                            item.attempt_id,
+                        )
+                        if cleanup_cancellation is not None and not worker_cancelled:
+                            raise cleanup_cancellation
+                else:
+                    if completion_pending:
+                        await asyncio.to_thread(
+                            self._journal.finish,
+                            item.attempt_id,
+                            owner_id=self._owner_id,
+                            outcome=TerminalOutcome.COMPLETED,
+                            raw_status="completed",
+                            summary=("project Code Agent completed with a Git-visible target change"),
+                            error=None,
+                            now=self._clock(),
+                        )
+                        completion_pending = False
+                    ownership.release()
+                if release is not None:
+                    release()
 
     async def _heartbeat(self, attempt_id: str) -> None:
         try:
@@ -5554,8 +5650,8 @@ class DirectProjectCodeExecutorAdapter:
                         ("attempt_timeout", "EXECUTOR_ATTEMPT_TIMEOUT"),
                     )
                     task = self._running.get(attempt_id)
-                    if task is not None and not task.done() and task.cancelling() == 0:
-                        task.cancel()
+                    if task is not None and not self._worker_done(task) and not self._worker_cancelling(task):
+                        self._cancel_worker(task)
                     return
                 if not active:
                     return
@@ -5572,8 +5668,8 @@ class DirectProjectCodeExecutorAdapter:
                         ("cancelled", "TASK_CANCEL_ACKNOWLEDGED"),
                     )
                     task = self._running.get(attempt_id)
-                    if task is not None and not task.done() and task.cancelling() == 0:
-                        task.cancel()
+                    if task is not None and not self._worker_done(task) and not self._worker_cancelling(task):
+                        self._cancel_worker(task)
                     return
         except asyncio.CancelledError:
             raise
@@ -5583,15 +5679,62 @@ class DirectProjectCodeExecutorAdapter:
                 ("heartbeat_interrupted", "EXECUTOR_HEARTBEAT_FAILED"),
             )
             task = self._running.get(attempt_id)
-            if task is not None and not task.done():
-                task.cancel()
+            if task is not None and not self._worker_done(task):
+                self._cancel_worker(task)
+
+    @staticmethod
+    def _worker_done(task):
+        return task.is_settled if isinstance(task, NativeTask) else task.done()
+
+    @staticmethod
+    def _worker_cancelling(task):
+        if isinstance(task, NativeTask):
+            scope = task.get_cancel_scope()
+            return scope is not None and scope.cancel_called
+        return task.cancelling() != 0
+
+    @staticmethod
+    def _cancel_worker(task):
+        if isinstance(task, NativeTask):
+            task.abort(reason="project_attempt_interrupted")
+        else:
+            task.cancel()
+
+    @staticmethod
+    def _worker_result(task):
+        if isinstance(task, NativeTask):
+            if task.exception is not None:
+                raise task.exception
+            return task.result
+        return task.result()
+
+    @staticmethod
+    async def _wait_workers(tasks, *, timeout):
+        # Waiters never own execution: cancelling a timeout observer must not
+        # cancel a native attempt while it owns a non-interruptible file write.
+        async def observe(task):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task.wait()
+
+        waiters = {
+            (asyncio.create_task(observe(task)) if isinstance(task, NativeTask) else task): task
+            for task in tasks
+        }
+        try:
+            done, pending = await asyncio.wait(waiters, timeout=timeout)
+            return {waiters[task] for task in done}, {waiters[task] for task in pending}
+        finally:
+            observers = [waiter for waiter, task in waiters.items() if isinstance(task, NativeTask)]
+            for waiter in observers:
+                waiter.cancel()
+            await asyncio.gather(*observers, return_exceptions=True)
 
     def _settle_worker(self, attempt_id: str, task: asyncio.Task[None]) -> None:
         if self._running.get(attempt_id) is task:
             self._running.pop(attempt_id, None)
         self._interruptions.pop(attempt_id, None)
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            task.result()
+            self._worker_result(task)
 
     @staticmethod
     def _adjustment_delivery(
@@ -5636,7 +5779,7 @@ class DirectProjectCodeExecutorAdapter:
                 or checkpoint is None
                 or not checkpoint.accepting
                 or worker is None
-                or worker.done()
+                or self._worker_done(worker)
             ):
                 rejected = await asyncio.to_thread(
                     self._journal.finish_adjustment,
@@ -5714,7 +5857,7 @@ class DirectProjectCodeExecutorAdapter:
                 selection=item.selection,
             )
         if record.raw_status == "applying":
-            done, _ = await asyncio.wait({task}, timeout=self._cancel_timeout)
+            done, _ = await self._wait_workers({task}, timeout=self._cancel_timeout)
             if not done:
                 raise FormalTaskViolation(
                     "EXECUTOR_CANCEL_PENDING",
@@ -5732,9 +5875,9 @@ class DirectProjectCodeExecutorAdapter:
             item.attempt_id,
             ("cancelled", "TASK_CANCEL_ACKNOWLEDGED"),
         )
-        if not task.done() and task.cancelling() == 0:
-            task.cancel()
-        done, pending = await asyncio.wait({task}, timeout=self._cancel_timeout)
+        if not self._worker_done(task) and not self._worker_cancelling(task):
+            self._cancel_worker(task)
+        done, pending = await self._wait_workers({task}, timeout=self._cancel_timeout)
         if pending:
             await asyncio.to_thread(
                 self._journal.finish,
@@ -5748,7 +5891,7 @@ class DirectProjectCodeExecutorAdapter:
             )
         elif done:
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                task.result()
+                self._worker_result(task)
         refreshed = await asyncio.to_thread(self._journal.get, item.attempt_id)
         assert refreshed is not None
         return self._delivery(
@@ -5898,17 +6041,17 @@ class DirectProjectCodeExecutorAdapter:
                         "interrupted",
                         "EXECUTOR_SHUTDOWN_INTERRUPTED",
                     )
-                    if not task.done() and task.cancelling() == 0:
-                        task.cancel()
+                    if not self._worker_done(task) and not self._worker_cancelling(task):
+                        self._cancel_worker(task)
         applying_tasks = {task for attempt_id, task in tasks if attempt_id in applying}
         if applying_tasks:
-            done, pending = await asyncio.wait(
+            done, pending = await self._wait_workers(
                 applying_tasks,
                 timeout=self._close_timeout,
             )
             for task in done:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    task.result()
+                    self._worker_result(task)
             if pending:
                 # Applying a staged patch is intentionally not cancelled: a
                 # worker thread or Git subprocess cannot be stopped safely in
@@ -5923,7 +6066,7 @@ class DirectProjectCodeExecutorAdapter:
                 )
         non_applying_tasks = {task for attempt_id, task in tasks if attempt_id not in applying}
         if non_applying_tasks:
-            _done, pending = await asyncio.wait(
+            _done, pending = await self._wait_workers(
                 non_applying_tasks,
                 timeout=self._close_timeout,
             )
@@ -5950,7 +6093,7 @@ class DirectProjectCodeExecutorAdapter:
         cleanup_failures: list[str] = []
         for attempt_id, cleanup in tuple(self._retained_worktree_cleanups.items()):
             worker = self._running.get(attempt_id)
-            if worker is not None and not worker.done():
+            if worker is not None and not self._worker_done(worker):
                 cleanup_failures.append(attempt_id)
                 continue
             coordinator = self._ensure_attempt_cleanup_coordinator(
