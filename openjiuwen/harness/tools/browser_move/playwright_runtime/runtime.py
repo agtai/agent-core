@@ -462,6 +462,16 @@ class BrowserAgentRuntime:
         driver = getattr(self, "_driver", None)
         if driver is not None:
             return driver
+        if not self._uses_browser_driver():
+            # Reaching here means a BrowserDriver-only code path leaked onto the
+            # Playwright MCP path, which drives Chrome through the MCP server's
+            # own primitives and never builds a driver. Fail with the real cause
+            # instead of the registry's generic "unknown backend" error.
+            raise RuntimeError(
+                "_ensure_browser_driver() was called while the Playwright MCP "
+                "backend is active; this code path requires a BrowserDriver "
+                "backend (set BROWSER_DRIVER_BACKEND=browser_use)"
+            )
         from openjiuwen.harness.tools.browser_move.drivers.registry import create_browser_driver
 
         backend = resolve_browser_driver_backend(getattr(self, "_instance", None))
@@ -4276,11 +4286,9 @@ class BrowserRuntimeRail(AgentRail):
         # Helpers never have an MCP twin.
         if normalized in _BROWSER_RUNTIME_HELPER_TOOL_NAMES:
             return canonical
-        # Catalog tools stay bare on BrowserDriver; MCP path rewrites to mcp_*.
-        # browser_navigate is always bare (B4 local Tool on both paths).
+        # Catalog tools stay bare on BrowserDriver; MCP path rewrites to mcp_*
+        # so calls reach the MCP server's own primitives, as upstream does.
         if normalized in _BROWSER_CATALOG_RUNTIME_TOOL_NAMES:
-            if normalized == "browser_navigate":
-                return canonical
             uses_driver = getattr(self._runtime, "_uses_browser_driver", None)
             if callable(uses_driver) and uses_driver() is True:
                 return canonical
