@@ -13,6 +13,7 @@ from openjiuwen.core.application.tasks import PersistentTaskCore, SqliteTaskStor
 from openjiuwen.core.application.tasks.formal_task_models import (
     ExecutorDeliveryResult,
     FormalAttemptState,
+    FormalTaskViolation,
     TaskAuthorizationGrant,
 )
 from openjiuwen.core.application.tasks.source import (
@@ -87,10 +88,28 @@ def test_public_core_dispatch_reopen_and_wrong_scope(tmp_path):
     store = SqliteTaskStore(tmp_path / "tasks.db")
     executor = Executor()
     core = PersistentTaskCore(store, executor)
+    context = _context(tmp_path)
+    prepared = core.prepare_creation_spec(command, context, now=NOW)
+    # Selection preflight is not durable acceptance and cannot grant authority.
+    assert sum(store.counts().values()) == 0 and executor.calls == []
+    for invalid_payload in (
+        {**command.payload, "attributes": {"extra": "forbidden"}},
+        {**command.payload, "hidden": "forbidden"},
+        {**command.payload, "native_source": None},
+    ):
+        invalid = contracts.CommandEnvelope.from_dict({**command.to_dict(), "payload": invalid_payload})
+        with pytest.raises((FormalTaskViolation, TaskSourceError)):
+            core.prepare_creation_spec(invalid, context, now=NOW)
+        assert sum(store.counts().values()) == 0 and executor.calls == []
+    for invalid_context in (_context(tmp_path, _scope("other")), replace(context, expires_at=NOW)):
+        with pytest.raises(FormalTaskViolation):
+            core.prepare_creation_spec(command, invalid_context, now=NOW)
+        assert sum(store.counts().values()) == 0 and executor.calls == []
     rejected = core.execute(command, replace(grant, scope=_scope("other")), context=_context(tmp_path), now=NOW)
     assert not rejected.ok and executor.calls == []
     accepted = core.execute(command, grant, context=_context(tmp_path), now=NOW)
     assert accepted.ok and executor.calls == []  # Durable acceptance is not execution.
+    assert store.get_task(accepted.result["task_id"], _scope()).spec == prepared
     assert core.execute(command, grant, context=_context(tmp_path), now=NOW) == accepted
     asyncio.run(core.drain_outbox())
     assert len(executor.calls) == 1

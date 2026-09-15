@@ -493,3 +493,14 @@ test-only namespaces ran without importing production source outside the install
 target. No whole-environment dependency resolution or deployment was performed.
 The SDK source was rebuilt after restoring standalone exception compatibility;
 only the final .9 wheel SHA in evidence is accepted. Full goal remains partial.
+
+
+## Shared creation preparation (2026-09-15)
+
+`PersistentTaskCore.prepare_creation_spec(command, context, now=...)` is the pure
+creation input validator used by Host Executor selection and Core create/successor.
+It returns the immutable spec without writing Store rows or running an Executor.
+It grants no authority: execute still checks authorization, and Store performs
+transactional admission/revalidation. Host source evidence is registered through
+the existing SDK codec; Host no longer repeats the generic payload/source helpers.
+This removes duplicate creation validation, not the TaskStore state machine.

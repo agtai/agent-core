@@ -494,6 +494,87 @@ class PersistentTaskCore:
             except Exception:  # noqa: BLE001 -- evidence never owns Task truth
                 continue
 
+    def prepare_creation_spec(
+        self,
+        command: CommandEnvelope,
+        context: ResolvedTaskContext | None,
+        *,
+        now: str,
+    ) -> FormalTaskSpec:
+        """Validate creation input for selection and admission, without side effects.
+
+        This is not an authorization grant or acceptance receipt. execute still
+        authorizes the command and the Store revalidates its atomic admission.
+        """
+        from openjiuwen.core.application.tasks.source import require_payload_source, source_payload_fields
+
+        successor = command.command_type == "task.create_successor"
+        if not successor and command.command_type != "task.create":
+            raise FormalTaskViolation(
+                "INVALID_TASK_CREATE_INTENT",
+                "Executor selection requires a creation command",
+                ErrorCode.PROTOCOL_VIOLATION,
+            )
+        payload = command.payload
+        fields = self._SUCCESSOR_PAYLOAD if successor else self._CREATE_PAYLOAD
+        # Preserve Core's existing validation order for each public command.
+        if successor:
+            require_exact_payload(payload, source_payload_fields(payload, fields),
+                                  field_name="task.create_successor payload")
+        if context is None:
+            raise FormalTaskViolation(
+                "FORMAL_TASK_CONTEXT_REQUIRED",
+                "task.create_successor requires server-resolved context" if successor
+                else "task.create requires a server-resolved execution context",
+                ErrorCode.PERMISSION_DENIED,
+            )
+        context.require_usable(
+            scope=command.scope,
+            required_permissions=frozenset({"task.execute", "project.write"}),
+            destructive=True,
+            now=now,
+        )
+        if not successor:
+            require_exact_payload(payload, source_payload_fields(payload, fields), field_name="task.create payload")
+        attributes = payload["attributes"]
+        if type(attributes) is not dict or any(
+            type(key) is not str or type(value) is not str for key, value in attributes.items()
+        ):
+            raise FormalTaskViolation(
+                "INVALID_FORMAL_TASK_ATTRIBUTES",
+                "successor requires an exact resolved model binding" if successor
+                else "task attributes must be a string map",
+                ErrorCode.INVALID_ARGUMENT,
+            )
+        if set(attributes) != {"model_identity", "model_config_version"}:
+            raise FormalTaskViolation(
+                "INVALID_FORMAL_TASK_ATTRIBUTES",
+                "successor requires an exact resolved model binding" if successor
+                else "project Code Agent tasks require an exact resolved model binding",
+                ErrorCode.INVALID_ARGUMENT,
+            )
+        spec = FormalTaskSpec(
+            name=payload["name"], instruction=payload["instruction"],
+            origin=command.origin, context=context, executor_id=payload["executor_id"],
+            required_capabilities=tuple(command.required_capabilities),
+            side_effect_class=payload["side_effect_class"],
+            constraints=tuple(payload["constraints"]) if successor else (),
+            attributes=tuple(sorted(attributes.items())), native_source=require_payload_source(command),
+        )
+        if spec.executor_id != self.executor.executor_id:
+            raise FormalTaskViolation(
+                "EXECUTOR_CAPABILITY_UNAVAILABLE",
+                "requested Executor is not available in this Task Core",
+                ErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+        if spec.side_effect_class != "project_mutation":
+            raise FormalTaskViolation(
+                "EXECUTOR_SIDE_EFFECT_CLASS_MISMATCH",
+                "project Code Agent tasks require project_mutation side effects",
+                ErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+        return spec
+
     def execute(
         self,
         command: CommandEnvelope,
@@ -637,60 +718,7 @@ class PersistentTaskCore:
                     return self.store.reprioritize(command, observed_at=observed_at)
                 return self.store.decide_unsupported_control(command, observed_at=observed_at)
             if command.command_type == "task.create_successor":
-                from openjiuwen.core.application.tasks.source import require_payload_source, source_payload_fields
-
-                require_exact_payload(
-                    command.payload,
-                    source_payload_fields(command.payload, self._SUCCESSOR_PAYLOAD),
-                    field_name="task.create_successor payload",
-                )
-                if context is None:
-                    raise FormalTaskViolation(
-                        "FORMAL_TASK_CONTEXT_REQUIRED",
-                        "task.create_successor requires server-resolved context",
-                        ErrorCode.PERMISSION_DENIED,
-                    )
-                context.require_usable(
-                    scope=command.scope,
-                    required_permissions=frozenset({"task.execute", "project.write"}),
-                    destructive=True,
-                    now=observed_at,
-                )
-                attributes = command.payload["attributes"]
-                if (
-                    type(attributes) is not dict
-                    or set(attributes) != {"model_identity", "model_config_version"}
-                    or any(type(key) is not str or type(value) is not str for key, value in attributes.items())
-                ):
-                    raise FormalTaskViolation(
-                        "INVALID_FORMAL_TASK_ATTRIBUTES",
-                        "successor requires an exact resolved model binding",
-                        ErrorCode.INVALID_ARGUMENT,
-                    )
-                spec = FormalTaskSpec(
-                    name=command.payload["name"],
-                    instruction=command.payload["instruction"],
-                    origin=command.origin,
-                    context=context,
-                    executor_id=command.payload["executor_id"],
-                    required_capabilities=tuple(command.required_capabilities),
-                    side_effect_class=command.payload["side_effect_class"],
-                    constraints=tuple(command.payload["constraints"]),
-                    attributes=tuple(sorted(attributes.items())),
-                    native_source=require_payload_source(command),
-                )
-                if spec.executor_id != self.executor.executor_id:
-                    raise FormalTaskViolation(
-                        "EXECUTOR_CAPABILITY_UNAVAILABLE",
-                        "requested Executor is not available in this Task Core",
-                        ErrorCode.CAPABILITY_UNAVAILABLE,
-                    )
-                if spec.side_effect_class != "project_mutation":
-                    raise FormalTaskViolation(
-                        "EXECUTOR_SIDE_EFFECT_CLASS_MISMATCH",
-                        "project Code Agent tasks require project_mutation side effects",
-                        ErrorCode.CAPABILITY_UNAVAILABLE,
-                    )
+                spec = self.prepare_creation_spec(command, context, now=observed_at)
                 return self.store.create_successor(
                     command,
                     spec,
@@ -763,62 +791,7 @@ class PersistentTaskCore:
                     selection=selection,
                     admission_policy=selected_policy,
                 )
-            if context is None:
-                raise FormalTaskViolation(
-                    "FORMAL_TASK_CONTEXT_REQUIRED",
-                    "task.create requires a server-resolved execution context",
-                    ErrorCode.PERMISSION_DENIED,
-                )
-            context.require_usable(
-                scope=command.scope,
-                required_permissions=frozenset({"task.execute", "project.write"}),
-                destructive=True,
-                now=observed_at,
-            )
-            payload = command.payload
-            from openjiuwen.core.application.tasks.source import require_payload_source, source_payload_fields
-
-            require_exact_payload(
-                payload, source_payload_fields(payload, self._CREATE_PAYLOAD), field_name="task.create payload"
-            )
-            attributes = payload["attributes"]
-            if type(attributes) is not dict or any(
-                type(key) is not str or type(value) is not str for key, value in attributes.items()
-            ):
-                raise FormalTaskViolation(
-                    "INVALID_FORMAL_TASK_ATTRIBUTES",
-                    "task attributes must be a string map",
-                    ErrorCode.INVALID_ARGUMENT,
-                )
-            if set(attributes) != {"model_identity", "model_config_version"}:
-                raise FormalTaskViolation(
-                    "INVALID_FORMAL_TASK_ATTRIBUTES",
-                    "project Code Agent tasks require an exact resolved model binding",
-                    ErrorCode.INVALID_ARGUMENT,
-                )
-            spec = FormalTaskSpec(
-                name=payload["name"],
-                instruction=payload["instruction"],
-                origin=command.origin,
-                context=context,
-                executor_id=payload["executor_id"],
-                required_capabilities=tuple(command.required_capabilities),
-                side_effect_class=payload["side_effect_class"],
-                attributes=tuple(sorted(attributes.items())),
-                native_source=require_payload_source(command),
-            )
-            if spec.executor_id != self.executor.executor_id:
-                raise FormalTaskViolation(
-                    "EXECUTOR_CAPABILITY_UNAVAILABLE",
-                    "requested Executor is not available in this Task Core",
-                    ErrorCode.CAPABILITY_UNAVAILABLE,
-                )
-            if spec.side_effect_class != "project_mutation":
-                raise FormalTaskViolation(
-                    "EXECUTOR_SIDE_EFFECT_CLASS_MISMATCH",
-                    "project Code Agent tasks require project_mutation side effects",
-                    ErrorCode.CAPABILITY_UNAVAILABLE,
-                )
+            spec = self.prepare_creation_spec(command, context, now=observed_at)
             return self.store.create(
                 command,
                 spec,
