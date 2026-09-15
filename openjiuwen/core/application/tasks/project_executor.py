@@ -1283,48 +1283,13 @@ def _attempt_result_artifacts(worktree: Path) -> tuple[TaskResultArtifact, ...]:
     if not relative_paths or len(relative_paths) > 32:
         return ()
     root = worktree.resolve(strict=True)
-    artifacts: list[TaskResultArtifact] = []
     try:
-        for relative_path in relative_paths:
-            artifact = TaskResultArtifact(relative_path=relative_path, sha256="0" * 64)
-            candidate = (root / artifact.relative_path).resolve(strict=True)
-            candidate.relative_to(root)
-            if not candidate.is_file() or candidate.is_symlink():
-                return ()
-            digest = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(64 * 1024), b""):
-                    digest.update(chunk)
-            artifacts.append(
-                TaskResultArtifact(
-                    relative_path=artifact.relative_path,
-                    sha256=digest.hexdigest(),
-                )
-            )
+        return _applied_result_artifacts(
+            root,
+            tuple(TaskResultArtifact(relative_path=path, sha256="0" * 64) for path in relative_paths),
+        )
     except (FormalTaskViolation, OSError, RuntimeError, UnicodeDecodeError, ValueError):
         return ()
-    return tuple(artifacts)
-
-
-def _applied_artifacts_match(root: Path, artifacts: tuple[TaskResultArtifact, ...]) -> bool:
-    if not artifacts:
-        return False
-    canonical_root = root.resolve(strict=True)
-    try:
-        for artifact in artifacts:
-            candidate = (canonical_root / artifact.relative_path).resolve(strict=True)
-            candidate.relative_to(canonical_root)
-            if not candidate.is_file() or candidate.is_symlink():
-                return False
-            digest = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(64 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != artifact.sha256:
-                return False
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return True
 
 
 def _applied_result_artifacts(root: Path, artifacts: tuple[TaskResultArtifact, ...]) -> tuple[TaskResultArtifact, ...]:

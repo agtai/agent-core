@@ -7,6 +7,14 @@ run through the existing TaskManager under the consuming Host Runner root. Their
 durable business state remains in the application stores. Controller, TeamAgent
 and Harness task APIs retain their own semantics and existing consumers.
 
+The 2026-09-15 management review does not consider that execution wiring a
+completed management unification. Work now delegates native settlement to
+TaskManager's existing finalizer, removing its separate native-completion watcher.
+Its asyncio Future is only a predecessor/shutdown waiting adapter. Formal Task
+artifact collection also reuses the existing applied-artifact reader used by
+checkpoint and recovery, removing a second path/hash loop and an unused verifier.
+Neither change replaces TaskStore/WorkStore's transaction or business state.
+
 ## Capability comparison and reuse decisions
 
 | Existing capability | Code and call flow | Relationship to this addition |

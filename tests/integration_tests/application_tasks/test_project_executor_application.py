@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -52,6 +53,30 @@ class Application:
 
     def runtime_support_governance(self, root):
         return {"policy": dict(FORMAL_RUNTIME_SUPPORT_POLICY), "application_paths": {}}
+
+
+@pytest.mark.parametrize("case", ["unchanged", "binary", "deleted", "limit", "overflow"])
+def test_artifact_collection_preserves_git_bytes_and_closed_bounds(tmp_path, case):
+    from openjiuwen.core.application.tasks.project_executor import _attempt_result_artifacts
+
+    _git_project(tmp_path)
+    before_head = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"])
+    if case == "deleted":
+        (tmp_path / "README.md").unlink()
+    elif case in {"limit", "overflow"}:
+        for index in range(32 if case == "limit" else 33):
+            (tmp_path / f"result-{index:02}.bin").write_bytes(bytes([index]))
+        subprocess.run(["git", "-C", str(tmp_path), "add", "-N", "."], check=True, capture_output=True)
+    elif case == "binary":
+        (tmp_path / "README.md").write_bytes(bytes(range(256)) * 513)
+    before_index = (tmp_path / ".git" / "index").read_bytes()
+    artifacts = _attempt_result_artifacts(tmp_path)
+    expected = 32 if case == "limit" else (1 if case == "binary" else 0)
+    assert len(artifacts) == expected
+    for artifact in artifacts:
+        assert artifact.sha256 == hashlib.sha256((tmp_path / artifact.relative_path).read_bytes()).hexdigest()
+    assert (tmp_path / ".git" / "index").read_bytes() == before_index
+    assert subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"]) == before_head
 
 
 @pytest.mark.asyncio

@@ -634,6 +634,16 @@ class WorkRuntime:
         else:
             record.operation = asyncio.get_running_loop().create_future()
 
+            async def finalize(_task) -> None:
+                # Native Task owns settlement, including failures before _run
+                # enters. The Future only adapts predecessor/close waiters.
+                if record.snapshot.state not in _TERMINAL:
+                    self._transition(record, WorkState.UNKNOWN, reason="SERVICE_OWNERSHIP_LOST")
+                if not record.snapshot.execution_settled:
+                    self._transition(record, record.snapshot.state, execution_settled=True)
+                if not record.operation.done():
+                    record.operation.set_result(None)
+
             async def run_owned() -> None:
                 from openjiuwen.core.common.task_manager.context import (
                     _current_task_id,
@@ -654,7 +664,7 @@ class WorkRuntime:
                 try:
                     await get_task_manager().create_task(
                         operation, name=name, group="application-work",
-                        catch_exceptions=True, on_scheduled=retain,
+                        catch_exceptions=True, on_scheduled=retain, finalizer=finalize,
                     )
                 except BaseException:
                     record.control.cancelled.set()
@@ -663,21 +673,10 @@ class WorkRuntime:
                 finally:
                     _current_task_id.reset(parent_token)
                     reset_task_group(group_token)
-                    with anyio.CancelScope(shield=True):
-                        if native is None:
+                    if native is None:
+                        with anyio.CancelScope(shield=True):
                             operation.close()
-                        else:
-                            try:
-                                await native.wait()
-                            except BaseException:
-                                if record.snapshot.state not in _TERMINAL:
-                                    self._transition(record, WorkState.UNKNOWN, reason="SERVICE_OWNERSHIP_LOST")
-                        if record.snapshot.state not in _TERMINAL:
-                            self._transition(record, WorkState.UNKNOWN, reason="SERVICE_OWNERSHIP_LOST")
-                        if not record.snapshot.execution_settled:
-                            self._transition(record, record.snapshot.state, execution_settled=True)
-                        if not record.operation.done():
-                            record.operation.set_result(None)
+                            await finalize(None)
 
             try:
                 task_group.start_soon(run_owned, name=name)
