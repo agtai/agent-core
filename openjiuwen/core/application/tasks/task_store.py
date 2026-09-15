@@ -727,6 +727,26 @@ _TaskReadSnapshot = tuple[
     PersistentAttemptRecord,
     PersistentAdmissionRecord | None,
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskQueueControl:
+    """As-of queue ownership, never a permit to bypass a write transaction."""
+
+    dispatch_control: str
+    can_update: bool
+    can_reprioritize: bool
+
+    @property
+    def operations(self) -> frozenset[str]:
+        if self.dispatch_control != "unclaimed":
+            return frozenset()
+        return frozenset(operation for operation, allowed in (
+            ("task.update", self.can_update and self.can_reprioritize),
+            ("task.reprioritize", self.can_reprioritize),
+        ) if allowed)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskAuthorityReadSnapshot:
     """One immutable database view; constituent models retain their own validation."""
@@ -738,6 +758,7 @@ class TaskAuthorityReadSnapshot:
     result_availability: TaskResultAvailability
     result: TaskResultRecord | None
     result_reason: str
+    queue_control: TaskQueueControl
 
 
 _OUTBOX_BINDING_SELECT = """
@@ -4419,21 +4440,11 @@ class SqliteTaskStore:
                     OutboxKind.ATTEMPT_DISPATCH.value,
                 ),
             ).fetchall()
+            queue_control = self._queue_control(task, attempt, dispatch)
             if (
-                task["state"] != FormalTaskState.ACCEPTED.value
-                or bool(task["cancel_requested"])
-                or bool(task["dispatch_fenced"])
-                or attempt is None
-                or attempt["task_id"] != task_id
-                or attempt["state"] != FormalAttemptState.ACCEPTED.value
+                not queue_control.can_update
                 or payload["attempt_id"] != task["attempt_id"]
                 or payload["expected_event_head"] != int(task["event_head"])
-                or len(dispatch) != 1
-                or dispatch[0]["state"] != OutboxState.PENDING.value
-                or int(dispatch[0]["delivery_count"]) != 0
-                or dispatch[0]["claimed_by"] is not None
-                or dispatch[0]["claimed_at"] is not None
-                or dispatch[0]["claim_token"] is not None
             ):
                 return self._persist_business_decision(
                     connection,
@@ -4597,37 +4608,7 @@ class SqliteTaskStore:
                     observed_at=observed_at,
                 )
             assert attempt is not None
-            selection = _selection_from_attempt_row(attempt)
-            dispatch = dispatches[0] if len(dispatches) == 1 else None
-            eligible = (
-                task["state"] == FormalTaskState.ACCEPTED.value
-                and not bool(task["cancel_requested"])
-                and not bool(task["dispatch_fenced"])
-                and task["reconciliation_state"] is None
-                and attempt["state"] == FormalAttemptState.ACCEPTED.value
-                and attempt["outcome"] is None
-                and attempt["executor_ref"] is None
-                and int(attempt["source_seq"]) == -1
-                and selection is not None
-                and dispatch is not None
-                and dispatch["state"] == OutboxState.PENDING.value
-                and dispatch["claimed_by"] is None
-                and dispatch["claimed_at"] is None
-                and dispatch["claim_token"] is None
-                and int(dispatch["delivery_count"]) == int(attempt["admission_attempt_count"])
-                and (
-                    int(dispatch["delivery_count"]) == 0
-                    or (
-                        attempt["admission_reason"]
-                        in {
-                            "EXECUTOR_PROJECT_BUSY",
-                            "EXECUTOR_CAPACITY_EXHAUSTED",
-                        }
-                        and dispatch["last_error"] == attempt["admission_reason"]
-                    )
-                )
-            )
-            if not eligible:
+            if not self._queue_control(task, attempt, dispatches).can_reprioritize:
                 return self._persist_business_decision(
                     connection,
                     command,
@@ -11830,6 +11811,43 @@ class SqliteTaskStore:
             )
             return self._mutation_result(connection, attempt, TaskMutationDisposition.APPLIED)
 
+    @classmethod
+    def _queue_control(cls, task, attempt, dispatches) -> TaskQueueControl:
+        """Project the same durable queue facts used by update and reprioritize.
+
+        Legacy unselected Tasks can still be updated, but do not advertise
+        selected-Executor queue operations. Physical claim ownership is checked
+        here rather than reconstructed by the application from admission labels.
+        """
+        if attempt is None or attempt["task_id"] != task["task_id"]:
+            return TaskQueueControl("none", False, False)
+        dispatch = dispatches[0] if len(dispatches) == 1 else None
+        accepted = (
+            task["state"] == FormalTaskState.ACCEPTED.value
+            and not bool(task["cancel_requested"])
+            and not bool(task["dispatch_fenced"])
+            and attempt["state"] == FormalAttemptState.ACCEPTED.value
+        )
+        can_update = bool(
+            accepted and dispatch is not None
+            and dispatch["state"] == OutboxState.PENDING.value
+            and int(dispatch["delivery_count"]) == 0
+            and dispatch["claimed_by"] is None
+            and dispatch["claimed_at"] is None
+            and dispatch["claim_token"] is None
+        )
+        if _selection_from_attempt_row(attempt) is None:
+            return TaskQueueControl("none", can_update, False)
+        unclaimed = bool(
+            accepted and task["reconciliation_state"] is None
+            and attempt["executor_ref"] is None and int(attempt["source_seq"]) == -1
+            and dispatch is not None and dispatch["state"] == OutboxState.PENDING.value
+        )
+        return TaskQueueControl(
+            "unclaimed" if unclaimed else "taken_over", can_update,
+            bool(unclaimed and cls._is_exact_unbound_queue(task, attempt, dispatch)),
+        )
+
     @staticmethod
     def _is_exact_unbound_queue(
         task: sqlite3.Row,
@@ -12240,8 +12258,13 @@ class SqliteTaskStore:
             self._hit("list_task_authority_snapshots_page.after_tasks")
             snapshots = []
             for row in rows[:limit]:
+                attempt_row = self._task_read_attempt_row(connection, row)
                 task, attempt, admission = self._task_read_snapshot_from_rows(
-                    row, self._task_read_attempt_row(connection, row))
+                    row, attempt_row)
+                dispatches = connection.execute(
+                    "SELECT * FROM outbox WHERE task_id=? AND attempt_id=? AND kind=?",
+                    (task.task_id, task.attempt_id, OutboxKind.ATTEMPT_DISPATCH.value),
+                ).fetchall()
                 event_row = connection.execute(
                     "SELECT * FROM task_events WHERE task_id=? AND seq=?",
                     (task.task_id, task.event_head),
@@ -12250,7 +12273,8 @@ class SqliteTaskStore:
                     raise self._corrupt("Task authority snapshot lost its event head")
                 availability, result, reason = self._task_result_for_row(connection, row)
                 snapshots.append(TaskAuthorityReadSnapshot(
-                    task, attempt, admission, self._event_from_row(event_row), availability, result, reason))
+                    task, attempt, admission, self._event_from_row(event_row), availability, result, reason,
+                    self._queue_control(row, attempt_row, dispatches)))
             next_cursor = snapshots[-1].task.task_id if has_more and snapshots else None
             return tuple(snapshots), next_cursor, has_more
 

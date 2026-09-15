@@ -254,6 +254,16 @@ availability/record/reason from one SQLite read transaction. It reuses ordinary
 keyset paging and existing row decoders. A missing event head fails closed;
 this reader neither repairs storage nor authorizes a command.
 
+The paired queue-control revision also includes `snapshot.queue_control`:
+`dispatch_control` and `operations` describe selected-Executor queue controls.
+Host readers use these facts instead of reconstructing eligibility from status
+and admission labels. Store update/reprioritize reread the same rule inside their
+write transaction; an earlier snapshot cannot authorize a later mutation. The
+existing exact unbound-queue proof also serves cancellation and reconciliation.
+Legacy Tasks without an Executor selection retain their existing update contract
+but do not advertise selected-Executor controls. No persisted or wire schema is
+changed; this internal snapshot addition requires the corresponding Host source.
+
 An application may project product permissions and result digests from this
 snapshot without polling the Task page twice for convergence. Later mutations
 remain subject to their existing command preconditions. Ordinary page APIs retain
