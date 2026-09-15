@@ -174,6 +174,23 @@ class TaskManager:
                                "previous_status": "pending", "current_status": "running"})
         return task
 
+    async def create_root_task(
+            self, coro: Coroutine, *, task_group: anyio.abc.TaskGroup, **options: Any,
+    ) -> Task:
+        """Schedule under a service group without inheriting a request parent.
+
+        Uses create_task's scheduling receipt, observers and finalizer unchanged.
+        The scheduled body and nested tasks inherit the service group; the caller's
+        context is restored even when a creation observer raises after scheduling.
+        """
+        group_token = set_task_group(task_group)
+        parent_token = _current_task_id.set(None)
+        try:
+            return await self.create_task(coro, **options)
+        finally:
+            _current_task_id.reset(parent_token)
+            reset_task_group(group_token)
+
     @asynccontextmanager
     async def task_group(self) -> AsyncGenerator[anyio.abc.TaskGroup, None]:
         """Create and manage a task group context.

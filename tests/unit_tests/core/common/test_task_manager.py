@@ -1401,3 +1401,67 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_failure", [False, True])
+async def test_service_root_preserves_caller_context_and_owns_nested_tasks(receipt_failure):
+    import anyio
+    from openjiuwen.core.common.task_manager.context import _current_task_id
+
+    TaskManager.reset_instance()
+    manager = TaskManager()
+    release, started = asyncio.Event(), asyncio.Event()
+    retained, children = [], []
+
+    async def child():
+        assert get_task_group() is service_group
+        await release.wait()
+        return "child completed"
+
+    async def root():
+        assert get_task_group() is service_group
+        children.append(await manager.create_task(child()))
+        started.set()
+        await release.wait()
+        return "root completed"
+
+    async def created(task):
+        if task.name == "service-root":
+            assert get_task_group() is service_group
+            assert get_current_task_id() is None
+
+    def scheduled(task):
+        retained.append(task)
+        if receipt_failure:
+            raise RuntimeError("receipt failed after scheduling")
+
+    await manager.on_created(created)
+    try:
+        async with anyio.create_task_group() as service_group:
+            async with manager.task_group() as request_group:
+                parent_token = _current_task_id.set("request-parent")
+                try:
+                    if receipt_failure:
+                        with pytest.raises(RuntimeError, match="receipt failed"):
+                            await manager.create_root_task(root(), task_group=service_group,
+                                name="service-root", on_scheduled=scheduled)
+                    else:
+                        await manager.create_root_task(root(), task_group=service_group,
+                            name="service-root", on_scheduled=scheduled)
+                    assert get_task_group() is request_group
+                    assert get_current_task_id() == "request-parent"
+                    await started.wait()
+                    assert retained[0].parent_task_id is None
+                    assert children[0].parent_task_id == retained[0].task_id
+                    await manager.cascade_cancel("request-parent")
+                    request_group.cancel_scope.cancel()
+                finally:
+                    _current_task_id.reset(parent_token)
+            assert retained[0].status not in {TaskStatus.CANCELLED, TaskStatus.COMPLETED, TaskStatus.FAILED}
+            release.set()
+        assert retained[0].result == "root completed"
+        assert children[0].result == "child completed"
+    finally:
+        release.set()
+        TaskManager.reset_instance()

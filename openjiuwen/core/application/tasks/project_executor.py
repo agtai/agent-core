@@ -90,7 +90,6 @@ from openjiuwen.core.application.tasks.formal_task_models import (
     utc_now,
 )
 from openjiuwen.core.application.tasks.task_store import SqliteTaskStore
-from openjiuwen.core.common.task_manager.context import _current_task_id, reset_task_group, set_task_group
 from openjiuwen.core.common.task_manager.manager import get_task_manager
 from openjiuwen.core.common.task_manager.task import Task as NativeTask
 
@@ -4760,12 +4759,10 @@ class DirectProjectCodeExecutorAdapter:
                 worker.add_done_callback(partial(self._settle_worker, item.attempt_id))
                 worker_owns_release = worker_owns_ownership = True
             else:
-                group_token = set_task_group(task_group)
-                parent_token = _current_task_id.set(None)
                 coro = run_owned_attempt()
                 try:
-                    await get_task_manager().create_task(
-                        coro, name=f"application-project-{item.attempt_id}",
+                    await get_task_manager().create_root_task(
+                        coro, task_group=task_group, name=f"application-project-{item.attempt_id}",
                         group="application-project", catch_exceptions=True,
                         on_scheduled=scheduled, finalizer=finalize,
                     )
@@ -4778,9 +4775,6 @@ class DirectProjectCodeExecutorAdapter:
                         )
                         self._cancel_worker(worker)
                     raise
-                finally:
-                    _current_task_id.reset(parent_token)
-                    reset_task_group(group_token)
             await worker_started.wait()
             current = await asyncio.to_thread(self._journal.get, item.attempt_id)
             assert current is not None

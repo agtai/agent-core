@@ -645,11 +645,6 @@ class WorkRuntime:
                     record.operation.set_result(None)
 
             async def run_owned() -> None:
-                from openjiuwen.core.common.task_manager.context import (
-                    _current_task_id,
-                    reset_task_group,
-                    set_task_group,
-                )
                 from openjiuwen.core.common.task_manager.manager import get_task_manager
 
                 native = None
@@ -659,11 +654,9 @@ class WorkRuntime:
                     nonlocal native
                     native = task
 
-                group_token = set_task_group(task_group)
-                parent_token = _current_task_id.set(None)
                 try:
-                    await get_task_manager().create_task(
-                        operation, name=name, group="application-work",
+                    await get_task_manager().create_root_task(
+                        operation, task_group=task_group, name=name, group="application-work",
                         catch_exceptions=True, on_scheduled=retain, finalizer=finalize,
                     )
                 except BaseException:
@@ -671,8 +664,6 @@ class WorkRuntime:
                     if record.snapshot.state not in _TERMINAL:
                         self._transition(record, WorkState.UNKNOWN, reason="SERVICE_OWNERSHIP_LOST")
                 finally:
-                    _current_task_id.reset(parent_token)
-                    reset_task_group(group_token)
                     if native is None:
                         with anyio.CancelScope(shield=True):
                             operation.close()

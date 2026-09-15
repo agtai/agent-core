@@ -519,3 +519,15 @@ Host product status now projects the same read instead of querying again and
 retrying mixed event heads in Voice. Retry eligibility and per-operation grants
 remain separately reauthorized and checked against the exact returned Attempt.
 This is read ownership consolidation, not replacement of TaskStore management.
+
+## Native service-root scheduling (2026-09-15)
+
+Task project dispatch and Work admission use
+`TaskManager.create_root_task(coro, task_group=service_group, **options)`.
+The native manager delegates to existing `create_task` with service-group context
+and no inherited request parent, then restores caller context on every exit.
+Nested native tasks inherit the service group and root identity. Scheduling
+receipts, finalizers and observer behavior are unchanged. Ordinary `create_task`
+still inherits the current parent and group. Application code no longer manages
+private parent/task-group ContextVars. Durable outcomes and physical cleanup stay
+with the existing application owners; root scheduling grants no business authority.
