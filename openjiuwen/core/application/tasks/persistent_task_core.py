@@ -57,7 +57,7 @@ from openjiuwen.core.application.tasks.formal_task_models import (
     require_exact_payload,
     utc_now,
 )
-from openjiuwen.core.application.tasks.task_store import SqliteTaskStore
+from openjiuwen.core.application.tasks.task_store import SqliteTaskStore, TaskAuthorityReadSnapshot
 
 _PROJECTABLE_TASK_EVENTS = frozenset(
     {
@@ -887,6 +887,35 @@ class PersistentTaskCore:
         *,
         now: str | None = None,
     ) -> ResultEnvelope:
+        return self._query(query, authorization, now=now)
+
+    def query_status_authority(
+        self,
+        query: QueryEnvelope,
+        authorization: TaskAuthorizationGrant | None,
+        *,
+        now: str | None = None,
+        visible_task_capacity: int = 32,
+    ) -> tuple[ResultEnvelope, tuple[TaskAuthorityReadSnapshot, ...]]:
+        """Read status and its in-process application projection inputs once.
+
+        Snapshots are for the trusted application owner, never a wire result.
+        The ordinary status payload still discloses only the authorized target.
+        """
+        snapshots: list[TaskAuthorityReadSnapshot] = []
+        result = self._query(query, authorization, now=now, status_authority=snapshots,
+                             visible_task_capacity=visible_task_capacity)
+        return result, tuple(snapshots) if result.ok else ()
+
+    def _query(
+        self,
+        query: QueryEnvelope,
+        authorization: TaskAuthorizationGrant | None,
+        *,
+        now: str | None = None,
+        status_authority: list[TaskAuthorityReadSnapshot] | None = None,
+        visible_task_capacity: int = 32,
+    ) -> ResultEnvelope:
         observed_at = now or utc_now()
         try:
             if authorization is None:
@@ -918,6 +947,10 @@ class PersistentTaskCore:
                 destructive=False,
                 now=observed_at,
             )
+            if status_authority is not None and query.query_type != "task.status":
+                raise FormalTaskViolation(
+                    "UNSUPPORTED_FORMAL_TASK_INTENT", "status authority requires task.status", ErrorCode.UNSUPPORTED,
+                )
             if query.query_type == "task.list":
                 if query.target_ref.id != "task-list":
                     raise FormalTaskViolation(
@@ -955,7 +988,23 @@ class PersistentTaskCore:
                     frozenset(),
                     field_name=f"{query.query_type} payload",
                 )
-                task, attempt, admission = self.store.task_read_snapshot(query.target_ref.id, query.scope)
+                if status_authority is None:
+                    task, attempt, admission = self.store.task_read_snapshot(query.target_ref.id, query.scope)
+                else:
+                    snapshots, cursor, has_more = self.store.list_task_authority_snapshots_page(
+                        query.scope, limit=visible_task_capacity,
+                    )
+                    if cursor is not None or has_more:
+                        raise FormalTaskViolation(
+                            "PRODUCTION_TASK_AUTHORITY_CAPACITY_EXCEEDED",
+                            "the complete visible Task set exceeds its closed authority bound",
+                            ErrorCode.CAPABILITY_UNAVAILABLE,
+                        )
+                    selected = next((item for item in snapshots if item.task.task_id == query.target_ref.id), None)
+                    if selected is None:
+                        raise FormalTaskViolation("TASK_NOT_FOUND", "task is unavailable", ErrorCode.NOT_FOUND)
+                    status_authority.extend(snapshots)
+                    task, attempt, admission = selected.task, selected.attempt, selected.admission
                 task_payload, admission_payload = self._task_read_projection(task, admission)
                 result = {
                     "task": task_payload,

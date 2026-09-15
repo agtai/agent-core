@@ -111,6 +111,31 @@ def test_public_core_dispatch_reopen_and_wrong_scope(tmp_path):
     assert accepted.ok and executor.calls == []  # Durable acceptance is not execution.
     assert store.get_task(accepted.result["task_id"], _scope()).spec == prepared
     assert core.execute(command, grant, context=_context(tmp_path), now=NOW) == accepted
+    query_data = command.to_dict()
+    for key in ("command_id", "command_type", "origin"):
+        del query_data[key]
+    query_data.update(query_type="task.status", payload={}, required_capabilities=["task.status"],
+                      target_ref={"kind": "task", "id": accepted.result["task_id"]})
+    query = contracts.QueryEnvelope.from_dict(query_data)
+    read_grant = replace(grant, operation="task.status", command_id=None,
+                         target_task_id=accepted.result["task_id"],
+                         allowed_capabilities=frozenset({"task.status"}), confirmation_id=None, confirmed=False)
+    before = store.counts()
+    status, snapshots = core.query_status_authority(query, read_grant, now=NOW)
+    assert status == core.query(query, read_grant, now=NOW)
+    assert len(snapshots) == 1 and status.result["task"]["event_head"] == snapshots[0].task.event_head
+    for invalid_grant in (None, replace(read_grant, scope=_scope("other")),
+                          replace(read_grant, expires_at=NOW), replace(read_grant, target_task_id="other")):
+        rejected, hidden = core.query_status_authority(query, invalid_grant, now=NOW)
+        assert not rejected.ok and hidden == ()
+    for change in ({"payload": {"extra": True}}, {"required_capabilities": ["task.get"]}):
+        invalid_query = contracts.QueryEnvelope.from_dict({**query_data, **change})
+        rejected, hidden = core.query_status_authority(invalid_query, read_grant, now=NOW)
+        assert not rejected.ok and hidden == ()
+    missing = contracts.QueryEnvelope.from_dict({**query_data, "target_ref": {"kind": "task", "id": "missing"}})
+    rejected, hidden = core.query_status_authority(missing, replace(read_grant, target_task_id="missing"), now=NOW)
+    assert not rejected.ok and rejected.error.reason == "TASK_NOT_FOUND" and hidden == ()
+    assert store.counts() == before and executor.calls == []
     asyncio.run(core.drain_outbox())
     assert len(executor.calls) == 1
     reopened = SqliteTaskStore(tmp_path / "tasks.db")
@@ -118,6 +143,20 @@ def test_public_core_dispatch_reopen_and_wrong_scope(tmp_path):
     assert task.state.value == "running"
     assert asyncio.run(PersistentTaskCore(reopened, executor).drain_outbox()) == 0
     assert len(executor.calls) == 1
+    second_data = command.to_dict()
+    second_data.update(request_id="second-request", command_id="second-command",
+                       target_ref={"kind": "task", "id": "create:second-command"})
+    second = core.execute(contracts.CommandEnvelope.from_dict(second_data),
+                          replace(grant, command_id="second-command"), context=context, now=NOW)
+    assert second.ok
+    before = store.counts()
+    rejected, hidden = core.query_status_authority(query, read_grant, now=NOW, visible_task_capacity=1)
+    assert not rejected.ok and hidden == ()
+    assert rejected.error.reason == "PRODUCTION_TASK_AUTHORITY_CAPACITY_EXCEEDED"
+    status, snapshots = core.query_status_authority(query, read_grant, now=NOW)
+    assert status.ok and len(snapshots) == 2
+    assert second.result["task_id"] not in str(status.to_dict())
+    assert store.counts() == before and len(executor.calls) == 1
 
 
 @pytest.mark.parametrize("value", [None, {}, {"contract_version": "unknown.application.v1"}])

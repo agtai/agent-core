@@ -504,3 +504,18 @@ It grants no authority: execute still checks authorization, and Store performs
 transactional admission/revalidation. Host source evidence is registered through
 the existing SDK codec; Host no longer repeats the generic payload/source helpers.
 This removes duplicate creation validation, not the TaskStore state machine.
+
+## Coherent application status reads (2026-09-15)
+
+`PersistentTaskCore.query_status_authority` shares ordinary query authorization,
+payload validation and result projection, then uses the existing Store atomic
+authority page to supply the trusted Host with consistent projection inputs.
+It returns a normal target-only ResultEnvelope and in-process snapshots, which
+are never wire output. Failure returns no snapshots. The bounded complete scope
+set is needed to validate lineage/capability facts; only the requested Task fact
+leaves the Host query owner. `query` retains its existing behavior for all callers.
+
+Host product status now projects the same read instead of querying again and
+retrying mixed event heads in Voice. Retry eligibility and per-operation grants
+remain separately reauthorized and checked against the exact returned Attempt.
+This is read ownership consolidation, not replacement of TaskStore management.
