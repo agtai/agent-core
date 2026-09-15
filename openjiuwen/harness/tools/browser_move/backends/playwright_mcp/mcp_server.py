@@ -27,15 +27,19 @@ for _p in (str(_REPO_ROOT), str(_SRC_ROOT), str(_HERE)):
         sys.path.append(_p)
 
 from fastmcp import Context, FastMCP
-from clients.stdio_client import BrowserMoveStdioClient
-from clients.streamable_http_client import BrowserMoveStreamableHttpClient
-from runtime.config import (
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.clients.stdio_client import (
+    BrowserMoveStdioClient,
+)
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.clients.streamable_http_client import (
+    BrowserMoveStreamableHttpClient,
+)
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     DEFAULT_BROWSER_TIMEOUT_S,
     MISSING_API_KEY_MESSAGE,
     build_runtime_settings,
     load_repo_dotenv,
 )
-from runtime.controllers.action import (
+from openjiuwen.harness.tools.browser_move.runtime.controllers.action import (
     bind_runtime,
     clear_runtime_runner,
     list_actions,
@@ -47,7 +51,7 @@ from runtime.controllers.action import (
 import openjiuwen.core.runner.resources_manager.tool_manager as _tool_mgr_mod
 
 if TYPE_CHECKING:
-    from runtime.runtime import BrowserAgentRuntime
+    from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
 
 _tool_mgr_mod.StdioClient = BrowserMoveStdioClient
 _tool_mgr_mod.StreamableHttpClient = BrowserMoveStreamableHttpClient
@@ -59,7 +63,7 @@ load_repo_dotenv()
 
 
 def _build_runtime() -> "BrowserAgentRuntime":
-    from runtime.runtime import BrowserAgentRuntime
+    from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
 
     settings = build_runtime_settings()
     if not settings.api_key:
