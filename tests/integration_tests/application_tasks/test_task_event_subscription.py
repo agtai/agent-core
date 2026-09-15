@@ -31,6 +31,7 @@ from openjiuwen.core.application.tasks.formal_task_models import (
     PersistentTaskRecord,
     ResolvedTaskContext,
     TaskAuthorizationGrant,
+    TaskEventAuthoritySnapshot,
     TaskRetryAuthoritySnapshot,
     TaskRetryProductRequestFingerprint,
 )
@@ -372,28 +373,46 @@ class _ScriptedSource:
         batches: tuple[tuple[PersistentTaskEvent, ...] | Exception, ...] = (),
         *,
         attempt: PersistentAttemptRecord | None = None,
-        task_reads: tuple[PersistentTaskRecord, ...] | None = None,
     ) -> None:
         self.task = task
         self.attempt = attempt or _attempt(task)
-        self.task_reads = deque(task_reads or (task,))
         self.batches = deque(batches)
-        self.get_calls = 0
-        self.attempt_calls = 0
+        self.snapshot_calls = 0
         self.event_calls = 0
         self.mutations = 0
         self._lock = threading.Lock()
 
-    def get_task(self, task_id: str, scope: ScopeRef) -> PersistentTaskRecord:
+    def event_authority_snapshot(self, task_id, scope, *, max_events):
         with self._lock:
-            self.get_calls += 1
-            if len(self.task_reads) > 1:
-                return self.task_reads.popleft()
-            return self.task_reads[0]
+            self.snapshot_calls += 1
+        genesis = _event(
+            seq=0, task_id=self.task.task_id, attempt_id=self.task.attempt_id,
+            scope=self.task.scope, correlation_id="correlation-1",
+            event_type="task.accepted", state="accepted",
+            causation_id=self.task.create_command_id,
+            details={"command_id": self.task.create_command_id},
+        )
+        events = (genesis,)
+        if self.task.state is FormalTaskState.RUNNING and self.task.event_head == 3:
+            accepted = _event(seq=1, event_type="attempt.accepted", state="accepted")
+            running = _event(seq=2, event_type="attempt.running", state="running")
+            events += (accepted, running, _event(
+                seq=3, source_event_id=running.source_event_id,
+                causation_id=running.causation_id,
+            ))
+        # Fault injection bypasses model construction so reader validation is exercised.
+        # Real SQLite tests above/below exercise the normal validated Store snapshot.
+        snapshot = object.__new__(TaskEventAuthoritySnapshot)
+        for name, value in dict(task=self.task, attempt=self.attempt, events=events,
+                                cursor=self.task.event_head, start_seq=0).items():
+            object.__setattr__(snapshot, name, value)
+        return snapshot
 
-    def get_attempt(self, attempt_id: str) -> PersistentAttemptRecord:
-        self.attempt_calls += 1
-        return self.attempt
+    def get_task(self, *args):
+        raise AssertionError("legacy Task read must never be called")
+
+    def get_attempt(self, *args):
+        raise AssertionError("legacy Attempt read must never be called")
 
     def events(
         self,
@@ -440,29 +459,15 @@ class _BlockingSource(_ScriptedSource):
 
 
 class _BlockingStartSource(_ScriptedSource):
-    def __init__(self, task: PersistentTaskRecord, *, block_read: str) -> None:
+    def __init__(self, task: PersistentTaskRecord) -> None:
         super().__init__(task)
-        self.block_read = block_read
         self.read_started = threading.Event()
         self.release_read = threading.Event()
 
-    def _block(self) -> None:
+    def event_authority_snapshot(self, task_id, scope, *, max_events):
         self.read_started.set()
         self.release_read.wait(timeout=2)
-
-    def get_task(self, task_id: str, scope: ScopeRef) -> PersistentTaskRecord:
-        self.get_calls += 1
-        if (self.block_read == "task_first" and self.get_calls == 1) or (
-            self.block_read == "task_confirm" and self.get_calls == 2
-        ):
-            self._block()
-        return self.task
-
-    def get_attempt(self, attempt_id: str) -> PersistentAttemptRecord:
-        self.attempt_calls += 1
-        if self.block_read == "attempt":
-            self._block()
-        return self.attempt
+        return super().event_authority_snapshot(task_id, scope, max_events=max_events)
 
 
 async def _wait_until(predicate, *, attempts: int = 300) -> None:
@@ -471,6 +476,17 @@ async def _wait_until(predicate, *, attempts: int = 300) -> None:
             return
         await asyncio.sleep(0.005)
     raise AssertionError("condition was not reached")
+
+
+async def _consume_prefix(subscription: TaskEventSubscription) -> None:
+    snapshot = subscription.snapshot()
+    assert snapshot.live_only is False
+    assert snapshot.cursor_replay_supported is True
+    assert snapshot.start_head_seq is not None
+    events = [await subscription.next_event() for _ in range(snapshot.start_head_seq + 1)]
+    assert [event.seq for event in events] == list(range(snapshot.start_head_seq + 1))
+    assert events[0].event_type == "task.accepted"
+    assert all(event.task_id == snapshot.task_id for event in events)
 
 
 @pytest.mark.asyncio
@@ -486,7 +502,6 @@ async def test_authority_snapshot_replays_prefix_then_concurrent_durable_suffix(
         scope=task.scope,
         task_id=task.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         poll_interval=0.001,
         clock=lambda: NOW,
     )
@@ -532,7 +547,6 @@ async def test_authority_restart_replays_terminal_prefix_without_worker(
         scope=task.scope,
         task_id=task.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         queue_capacity=32,
         clock=lambda: NOW,
     )
@@ -564,7 +578,6 @@ async def test_authority_replay_expiry_and_capacity_fail_before_allocation(
         scope=task.scope,
         task_id=task.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         clock=lambda: NOW,
     )
     with pytest.raises(FormalTaskViolation):
@@ -578,7 +591,6 @@ async def test_authority_replay_expiry_and_capacity_fail_before_allocation(
         scope=task.scope,
         task_id=task.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         queue_capacity=3,
         clock=lambda: NOW,
     )
@@ -605,7 +617,6 @@ async def test_authority_close_before_prefix_delivery_has_zero_task_effect(
         scope=task.scope,
         task_id=task.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         clock=lambda: NOW,
     )
 
@@ -640,7 +651,6 @@ async def test_old_epoch_feed_closes_on_its_terminal_and_never_consumes_retry(
         scope=task_b.scope,
         task_id=task_b.task_id,
         enabled=True,
-        authority_atomic_replay=True,
         queue_capacity=32,
         poll_interval=0.001,
         clock=lambda: NOW,
@@ -676,7 +686,7 @@ async def test_old_epoch_feed_closes_on_its_terminal_and_never_consumes_retry(
 
 
 @pytest.mark.asyncio
-async def test_sqlite_live_feed_starts_at_head_and_delivers_terminal_before_close(
+async def test_sqlite_feed_replays_prefix_and_delivers_terminal_before_close(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "tasks.sqlite3")
@@ -694,6 +704,8 @@ async def test_sqlite_live_feed_starts_at_head_and_delivers_terminal_before_clos
     )
 
     assert await subscription.start() is True
+
+    await _consume_prefix(subscription)
     assert subscription.snapshot().start_head_seq == 0
     _advance_running(store, task)
     running = [await asyncio.wait_for(subscription.next_event(), timeout=1) for _ in range(3)]
@@ -716,8 +728,8 @@ async def test_sqlite_live_feed_starts_at_head_and_delivers_terminal_before_clos
     assert final.state is TaskEventSubscriptionState.CLOSED
     assert final.terminal_event_seen is True
     assert final.terminal_event_delivered is True
-    assert final.cursor_replay_supported is False
-    assert final.live_only is True
+    assert final.cursor_replay_supported is True
+    assert final.live_only is False
     counts_after_external_appends = store.counts()
     await subscription.close()
     assert store.counts() == counts_after_external_appends
@@ -741,6 +753,7 @@ async def test_sqlite_feed_accepts_direct_first_running_observation(
         clock=lambda: NOW,
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     _advance_running_direct(store, task)
 
     delivered = [await asyncio.wait_for(subscription.next_event(), timeout=1) for _ in range(2)]
@@ -768,6 +781,7 @@ async def test_sqlite_feed_accepts_distinct_repeated_accepted_observations(
         clock=lambda: NOW,
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     item = store.claim_outbox(f"worker-repeated-accepted:{task.task_id}")
     assert item is not None
     store.complete_outbox(
@@ -808,6 +822,7 @@ async def test_sqlite_feed_accepts_task_core_first_terminal_control_path(
         clock=lambda: NOW,
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     _cancel_task(store, task)
 
     delivered = [await asyncio.wait_for(subscription.next_event(), timeout=1) for _ in range(3)]
@@ -823,7 +838,7 @@ async def test_sqlite_feed_accepts_task_core_first_terminal_control_path(
 
 
 @pytest.mark.asyncio
-async def test_sqlite_terminal_sentinel_starts_closed_without_history_worker(
+async def test_sqlite_terminal_sentinel_replays_without_history_worker(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "tasks.sqlite3")
@@ -848,20 +863,22 @@ async def test_sqlite_terminal_sentinel_starts_closed_without_history_worker(
     )
 
     assert await subscription.start() is True
+
+    await _consume_prefix(subscription)
     snapshot = subscription.snapshot()
     assert snapshot.state is TaskEventSubscriptionState.CLOSED
     assert snapshot.start_head_seq == snapshot.last_seq == task.event_head
-    assert snapshot.close_reason == "already_terminal_at_start_head"
-    assert snapshot.queue_allocated is False
+    assert snapshot.terminal_event_delivered is True
+    assert snapshot.queue_allocated is True
     assert snapshot.worker_pending is False
-    assert snapshot.source_reads == 0
+    assert snapshot.source_reads == 1
     assert store.counts() == counts
     with pytest.raises(StopAsyncIteration):
         await subscription.next_event()
 
 
 @pytest.mark.asyncio
-async def test_sqlite_nonzero_head_feed_is_live_only_and_uses_attempt_baseline(
+async def test_sqlite_nonzero_head_replay_seeds_attempt_state(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "tasks.sqlite3")
@@ -884,6 +901,8 @@ async def test_sqlite_nonzero_head_feed_is_live_only_and_uses_attempt_baseline(
     )
 
     assert await subscription.start() is True
+
+    await _consume_prefix(subscription)
     assert subscription.snapshot().start_head_seq == 3
     assert subscription.snapshot().queued_events == 0
     _advance_terminal(store, task)
@@ -918,6 +937,7 @@ async def test_two_sqlite_task_feeds_are_isolated_and_detach_has_zero_task_effec
         for task in (first, second)
     ]
     await asyncio.gather(*(subscription.start() for subscription in subscriptions))
+    await asyncio.gather(*(_consume_prefix(subscription) for subscription in subscriptions))
 
     _advance_running(store, first)
     await _wait_until(lambda: subscriptions[0].snapshot().queued_events == 3)
@@ -979,7 +999,7 @@ async def test_authorization_rejects_before_object_read_queue_or_worker(
         await subscription.start()
 
     snapshot = subscription.snapshot()
-    assert source.get_calls == 0
+    assert source.snapshot_calls == 0
     assert source.event_calls == 0
     assert snapshot.state is TaskEventSubscriptionState.NEW
     assert snapshot.queue_allocated is False
@@ -1005,8 +1025,7 @@ def test_unauthorized_start_does_not_bind_loop_or_prevent_later_close(
         assert raised.value.reason == "FORMAL_TASK_AUTHORIZATION_REQUIRED"
 
     asyncio.run(reject_on_first_loop())
-    assert source.get_calls == 0
-    assert source.attempt_calls == 0
+    assert source.snapshot_calls == 0
     assert source.event_calls == 0
     assert subscription.snapshot().state is TaskEventSubscriptionState.NEW
     assert subscription.snapshot().queue_allocated is False
@@ -1042,7 +1061,7 @@ async def test_feature_off_creates_no_reader_queue_timer_or_worker(
     assert snapshot.queue_allocated is False
     assert snapshot.queued_events == 0
     assert snapshot.worker_pending is False
-    assert source.get_calls == 0
+    assert source.snapshot_calls == 0
     assert source.event_calls == 0
 
 
@@ -1125,8 +1144,7 @@ def test_protocol_failed_start_releases_loop_binding_for_cross_loop_close(
 
     asyncio.run(fail_on_first_loop())
     assert subscription.snapshot().state is TaskEventSubscriptionState.NEW
-    assert source.get_calls == 1
-    assert source.attempt_calls == 0
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert source.mutations == 0
 
@@ -1165,8 +1183,7 @@ def test_malformed_task_spec_is_protocol_failure_and_releases_loop_binding(
     assert failed.queue_allocated is False
     assert failed.queued_events == 0
     assert failed.worker_pending is False
-    assert source.get_calls == 1
-    assert source.attempt_calls == 0
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert source.mutations == 0
 
@@ -1197,20 +1214,19 @@ async def test_start_snapshot_requires_nonempty_correlation_binding(
         await subscription.start()
 
     assert raised.value.reason == "TASK_EVENT_SOURCE_PROTOCOL_VIOLATION"
-    assert source.get_calls == 1
-    assert source.attempt_calls == 0
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert subscription.snapshot().queue_allocated is False
     assert subscription.snapshot().worker_pending is False
 
 
 @pytest.mark.asyncio
-async def test_start_rejects_inconsistent_task_attempt_task_snapshot(
+async def test_start_rejects_atomic_prefix_cursor_mismatch(
     tmp_path: Path,
 ) -> None:
     first = _record(tmp_path)
     changed = replace(first, event_head=1, cancel_requested=True)
-    source = _ScriptedSource(first, task_reads=(first, changed))
+    source = _ScriptedSource(changed)
     subscription = TaskEventSubscription(
         source=source,
         authorization=_grant("task-1"),
@@ -1223,9 +1239,8 @@ async def test_start_rejects_inconsistent_task_attempt_task_snapshot(
     with pytest.raises(FormalTaskViolation) as raised:
         await subscription.start()
 
-    assert raised.value.reason == "TASK_EVENT_START_SNAPSHOT_CHANGED"
-    assert source.get_calls == 2
-    assert source.attempt_calls == 1
+    assert raised.value.reason == "TASK_EVENT_AUTHORITY_SNAPSHOT_CURSOR_MISMATCH"
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert subscription.snapshot().queue_allocated is False
     assert subscription.snapshot().worker_pending is False
@@ -1279,8 +1294,7 @@ async def test_attempt_baseline_requires_exact_task_executor_and_source_binding(
             await subscription.start()
 
         assert raised.value.reason == reason
-        assert source.get_calls == 1
-        assert source.attempt_calls == 1
+        assert source.snapshot_calls == 1
         assert source.event_calls == 0
         assert subscription.snapshot().queue_allocated is False
 
@@ -1326,22 +1340,11 @@ async def test_terminal_attempt_sentinel_rejects_mixed_state_or_outcome(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_mode", ["timeout", "cancel"])
-@pytest.mark.parametrize(
-    ("block_read", "expected_task_reads", "expected_attempt_reads"),
-    [
-        ("task_first", 1, 0),
-        ("attempt", 1, 1),
-        ("task_confirm", 2, 1),
-    ],
-)
 async def test_cancelled_close_during_blocking_start_prevents_reader_activation(
     tmp_path: Path,
     close_mode: str,
-    block_read: str,
-    expected_task_reads: int,
-    expected_attempt_reads: int,
 ) -> None:
-    source = _BlockingStartSource(_record(tmp_path), block_read=block_read)
+    source = _BlockingStartSource(_record(tmp_path))
     subscription = TaskEventSubscription(
         source=source,
         authorization=_grant("task-1"),
@@ -1371,8 +1374,7 @@ async def test_cancelled_close_during_blocking_start_prevents_reader_activation(
     assert snapshot.close_reason == "consumer_detached"
     assert snapshot.queue_allocated is False
     assert snapshot.worker_pending is False
-    assert source.get_calls == expected_task_reads
-    assert source.attempt_calls == expected_attempt_reads
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert source.mutations == 0
 
@@ -1394,6 +1396,7 @@ async def test_live_feed_reauthorizes_expiry_before_each_object_read(
         clock=lambda: current_time[0],
     )
     await subscription.start()
+    await _consume_prefix(subscription)
     await _wait_until(lambda: source.event_calls >= 1)
     reads_before_expiry = source.event_calls
 
@@ -1442,6 +1445,7 @@ async def test_blocking_event_read_cannot_disclose_content_after_grant_expiry(
         clock=lambda: current_time[0],
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     await _wait_until(source.read_started.is_set)
 
     current_time[0] = expires_at
@@ -1456,7 +1460,7 @@ async def test_blocking_event_read_cannot_disclose_content_after_grant_expiry(
     assert snapshot.failure_reason == "FORMAL_TASK_AUTHORIZATION_EXPIRED"
     assert snapshot.queued_events == 0
     assert snapshot.last_seq == snapshot.start_head_seq == 0
-    assert snapshot.source_reads == 1
+    assert snapshot.source_reads == 2
     assert snapshot.worker_pending is False
     assert snapshot.terminal_event_seen is False
     assert snapshot.terminal_event_delivered is False
@@ -1499,6 +1503,7 @@ async def test_queued_content_is_discarded_if_grant_expires_before_delivery(
         clock=lambda: current_time[0],
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     await _wait_until(lambda: subscription.snapshot().state is TaskEventSubscriptionState.TERMINAL_PENDING)
     assert subscription.snapshot().queued_events == 2
 
@@ -1518,10 +1523,10 @@ async def test_queued_content_is_discarded_if_grant_expires_before_delivery(
     assert source.mutations == 0
 
 
-def test_final_start_read_expiry_preserves_error_and_releases_loop_binding(
+def test_atomic_snapshot_read_expiry_preserves_error_and_releases_loop_binding(
     tmp_path: Path,
 ) -> None:
-    source = _BlockingStartSource(_record(tmp_path), block_read="task_confirm")
+    source = _BlockingStartSource(_record(tmp_path))
     current_time = [NOW]
     expires_at = "2026-08-06T10:00:01Z"
     subscription = TaskEventSubscription(
@@ -1549,8 +1554,7 @@ def test_final_start_read_expiry_preserves_error_and_releases_loop_binding(
     assert failed.queue_allocated is False
     assert failed.queued_events == 0
     assert failed.worker_pending is False
-    assert source.get_calls == 2
-    assert source.attempt_calls == 1
+    assert source.snapshot_calls == 1
     assert source.event_calls == 0
     assert source.mutations == 0
 
@@ -1612,6 +1616,7 @@ async def test_identical_duplicate_is_idempotent_and_terminal_is_delivered_once(
         clock=lambda: NOW,
     )
     await subscription.start()
+    await _consume_prefix(subscription)
 
     delivered = [await asyncio.wait_for(subscription.next_event(), timeout=1) for _ in range(5)]
 
@@ -1641,7 +1646,7 @@ def _fault_cases() -> list[tuple[str, tuple[PersistentTaskEvent, ...], str]]:
             "TASK_EVENT_SEQUENCE_CONFLICT",
         ),
         ("gap", (_event(seq=2),), "TASK_EVENT_SEQUENCE_GAP"),
-        ("reorder", (_event(seq=0),), "TASK_EVENT_SEQUENCE_REORDERED"),
+        ("replayed-sequence-conflict", (_event(seq=0, event_id="conflicting-genesis"),), "TASK_EVENT_SEQUENCE_CONFLICT"),
         (
             "foreign-task",
             (_event(seq=1, task_id="task-other"),),
@@ -1831,6 +1836,7 @@ async def test_protocol_faults_fail_closed_without_speculative_delivery(
         clock=lambda: NOW,
     )
     await subscription.start()
+    await _consume_prefix(subscription)
     await _wait_until(lambda: subscription.snapshot().state is TaskEventSubscriptionState.FAILED)
 
     with pytest.raises(FormalTaskViolation) as raised:
@@ -1879,6 +1885,7 @@ async def test_nonzero_head_attempt_baseline_rejects_backward_or_repeated_events
         clock=lambda: NOW,
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     await _wait_until(lambda: subscription.snapshot().state is TaskEventSubscriptionState.FAILED)
 
     snapshot = subscription.snapshot()
@@ -1917,6 +1924,7 @@ async def test_executor_cannot_skip_running_with_first_terminal_observation(
         clock=lambda: NOW,
     )
     assert await subscription.start() is True
+    await _consume_prefix(subscription)
     await _wait_until(lambda: subscription.snapshot().state is TaskEventSubscriptionState.FAILED)
 
     with pytest.raises(FormalTaskViolation) as raised:
@@ -1956,6 +1964,7 @@ async def test_queue_overflow_and_reader_failure_are_explicit_failures(
         clock=lambda: NOW,
     )
     await overflow.start()
+    await _consume_prefix(overflow)
     await _wait_until(lambda: overflow.snapshot().state is TaskEventSubscriptionState.FAILED)
     assert overflow.snapshot().failure_reason == "TASK_EVENT_SUBSCRIPTION_OVERFLOW"
     assert overflow.snapshot().last_seq == 0
@@ -1982,9 +1991,10 @@ async def test_queue_overflow_and_reader_failure_are_explicit_failures(
         clock=lambda: NOW,
     )
     await limited.start()
+    await _consume_prefix(limited)
     await _wait_until(lambda: limited.snapshot().state is TaskEventSubscriptionState.FAILED)
     assert limited.snapshot().failure_reason == ("TASK_EVENT_SUBSCRIPTION_VALIDATION_LIMIT")
-    assert limited.snapshot().tracked_events == 0
+    assert limited.snapshot().tracked_events == 1
 
     reader_source = _ScriptedSource(_record(tmp_path), (RuntimeError("read"),))
     reader = TaskEventSubscription(
@@ -1997,6 +2007,7 @@ async def test_queue_overflow_and_reader_failure_are_explicit_failures(
         clock=lambda: NOW,
     )
     await reader.start()
+    await _consume_prefix(reader)
     await _wait_until(lambda: reader.snapshot().state is TaskEventSubscriptionState.FAILED)
     assert reader.snapshot().failure_reason == "TASK_EVENT_SOURCE_FAILURE"
     assert reader.snapshot().failure_code is ErrorCode.UNAVAILABLE
@@ -2017,6 +2028,7 @@ async def test_cancelled_close_retains_reader_and_never_claims_closed_early(
         clock=lambda: NOW,
     )
     await subscription.start()
+    await _consume_prefix(subscription)
     await _wait_until(source.read_started.is_set)
 
     with pytest.raises(TimeoutError):
@@ -2049,6 +2061,7 @@ async def test_cancelled_consumer_only_detaches_subscription(tmp_path: Path) -> 
         clock=lambda: NOW,
     )
     await subscription.start()
+    await _consume_prefix(subscription)
     consumer = asyncio.create_task(subscription.next_event())
     await asyncio.sleep(0)
     consumer.cancel()
@@ -2062,36 +2075,28 @@ async def test_cancelled_consumer_only_detaches_subscription(tmp_path: Path) -> 
     assert source.mutations == 0
 
 
-@pytest.mark.asyncio
-async def test_already_terminal_start_is_honest_live_only_without_history_read(
-    tmp_path: Path,
-) -> None:
-    source = _ScriptedSource(
-        _record(
-            tmp_path,
-            state=FormalTaskState.TERMINAL,
-            outcome=TerminalOutcome.COMPLETED,
-            event_head=7,
-        )
-    )
-    subscription = TaskEventSubscription(
-        source=source,
-        authorization=_grant("task-1"),
-        scope=_scope(),
-        task_id="task-1",
-        enabled=True,
-        clock=lambda: NOW,
-    )
 
-    assert await subscription.start() is True
+@pytest.mark.asyncio
+async def test_source_without_atomic_handoff_fails_before_legacy_reads_or_allocation(tmp_path: Path) -> None:
+    class LegacySource:
+        def get_task(self, *args):
+            pytest.fail("legacy Task reads are unsupported")
+
+        def get_attempt(self, *args):
+            pytest.fail("legacy Attempt reads are unsupported")
+
+        def events(self, *args, **kwargs):
+            pytest.fail("no tail read before atomic handoff")
+
+    subscription = TaskEventSubscription(
+        source=LegacySource(), authorization=_grant("task-1"),
+        scope=_scope(), task_id="task-1", enabled=True, clock=lambda: NOW,
+    )
+    with pytest.raises(FormalTaskViolation) as raised:
+        await subscription.start()
+    assert raised.value.reason == "TASK_EVENT_AUTHORITY_HANDOFF_UNAVAILABLE"
     snapshot = subscription.snapshot()
-    assert snapshot.state is TaskEventSubscriptionState.CLOSED
-    assert snapshot.start_head_seq == snapshot.last_seq == 7
-    assert snapshot.close_reason == "already_terminal_at_start_head"
-    assert snapshot.terminal_event_seen is False
-    assert snapshot.terminal_event_delivered is False
-    assert source.get_calls == 2
-    assert source.attempt_calls == 1
-    assert source.event_calls == 0
-    with pytest.raises(StopAsyncIteration):
-        await subscription.next_event()
+    assert snapshot.queue_allocated is False
+    assert snapshot.worker_pending is False
+    assert snapshot.source_reads == 0
+    await subscription.close()

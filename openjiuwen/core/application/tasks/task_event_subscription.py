@@ -2,9 +2,8 @@
 
 """Authorized delivery of canonical formal TaskEvents.
 
-The default reader deliberately starts at the Store's current event head and is
-live-only.  The authority replay mode instead consumes one Store-owned atomic
-prefix/cursor snapshot before reading its durable suffix. With presentation_class,
+The reader consumes one Store-owned atomic prefix/cursor snapshot before
+reading its durable suffix. With presentation_class,
 it reads bounded pages from the Store-owned durable consumer watermark on demand.
 No mode exposes a caller-selected cursor or fabricated lifecycle history.
 """
@@ -93,12 +92,8 @@ _TASK_EVENT_PRODUCERS = {
 _CANONICAL_EVENT_TYPES = frozenset(_TASK_EVENT_PRODUCERS) | frozenset(_ATTEMPT_LIFECYCLE_EVENT_STATES)
 
 
-class TaskEventSource(Protocol):
+class TaskEventAuthoritySource(Protocol):
     """Read-only surface implemented directly by ``SqliteTaskStore``."""
-
-    def get_task(self, task_id: str, scope: ScopeRef) -> PersistentTaskRecord: ...
-
-    def get_attempt(self, attempt_id: str) -> PersistentAttemptRecord: ...
 
     def events(
         self,
@@ -108,10 +103,6 @@ class TaskEventSource(Protocol):
         after_seq: int = -1,
         attempt_id: str | None = None,
     ) -> tuple[PersistentTaskEvent, ...]: ...
-
-
-class TaskEventAuthoritySource(TaskEventSource, Protocol):
-    """Store authority surface for an atomic prefix/cursor handoff."""
 
     def event_authority_snapshot(
         self, task_id: str, scope: ScopeRef, *, max_events: int
@@ -171,7 +162,7 @@ class TaskEventSubscription:
     def __init__(
         self,
         *,
-        source: TaskEventSource,
+        source: TaskEventAuthoritySource,
         authorization: TaskAuthorizationGrant | None,
         scope: ScopeRef,
         task_id: str,
@@ -179,7 +170,6 @@ class TaskEventSubscription:
         queue_capacity: int = 32,
         validation_capacity: int = 4096,
         poll_interval: float = 0.05,
-        authority_atomic_replay: bool = False,
         consumer_scope: bool = False,
         presentation_class: str | None = None,
         clock: Callable[[], str] = utc_now,
@@ -202,12 +192,6 @@ class TaskEventSubscription:
                 "task event subscription flag must be boolean",
                 ErrorCode.INVALID_ARGUMENT,
             )
-        if type(authority_atomic_replay) is not bool:
-            raise _violation(
-                "INVALID_TASK_EVENT_AUTHORITY_MODE",
-                "TaskEvent authority replay mode must be boolean",
-                ErrorCode.INVALID_ARGUMENT,
-            )
         if type(consumer_scope) is not bool:
             raise _violation(
                 "INVALID_TASK_EVENT_AUTHORITY_MODE",
@@ -218,7 +202,6 @@ class TaskEventSubscription:
             type(presentation_class) is not str
             or presentation_class not in {"text", "voice"}
             or not consumer_scope
-            or not authority_atomic_replay
         ):
             raise _violation(
                 "INVALID_TASK_EVENT_AUTHORITY_MODE",
@@ -256,7 +239,6 @@ class TaskEventSubscription:
         self._queue_capacity = queue_capacity
         self._validation_capacity = validation_capacity
         self._poll_interval = float(poll_interval)
-        self._authority_atomic_replay = authority_atomic_replay
         self._consumer_scope = consumer_scope
         self._presentation_class = presentation_class
         self._clock = clock
@@ -344,9 +326,7 @@ class TaskEventSubscription:
             try:
                 if self._presentation_class is not None:
                     return await self._start_consumer_replay()
-                if self._authority_atomic_replay:
-                    return await self._start_authority_atomic_replay()
-                return await self._start_authorized_baseline()
+                return await self._start_authority_atomic_replay()
             except BaseException:
                 # Preserve the original error/cancellation, but do not strand a
                 # resource-free NEW reader on the loop used by a failed start.
@@ -740,8 +720,7 @@ class TaskEventSubscription:
         if self._presentation_class is not None:
             return
         if (
-            not self._authority_atomic_replay
-            or self._state is not TaskEventSubscriptionState.ACTIVE
+            self._state is not TaskEventSubscriptionState.ACTIVE
             or self._worker is not None
             or self._queue is None
             or not self._queue.empty()
@@ -752,116 +731,6 @@ class TaskEventSubscription:
             self._poll_loop(),
             name=f"live-voice-task-events-authority:{self._task_id}",
         )
-
-    async def _start_authorized_baseline(self) -> bool:
-        try:
-            task = await asyncio.to_thread(self._source.get_task, self._task_id, self._scope)
-        except FormalTaskViolation:
-            raise
-        except Exception as error:
-            raise _violation(
-                "TASK_EVENT_SOURCE_FAILURE",
-                "formal TaskEvent source failed during subscription start",
-                ErrorCode.UNAVAILABLE,
-            ) from error
-        if self._settle_start_close_intent():
-            return False
-        self._authorize_current_read()
-        if self._settle_start_close_intent():
-            return False
-        self._validate_start_snapshot(task)
-
-        if self._settle_start_close_intent():
-            return False
-        self._authorize_current_read()
-        if self._settle_start_close_intent():
-            return False
-        try:
-            attempt = await asyncio.to_thread(self._source.get_attempt, task.attempt_id)
-        except FormalTaskViolation:
-            raise
-        except Exception as error:
-            raise _violation(
-                "TASK_EVENT_SOURCE_FAILURE",
-                "formal attempt source failed during subscription start",
-                ErrorCode.UNAVAILABLE,
-            ) from error
-        if self._settle_start_close_intent():
-            return False
-        self._authorize_current_read()
-        if self._settle_start_close_intent():
-            return False
-        attempt_state = self._validate_attempt_snapshot(task, attempt)
-
-        # The Store currently exposes task and attempt reads separately. Bracket
-        # the attempt read and reject change instead of mixing two revisions.
-        if self._settle_start_close_intent():
-            return False
-        self._authorize_current_read()
-        if self._settle_start_close_intent():
-            return False
-        try:
-            confirmed_task = await asyncio.to_thread(self._source.get_task, self._task_id, self._scope)
-        except FormalTaskViolation:
-            raise
-        except Exception as error:
-            raise _violation(
-                "TASK_EVENT_SOURCE_FAILURE",
-                "formal TaskEvent source failed during subscription start",
-                ErrorCode.UNAVAILABLE,
-            ) from error
-        if self._settle_start_close_intent():
-            return False
-        self._authorize_current_read()
-        if self._settle_start_close_intent():
-            return False
-        self._validate_start_snapshot(confirmed_task)
-        if confirmed_task != task:
-            raise _violation(
-                "TASK_EVENT_START_SNAPSHOT_CHANGED",
-                "formal task changed while the live feed baseline was read",
-                ErrorCode.CONFLICT,
-            )
-        self._validate_attempt_snapshot(confirmed_task, attempt)
-
-        self._start_head_seq = task.event_head
-        self._last_seq = task.event_head
-        self._attempt_id = task.attempt_id
-        self._previous_attempt_id = None
-        self._attempt_number = attempt.attempt_number
-        self._segment_start_seq = None
-        self._attempt_executor_id = task.spec.executor_id
-        self._correlation_id = task.correlation_id
-        self._task_state = task.state
-        self._task_outcome = None if task.outcome is None else task.outcome.value
-        self._attempt_state = attempt_state
-        self._attempt_outcome = None if attempt.outcome is None else attempt.outcome.value
-        if task.state is FormalTaskState.TERMINAL:
-            self._state = TaskEventSubscriptionState.CLOSED
-            self._close_reason = "already_terminal_at_start_head"
-            return True
-
-        # Linearize allocation against close intent arriving from another
-        # thread/loop. Same-loop close cannot run between these statements.
-        with self._close_intent_lock:
-            if self._close_requested:
-                close_reason = self._close_request_reason or "consumer_detached"
-            else:
-                close_reason = None
-                self._queue = asyncio.Queue(maxsize=self._queue_capacity)
-                self._changed = asyncio.Event()
-                self._detach = asyncio.Event()
-                self._state = TaskEventSubscriptionState.ACTIVE
-                assert self._owner_loop is not None
-                self._worker = self._owner_loop.create_task(
-                    self._poll_loop(),
-                    name=f"live-voice-task-events:{self._task_id}",
-                )
-        if close_reason is not None:
-            self._state = TaskEventSubscriptionState.CLOSED
-            self._close_reason = close_reason
-            return False
-        return True
 
     async def next_event(self) -> PersistentTaskEvent:
         """Return the next validated event; consumer cancellation detaches the feed."""
@@ -989,8 +858,8 @@ class TaskEventSubscription:
             tracked_events=len(self._seen_event_ids),
             worker_pending=worker is not None and not worker.done(),
             source_reads=self._source_reads,
-            live_only=not self._authority_atomic_replay,
-            cursor_replay_supported=self._authority_atomic_replay,
+            live_only=False,
+            cursor_replay_supported=True,
             terminal_event_seen=self._terminal_event_seen,
             terminal_event_delivered=self._terminal_event_delivered,
             close_reason=self._close_reason,
@@ -1694,7 +1563,6 @@ class TaskEventSubscription:
 
 __all__ = [
     "TaskEventAuthoritySource",
-    "TaskEventSource",
     "TaskEventSubscription",
     "TaskEventSubscriptionSnapshot",
     "TaskEventSubscriptionState",

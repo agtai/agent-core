@@ -282,16 +282,15 @@ permission; Store transactions and executor fences remain authoritative.
 ### Shared subscription lifecycle and durable consumption (.6)
 
 `TaskEventSubscription` now also reads the existing Store consumer authority
-pages with `enabled=True, authority_atomic_replay=True, consumer_scope=True,
+pages with `enabled=True, consumer_scope=True,
 presentation_class="text"` (or `"voice"`). JiuwenSwarm's
 `TaskEventAuthorityProgressSource` directly constructs this SDK reader for all
-three modes; its separate consumer subscription implementation is removed.
+both modes; its separate consumer subscription implementation is removed.
 The Store remains the only owner of persisted cursors and canonical event facts.
 The reader never ACKs a presentation or changes a Task/outbox record.
 
 | Mode | Start position | Read management | Cancellation of next_event |
 |---|---|---|---|
-| Default live-only | Current Store head | Existing background tail | Detaches reader |
 | Authority prefix, no presentation_class | Validated current-attempt prefix | Prefix then existing background tail | Detaches reader |
 | Authority consumer pages | Durable text/voice watermark | Demand pages, frozen head while paging | Cancels that wait; reader remains active |
 
@@ -531,3 +530,7 @@ receipts, finalizers and observer behavior are unchanged. Ordinary `create_task`
 still inherits the current parent and group. Application code no longer manages
 private parent/task-group ContextVars. Durable outcomes and physical cleanup stay
 with the existing application owners; root scheduling grants no business authority.
+
+The obsolete live-only startup and `authority_atomic_replay` selector have been
+removed. Sources must provide the atomic authority snapshot API. Both supported
+Host consumers already used this contract; no stored data migration is needed.
