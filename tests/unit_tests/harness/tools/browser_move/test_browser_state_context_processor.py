@@ -19,18 +19,18 @@ from openjiuwen.harness.prompts.prompt_attachment_manager import (
     PROMPT_ATTACHMENT_PRESERVE_TAIL_METADATA_KEY,
     PromptAttachmentManager,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_processor import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
     BrowserStateContextProcessor,
     BrowserStateContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
     BROWSER_TASK_STATE_KEY,
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.runtime.probes import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
     build_browser_state_metadata_js,
 )
-from openjiuwen.harness.tools.browser_move.runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserAgentRuntime,
 )
 
@@ -867,144 +867,6 @@ def test_browser_state_metadata_probe_collects_tabs_and_position_without_screens
     assert "page.screenshot" not in js
 
 
-def test_neutral_refresh_group_needs_a_full_capture_but_is_scored_non_mutating() -> None:
-    messages = [
-        AssistantMessage(
-            content="",
-            tool_calls=[
-                ToolCall(id="hover", type="function", name="browser_hover", arguments='{"target_id": "e1"}'),
-                ToolCall(id="dialog", type="function", name="browser_handle_dialog", arguments='{"accept": true}'),
-            ],
-        ),
-        ToolMessage(tool_call_id="hover", content="{}"),
-        ToolMessage(tool_call_id="dialog", content="{}"),
-    ]
-
-    group_id, refresh_ids, observation_only, mutating = BrowserStateContextProcessor._completed_state_action_group(
-        messages
-    )
-
-    assert group_id
-    assert refresh_ids == {"hover", "dialog"}
-    # hover / handle_dialog stay in the refresh set, so the group still takes the
-    # FULL capture path rather than the compact observation path.
-    assert observation_only is False
-    assert mutating is False
-
-
-def test_mixed_group_with_one_state_changing_tool_is_scored_mutating() -> None:
-    messages = [
-        AssistantMessage(
-            content="",
-            tool_calls=[
-                ToolCall(id="hover", type="function", name="browser_hover", arguments='{"target_id": "e1"}'),
-                ToolCall(id="click", type="function", name="browser_click", arguments='{"target_id": "e1"}'),
-            ],
-        ),
-        ToolMessage(tool_call_id="hover", content="{}"),
-        ToolMessage(tool_call_id="click", content="{}"),
-    ]
-
-    _, _, observation_only, mutating = BrowserStateContextProcessor._completed_state_action_group(messages)
-
-    assert observation_only is False
-    assert mutating is True
-
-
-def test_observation_only_group_of_neutral_probes_is_scored_non_mutating() -> None:
-    messages = [
-        AssistantMessage(
-            content="",
-            tool_calls=[
-                ToolCall(id="find", type="function", name="browser_find", arguments='{"text": "user1"}'),
-            ],
-        ),
-        ToolMessage(tool_call_id="find", content="{}"),
-    ]
-
-    _, _, observation_only, mutating = BrowserStateContextProcessor._completed_state_action_group(messages)
-
-    assert observation_only is True
-    assert mutating is False
-
-
-@pytest.mark.asyncio
-async def test_neutral_group_passes_the_non_mutating_flag_to_the_full_capture() -> None:
-    provider = AsyncMock()
-    provider.capture_browser_state.return_value = _state("https://the-internet.example/hovers")
-    engine = ContextEngine()
-    context = await engine.create_context(
-        "browser-neutral-capture-test",
-        processors=[
-            (
-                "BrowserStateContextProcessor",
-                BrowserStateContextProcessorConfig(provider=provider),
-            )
-        ],
-    )
-    await context.add_messages(UserMessage(content="hover the first avatar"))
-    await context.get_context_window()
-    await _add_completed_browser_action(
-        context,
-        call_id="hover-call",
-        tool_name="browser_hover",
-        arguments='{"target_id": "e1"}',
-    )
-
-    await context.get_context_window()
-
-    assert provider.capture_browser_state.await_count == 2
-    assert provider.capture_compact_browser_state.await_count == 0
-    assert provider.capture_browser_state.await_args.kwargs["mutating"] is False
-
-
-@pytest.mark.asyncio
-async def test_mutating_group_keeps_passing_the_mutating_flag() -> None:
-    provider = AsyncMock()
-    provider.capture_browser_state.return_value = _state("https://example.test/page")
-    engine = ContextEngine()
-    context = await engine.create_context(
-        "browser-mutating-capture-test",
-        processors=[
-            (
-                "BrowserStateContextProcessor",
-                BrowserStateContextProcessorConfig(provider=provider),
-            )
-        ],
-    )
-    await context.add_messages(UserMessage(content="click continue"))
-    await context.get_context_window()
-    await _add_completed_browser_action(
-        context,
-        call_id="click-call",
-        tool_name="browser_click",
-        arguments='{"target_id": "e1"}',
-    )
-
-    await context.get_context_window()
-
-    assert provider.capture_browser_state.await_args.kwargs["mutating"] is True
-
-
-@pytest.mark.asyncio
-async def test_capture_degrades_for_a_provider_without_the_mutating_keyword() -> None:
-    class LegacyProvider:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        async def capture_browser_state(self, *, action_group_id: str = "") -> dict:
-            self.calls.append({"action_group_id": action_group_id})
-            return _state("https://legacy.example")
-
-    provider = LegacyProvider()
-    processor = BrowserStateContextProcessor(BrowserStateContextProcessorConfig(provider=provider))
-
-    captured = await processor._capture_state(action_group_id="group-1", mutating=False)
-
-    assert captured["ok"] is True
-    assert provider.calls == [{"action_group_id": "group-1"}]
-
-
 @pytest.mark.asyncio
 async def test_processor_requires_replan_for_semantic_loop_even_when_dom_changes() -> None:
     state = _state("https://shop.example/search")
@@ -1040,7 +902,7 @@ async def test_processor_requires_replan_for_semantic_loop_even_when_dom_changes
         def update_state(self, value):
             self.state.update(value)
 
-    from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserRuntimeRail
+    from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserRuntimeRail
 
     session = Session()
     state["semantic_progress"]["revision"] = 1

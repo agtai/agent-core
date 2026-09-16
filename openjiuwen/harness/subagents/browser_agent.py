@@ -20,32 +20,29 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
-from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_processor import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_state_context_processor import (
     BrowserStateContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_processor import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessorConfig,
 )
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
-from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
-    DEFAULT_BROWSER_CAPABILITIES,
-    narrow_allowed_tools_for_browser_driver,
-    resolve_browser_capabilities,
-)
-from openjiuwen.harness.tools.browser_move.runtime.config import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
     RuntimeSettings,
     build_browser_guardrails,
     build_playwright_mcp_config,
     build_runtime_settings,
-    resolve_browser_driver_backend,
 )
-from openjiuwen.harness.tools.browser_move.runtime.runtime import (
-    BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+    DEFAULT_BROWSER_CAPABILITIES,
+    resolve_browser_capabilities,
+)
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserAgentRuntime,
     BrowserRuntimeRail,
 )
-from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
     build_browser_runtime_tools,
 )
 
@@ -72,32 +69,50 @@ _BROWSER_MODEL_TEMPERATURE_MARKER = "_browser_agent_temperature"
 _BROWSER_PARENT_MODEL_MARKER = "_browser_agent_parent_model"
 
 DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT_EN = (
-    "You are a browser automation agent. Complete the user's web task by planning and using "
-    "the available browser tools to navigate, inspect, interact, and extract evidence. "
-    "Every model call includes one runtime-maintained <browser_working_context> immediately before the "
-    "latest complete <browser_state> observation. Treat working context as authoritative for phase "
-    "status, field coverage, blockers, structured evidence, recent action deltas, and the runtime "
-    "directive. A fresh browser capture occurs initially and after a recognized state-invalidating "
-    "action; otherwise the cached observation is reused. When the runtime directive requires "
-    "replanning or a recent action reports no semantic progress, do not repeat it; use a materially "
-    "different approach or finish with the available evidence. "
-    "Before acting, classify the task as a simple lookup or a complex workflow and keep a compact "
-    "phase plan. Prefer direct navigation when the task already contains a known URL. Prefer "
-    "observable page conditions over fixed sleeps. Keep actions targeted, avoid redundant "
-    "verification, and only claim completion when the requested outcome is evidenced on the page."
+    "You are a browser automation agent responsible for executing web tasks directly. "
+    "Choose the strategy at this agent level and use the available Playwright and runtime tools; "
+    "the runtime validates targets and outcomes but does not replace your task judgment.\n"
+    "Every model call includes one runtime-maintained <browser_working_context> followed by the latest "
+    "<browser_state>. Requirements, evidence, blockers, status, and runtime directive are authoritative. "
+    "A fresh browser capture occurs initially and after a recognized page mutation; otherwise the cached "
+    "observation is reused. When the runtime directive requires replanning, change the strategy materially.\n"
+    "For a simple lookup, prefer a direct search-results URL when the engine and query are known. Use "
+    "browser_probe_interactives for page controls and browser_probe_cards for repeated results or products. "
+    "Use the compact PageState target_id with its generation_id directly; never reconstruct guessed CSS from "
+    "a target ID. When a card has primary_link or href, navigate directly to that URL.\n"
+    "Use browser_batch_interact when two or more deterministic actions or same-page field extractions are already "
+    "known. Use a primitive for one uncertain action. Prefer observable condition waits over fixed sleep. Use "
+    "browser_snapshot only when compact probes are insufficient, and browser_evaluate only for a small exact "
+    "target or computation. If an older result has a <persisted-output> marker, recall it only when its preview "
+    "does not contain the needed evidence; recalled targets are not executable after navigation.\n"
+    "Record requested values under the canonical requirement fields and use unknown for an inspected missing "
+    "value. One trustworthy page value or structured result is enough; do not verify the same fact with multiple "
+    "tools. Stop immediately when the requested outcome is evidenced. The runtime determines final status, so "
+    "return a concise natural-language result rather than another progress object.\n"
+    "If an optional capability makes a browser_run_code tool visible, use it only when deterministic tools are "
+    "insufficient, and never dump the full document. Preserve session continuity and report a concrete blocker "
+    "when the available browser state or tools cannot complete the task."
 )
 
 DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT_CN = (
-    "你是浏览器自动化代理。请规划并使用可用的浏览器工具完成用户的网页任务："
-    "导航、检查、交互和提取证据。"
-    "每次模型调用都会在最新完整的 <browser_state> 观察之前注入一份由 runtime 维护的 "
-    "<browser_working_context>。其中的阶段状态、字段覆盖率、阻断项、结构化证据、最近动作变化和 "
-    "runtime 指令均为权威信息。系统仅在初始调用和已识别的浏览器状态变更操作完成后重新捕获页面；"
-    "其他调用复用缓存观察。当 runtime 要求重新规划或最近动作没有语义进展时，不得重复该操作；"
-    "应改用实质不同的策略，或基于现有证据结束任务。"
-    "执行前先将任务判断为简单查询或复杂流程，并维护紧凑的阶段计划。"
-    "任务已包含已知 URL 时优先直接导航。优先等待可观察页面条件，不要固定 sleep。"
-    "操作应保持目标明确，避免重复验证；只有当网页上的具体证据证明任务已完成时，才声明完成。"
+    "你是浏览器自动化代理，负责直接完成网页任务。请在当前代理层决定策略并使用可见的 Playwright "
+    "和 runtime 工具；runtime 负责验证目标和结果，但不代替你的任务判断。\n"
+    "每次模型调用都会依次提供 runtime 维护的 <browser_working_context> 和最新 <browser_state>。"
+    "其中的请求字段、证据、阻断项、状态和 runtime 指令是权威信息。系统仅在初始调用和已识别的"
+    "页面变更后重新观察；runtime 要求重新规划时，应实质改变策略。\n"
+    "已知搜索引擎和关键词时，简单查询优先直接构造搜索结果 URL。页面控件使用 "
+    "browser_probe_interactives，重复结果或商品使用 browser_probe_cards。直接使用 PageState 返回的 "
+    "target_id 和 generation_id，禁止把 target_id 改写成猜测的 CSS。卡片包含 primary_link 或 href "
+    "时直接导航该 URL。\n"
+    "只有两个及以上确定动作或同页多字段提取时使用 browser_batch_interact；单个不确定动作使用基础工具。"
+    "优先等待可观察条件，不使用固定 sleep。紧凑 Probe 不足时再使用 browser_snapshot；"
+    "browser_evaluate 仅用于小范围精确目标或计算。旧结果出现 <persisted-output> 且预览不足时才恢复；"
+    "导航后恢复内容中的目标不可继续操作。\n"
+    "按 browser_working_context 中的规范字段记录证据；字段已检查但缺失时使用 unknown。"
+    "一个可信页面值或结构化结果已经足够，不要用多个工具重复验证同一事实。请求结果有证据后立即结束。"
+    "最终状态由 runtime 决定，只返回简洁自然语言结果，不再维护第二份进度对象。\n"
+    "只有可选能力明确暴露 browser_run_code 时才使用，并且仅限确定性工具不足的情况；禁止转储完整页面。"
+    "保持浏览器会话连续；现有页面或工具确实无法完成时，报告具体 blocker。"
 )
 
 DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT: Dict[str, str] = {
@@ -106,9 +121,9 @@ DEFAULT_BROWSER_AGENT_SYSTEM_PROMPT: Dict[str, str] = {
 }
 
 DEFAULT_BROWSER_AGENT_DESCRIPTION_EN = (
-    "Dedicated browser subagent that controls the browser to complete web tasks."
+    "Dedicated browser subagent that directly controls the browser with Playwright MCP tools."
 )
-DEFAULT_BROWSER_AGENT_DESCRIPTION_CN = "专用浏览器子代理，控制浏览器完成网页任务。"
+DEFAULT_BROWSER_AGENT_DESCRIPTION_CN = "专用浏览器子代理，直接使用 Playwright MCP 工具执行网页任务。"
 DEFAULT_BROWSER_AGENT_DESCRIPTION: Dict[str, str] = {
     "cn": DEFAULT_BROWSER_AGENT_DESCRIPTION_CN,
     "en": DEFAULT_BROWSER_AGENT_DESCRIPTION_EN,
@@ -299,25 +314,17 @@ def create_browser_agent(
         available = ", ".join(capability.name for capability in DEFAULT_BROWSER_CAPABILITIES)
         raise ValueError(f"Unsupported browser capabilities: {rejected}. Available capabilities: {available}")
 
-    resolved_language = resolve_language(language)
-    instance = _coerce_browser_instance(browser_instance, browser_key)
-    browser_model = _browser_model_with_temperature(model, temperature)
-    resolved_settings = _resolve_runtime_settings(browser_model, settings, instance)
-
-    allowed_tool_names = resolved_capabilities.allowed_tool_names
-    # Default backend is browser_use: only advertise tools that are actually registered.
-    if resolve_browser_driver_backend(resolved_settings.instance) == "browser_use":
-        allowed_tool_names = narrow_allowed_tools_for_browser_driver(
-            allowed_tool_names,
-            registered_catalog_tool_names=BROWSER_CATALOG_RUNTIME_TOOL_NAMES,
-        )
-
     logger.info(
         "Resolved browser capabilities: requested=%s, selected=%s, allowed_tools=%s",
         resolved_capabilities.requested_names,
         resolved_capabilities.selected_names,
-        allowed_tool_names,
+        resolved_capabilities.allowed_tool_names,
     )
+
+    resolved_language = resolve_language(language)
+    instance = _coerce_browser_instance(browser_instance, browser_key)
+    browser_model = _browser_model_with_temperature(model, temperature)
+    resolved_settings = _resolve_runtime_settings(browser_model, settings, instance)
 
     final_card = card or AgentCard(
         id=BROWSER_AGENT_CARD_ID,
@@ -340,7 +347,7 @@ def create_browser_agent(
         "mcp_cfg": resolved_settings.mcp_cfg,
         "guardrails": resolved_settings.guardrails,
         "instance": resolved_settings.instance,
-        "allowed_tool_names": allowed_tool_names,
+        "allowed_tool_names": resolved_capabilities.allowed_tool_names,
     }
     browser_backend = BrowserAgentRuntime(**runtime_kwargs)
     injected_tools = build_browser_runtime_tools(browser_backend, language=resolved_language)
@@ -351,7 +358,6 @@ def create_browser_agent(
     injected_rails: List[AgentRail] = [
         BrowserRuntimeRail(browser_backend),
     ]
-    # Non-CORE exception: recall offloaded browser tool results from working context.
     injected_tools.append(BrowserOffloadRecallTool(workspace, language=resolved_language))
 
     browser_state_processor = (
@@ -363,6 +369,8 @@ def create_browser_agent(
         working_context_config,
     )
     browser_windowed_tool_names = [
+        "browser_probe_interactives",
+        "browser_probe_cards",
         "browser_snapshot",
         "browser_find",
         "browser_evaluate",

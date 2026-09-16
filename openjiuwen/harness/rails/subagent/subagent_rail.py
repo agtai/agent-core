@@ -15,7 +15,7 @@ from openjiuwen.harness.prompts.tools import get_tool_description
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.tools import SessionToolkit, build_session_tools, create_task_tool
-from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
     DEFAULT_BROWSER_CAPABILITIES,
 )
 from openjiuwen.harness.tools.subagent._control_registry import release_all_subagent_controls

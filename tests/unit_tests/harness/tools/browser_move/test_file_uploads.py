@@ -9,8 +9,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from openjiuwen.harness.tools.browser_move.runtime.controllers.action import ActionController, register_builtin_actions
-from openjiuwen.harness.tools.browser_move.runtime.controllers.action import _build_set_input_files_script, _list_dir_files
+from openjiuwen.harness.tools.browser_move.controllers.action import ActionController, register_builtin_actions
+from openjiuwen.harness.tools.browser_move.controllers.action import _build_set_input_files_script, _list_dir_files
 
 
 def _run(coro):

@@ -11,18 +11,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.runtime.config import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
     BrowserInstanceConfig,
     BrowserRunGuardrails,
 )
-from openjiuwen.harness.tools.browser_move.runtime.service import BrowserService
-from openjiuwen.harness.tools.browser_move.runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
     BrowserAgentRuntime,
     _ACTIVE_BROWSER_RUNTIMES,
     reset_active_browser_runtimes,
     reset_managed_browser_runtime,
 )
-from openjiuwen.harness.tools.browser_move.runtime.service_registry import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.service_registry import (
     BROWSER_SERVICE_REGISTRY,
     BrowserServiceRegistry,
 )

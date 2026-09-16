@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.chrome.managed_browser import (
+from openjiuwen.harness.tools.browser_move.drivers.managed_browser import (
     ManagedBrowserDriver,
 )
-from openjiuwen.harness.tools.browser_move.runtime.profiles import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.profiles import (
     BrowserProfile,
 )
 
@@ -32,7 +32,7 @@ def _make_driver() -> ManagedBrowserDriver:
 def test_start_reuses_existing_endpoint_without_spawning() -> None:
     driver = _make_driver()
     with patch.object(driver, "_is_endpoint_ready", return_value=True), patch(
-        "openjiuwen.harness.tools.browser_move.chrome.managed_browser.subprocess.Popen"
+        "openjiuwen.harness.tools.browser_move.drivers.managed_browser.subprocess.Popen"
     ) as mock_popen:
         endpoint = driver.start()
 
@@ -68,7 +68,7 @@ def test_resolve_binary_autodetects_when_path_is_empty() -> None:
     driver.profile.browser_binary = ""
 
     with patch(
-        "openjiuwen.harness.tools.browser_move.chrome.managed_browser._candidate_chrome_binaries",
+        "openjiuwen.harness.tools.browser_move.drivers.managed_browser._candidate_chrome_binaries",
         return_value=["detected-chrome"],
     ):
         assert driver._resolve_binary() == "detected-chrome"
@@ -79,7 +79,7 @@ def test_resolve_binary_does_not_fallback_for_invalid_explicit_path() -> None:
     driver.profile.browser_binary = "C:/missing/chrome.exe"
 
     with patch(
-        "openjiuwen.harness.tools.browser_move.chrome.managed_browser._candidate_chrome_binaries",
+        "openjiuwen.harness.tools.browser_move.drivers.managed_browser._candidate_chrome_binaries",
         return_value=["detected-chrome"],
     ), pytest.raises(RuntimeError, match="Configured Chrome binary not found"):
         driver._resolve_binary()

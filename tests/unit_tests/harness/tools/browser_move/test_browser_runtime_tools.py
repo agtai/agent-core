@@ -5,38 +5,20 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from openjiuwen.core.foundation.tool import McpServerConfig, Tool, ToolCard
-from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
-from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
     BrowserBatchInteractTool,
     BrowserCancelTool,
     BrowserClearCancelTool,
-    BrowserClickTool,
-    BrowserCloseTool,
     BrowserCustomActionTool,
-    BrowserDragTool,
-    BrowserDropTool,
-    BrowserEvaluateTool,
-    BrowserFileUploadTool,
-    BrowserFillFormTool,
-    BrowserFindTool,
-    BrowserHandleDialogTool,
-    BrowserHoverTool,
     BrowserListActionsTool,
-    BrowserNavigateBackTool,
-    BrowserNavigateTool,
-    BrowserPressKeyTool,
     BrowserProbeCardsTool,
     BrowserProbeInteractivesTool,
     BrowserRuntimeHealthTool,
-    BrowserSelectOptionTool,
-    BrowserSnapshotTool,
-    BrowserTabsTool,
-    BrowserTakeScreenshotTool,
-    BrowserTypeTool,
     build_browser_runtime_tools,
 )
 
@@ -63,9 +45,9 @@ def _make_runtime() -> BrowserAgentRuntime:
     )
 
 
-def test_build_browser_runtime_tools_returns_catalog_and_cancel_tools() -> None:
+def test_build_browser_runtime_tools_returns_helper_tools_by_default() -> None:
     tools = build_browser_runtime_tools(_make_runtime())
-    assert len(tools) == 20
+    assert len(tools) == 3
 
 
 def test_each_tool_is_tool_subclass() -> None:
@@ -78,85 +60,20 @@ def test_each_tool_has_tool_card() -> None:
         assert isinstance(tool.card, ToolCard)
 
 
-def test_default_catalog_tool_names() -> None:
+def test_default_helper_tool_names() -> None:
     names = [tool.card.name for tool in build_browser_runtime_tools(_make_runtime())]
     assert names == [
-        "browser_navigate",
-        "browser_navigate_back",
-        "browser_click",
-        "browser_type",
-        "browser_press_key",
-        "browser_take_screenshot",
-        "browser_tabs",
-        "browser_close",
-        "browser_select_option",
-        "browser_evaluate",
-        "browser_drag",
-        "browser_file_upload",
-        "browser_hover",
-        "browser_find",
-        "browser_handle_dialog",
-        "browser_drop",
-        "browser_fill_form",
-        "browser_snapshot",
-        "browser_cancel_run",
-        "browser_clear_cancel",
-    ]
-    # Phase C: helpers are demoted from model injection.
-    for demoted in (
         "browser_probe_interactives",
         "browser_probe_cards",
         "browser_batch_interact",
-        "browser_custom_action",
-        "browser_list_custom_actions",
-        "browser_runtime_health",
-    ):
-        assert demoted not in names
+    ]
 
 
 def test_helper_tool_classes() -> None:
-    (
-        navigate,
-        navigate_back,
-        click,
-        type_tool,
-        press_key,
-        screenshot,
-        tabs,
-        close_tool,
-        select_option,
-        evaluate,
-        drag,
-        file_upload,
-        hover,
-        find_tool,
-        handle_dialog,
-        drop,
-        fill_form,
-        snapshot,
-        cancel,
-        clear_cancel,
-    ) = build_browser_runtime_tools(_make_runtime())
-    assert isinstance(navigate, BrowserNavigateTool)
-    assert isinstance(navigate_back, BrowserNavigateBackTool)
-    assert isinstance(click, BrowserClickTool)
-    assert isinstance(type_tool, BrowserTypeTool)
-    assert isinstance(press_key, BrowserPressKeyTool)
-    assert isinstance(screenshot, BrowserTakeScreenshotTool)
-    assert isinstance(tabs, BrowserTabsTool)
-    assert isinstance(close_tool, BrowserCloseTool)
-    assert isinstance(select_option, BrowserSelectOptionTool)
-    assert isinstance(evaluate, BrowserEvaluateTool)
-    assert isinstance(drag, BrowserDragTool)
-    assert isinstance(file_upload, BrowserFileUploadTool)
-    assert isinstance(hover, BrowserHoverTool)
-    assert isinstance(find_tool, BrowserFindTool)
-    assert isinstance(handle_dialog, BrowserHandleDialogTool)
-    assert isinstance(drop, BrowserDropTool)
-    assert isinstance(fill_form, BrowserFillFormTool)
-    assert isinstance(snapshot, BrowserSnapshotTool)
-    assert isinstance(cancel, BrowserCancelTool)
-    assert isinstance(clear_cancel, BrowserClearCancelTool)
+    probe_interactives, probe_cards, batch_interact = build_browser_runtime_tools(_make_runtime())
+    assert isinstance(probe_interactives, BrowserProbeInteractivesTool)
+    assert isinstance(probe_cards, BrowserProbeCardsTool)
+    assert isinstance(batch_interact, BrowserBatchInteractTool)
 
 
 def test_language_en_uses_non_empty_descriptions() -> None:
@@ -180,348 +97,6 @@ def test_cancel_tool_calls_cancel_run() -> None:
     runtime.ensure_runtime_ready.assert_called_once()
     runtime.cancel_run.assert_called_once_with(session_id="s1", request_id=None)
     assert result.success is True
-
-
-def test_navigate_tool_calls_runtime_navigate() -> None:
-    runtime = _make_runtime()
-    runtime.navigate = AsyncMock(
-        return_value={
-            "ok": True,
-            "url": "https://example.com/",
-            "title": "Example Domain",
-            "changed_document": True,
-            "page_state": {"url": "https://example.com/", "generation_id": "g1"},
-        }
-    )
-    tool = BrowserNavigateTool(runtime)
-    result = _run(
-        tool.invoke(
-            {
-                "url": "https://example.com",
-                "wait_until": "domcontentloaded",
-                "timeout_ms": 5000,
-            }
-        )
-    )
-    runtime.navigate.assert_called_once_with(
-        url="https://example.com",
-        wait_until="domcontentloaded",
-        timeout_ms=5000,
-    )
-    assert result.success is True
-    assert result.data["url"] == "https://example.com/"
-
-
-def test_navigate_tool_is_registered_in_build_browser_runtime_tools() -> None:
-    tools = build_browser_runtime_tools(_make_runtime())
-    navigate = next(tool for tool in tools if tool.card.name == "browser_navigate")
-    assert isinstance(navigate, BrowserNavigateTool)
-    assert "url" in navigate.card.input_params["required"]
-
-
-def test_navigate_tool_rejects_non_integer_timeout() -> None:
-    runtime = _make_runtime()
-    runtime.navigate = AsyncMock()
-    tool = BrowserNavigateTool(runtime)
-    result = _run(tool.invoke({"url": "https://example.com", "timeout_ms": "slow"}))
-    assert result.success is False
-    assert "timeout_ms" in (result.error or "")
-    runtime.navigate.assert_not_called()
-
-
-def test_runtime_navigate_calls_driver_navigate() -> None:
-    from openjiuwen.harness.tools.browser_move.backends.contract.base import NavResult
-
-    runtime = _make_runtime()
-    driver = AsyncMock()
-    driver.navigate = AsyncMock(
-        return_value=NavResult(
-            url="https://example.com/",
-            title="Example Domain",
-            changed_document=True,
-            driver_generation=2,
-        )
-    )
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime._ensure_browser_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
-    runtime._apply_document_changed = MagicMock()  # type: ignore[method-assign]
-
-    result = _run(
-        runtime.navigate(
-            url="https://example.com",
-            wait_until="domcontentloaded",
-            timeout_ms=2500,
-        )
-    )
-
-    driver.navigate.assert_called_once_with(
-        "https://example.com",
-        wait_until="domcontentloaded",
-        timeout_ms=2500,
-    )
-    runtime._apply_document_changed.assert_called_once_with(
-        changed=True,
-        url="https://example.com/",
-        title="Example Domain",
-    )
-    assert result["ok"] is True
-    assert result["url"] == "https://example.com/"
-    assert result["title"] == "Example Domain"
-
-
-def test_click_tool_calls_runtime_click() -> None:
-    runtime = _make_runtime()
-    runtime.click = AsyncMock(return_value={"ok": True, "detail": "clicked", "page_state": {}})
-    tool = BrowserClickTool(runtime)
-    result = _run(
-        tool.invoke(
-            {
-                "generation_id": "g1",
-                "target_id": "t_g1_1",
-                "button": "left",
-                "click_count": 1,
-            }
-        )
-    )
-    runtime.click.assert_called_once_with(
-        generation_id="g1",
-        target_id="t_g1_1",
-        ref="",
-        selector="",
-        button="left",
-        click_count=1,
-    )
-    assert result.success is True
-
-
-def test_type_tool_calls_runtime_type_text() -> None:
-    runtime = _make_runtime()
-    runtime.type_text = AsyncMock(return_value={"ok": True, "detail": "typed", "page_state": {}})
-    tool = BrowserTypeTool(runtime)
-    result = _run(
-        tool.invoke(
-            {
-                "generation_id": "g2",
-                "selector": "#q",
-                "text": "hello",
-                "clear": True,
-                "press_enter": True,
-            }
-        )
-    )
-    runtime.type_text.assert_called_once_with(
-        generation_id="g2",
-        text="hello",
-        target_id="",
-        ref="",
-        selector="#q",
-        clear=True,
-        press_enter=True,
-        sensitive=False,
-    )
-    assert result.success is True
-
-
-def test_press_key_tool_calls_runtime_press_key() -> None:
-    runtime = _make_runtime()
-    runtime.press_key = AsyncMock(return_value={"ok": True, "detail": "pressed", "page_state": {}})
-    tool = BrowserPressKeyTool(runtime)
-    result = _run(tool.invoke({"key": "Enter"}))
-    runtime.press_key.assert_called_once_with(keys="Enter")
-    assert result.success is True
-
-
-def test_navigate_back_tool_calls_runtime_navigate_back() -> None:
-    runtime = _make_runtime()
-    runtime.navigate_back = AsyncMock(
-        return_value={"ok": True, "url": "https://example.com/", "title": "Example", "page_state": {}}
-    )
-    tool = BrowserNavigateBackTool(runtime)
-    result = _run(tool.invoke({}))
-    runtime.navigate_back.assert_called_once_with()
-    assert result.success is True
-
-
-def test_screenshot_tool_calls_runtime_take_screenshot() -> None:
-    runtime = _make_runtime()
-    runtime.take_screenshot = AsyncMock(
-        return_value={"ok": True, "screenshot_b64": "abc", "full_page": False, "page_state": {}}
-    )
-    tool = BrowserTakeScreenshotTool(runtime)
-    result = _run(tool.invoke({"full_page": False}))
-    runtime.take_screenshot.assert_called_once_with(full_page=False)
-    assert result.success is True
-
-
-def test_tabs_tool_calls_runtime_tabs() -> None:
-    runtime = _make_runtime()
-    runtime.tabs = AsyncMock(return_value={"ok": True, "action": "list", "tabs": [], "page_state": {}})
-    tool = BrowserTabsTool(runtime)
-    result = _run(tool.invoke({"action": "list"}))
-    runtime.tabs.assert_called_once_with(action="list", index=None)
-    assert result.success is True
-
-
-def test_select_option_tool_calls_runtime() -> None:
-    runtime = _make_runtime()
-    runtime.select_option = AsyncMock(return_value={"ok": True, "detail": "selected", "page_state": {}})
-    tool = BrowserSelectOptionTool(runtime)
-    result = _run(
-        tool.invoke(
-            {
-                "generation_id": "g1",
-                "selector": "#country",
-                "label": "Singapore",
-            }
-        )
-    )
-    runtime.select_option.assert_called_once_with(
-        generation_id="g1",
-        target_id="",
-        ref="",
-        selector="#country",
-        value=None,
-        label="Singapore",
-    )
-    assert result.success is True
-
-
-def test_evaluate_tool_calls_runtime() -> None:
-    runtime = _make_runtime()
-    runtime.evaluate = AsyncMock(return_value={"ok": True, "value": 2, "page_state": {}})
-    tool = BrowserEvaluateTool(runtime)
-    result = _run(tool.invoke({"function": "() => 1 + 1"}))
-    runtime.evaluate.assert_called_once_with(source="() => 1 + 1", args=None)
-    assert result.success is True
-
-
-def test_runtime_evaluate_rejects_document_dumps() -> None:
-    runtime = _make_runtime()
-    runtime.ensure_runtime_ready = AsyncMock()
-    result = _run(runtime.evaluate(source="() => document.body.innerHTML"))
-    assert result["ok"] is False
-    assert "full-document" in (result["error"] or "")
-
-
-def test_runtime_select_option_calls_driver() -> None:
-    from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
-
-    runtime = _make_runtime()
-    driver = AsyncMock()
-    driver.select_option = AsyncMock(
-        return_value=ActResult(ok=True, detail="selected", document_changed=False, driver_generation=4)
-    )
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime._ensure_browser_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
-    runtime._resolve_catalog_element_ref = AsyncMock(return_value=SelectorRef(css="#country"))  # type: ignore[method-assign]
-    runtime._apply_document_changed = MagicMock()  # type: ignore[method-assign]
-
-    result = _run(
-        runtime.select_option(
-            generation_id="g1",
-            selector="#country",
-            label="SG",
-        )
-    )
-    driver.select_option.assert_called_once_with(
-        SelectorRef(css="#country"),
-        value=None,
-        label="SG",
-    )
-    assert result["ok"] is True
-
-
-def test_close_snapshot_drag_upload_tools_call_runtime() -> None:
-    runtime = _make_runtime()
-    runtime.close_page = AsyncMock(return_value={"ok": True, "page_state": {}})
-    runtime.snapshot = AsyncMock(return_value={"ok": True, "ax_text": "Heading", "page_state": {}})
-    runtime.drag = AsyncMock(return_value={"ok": True, "page_state": {}})
-    runtime.file_upload = AsyncMock(return_value={"ok": True, "page_state": {}})
-    runtime.fill_form = AsyncMock(return_value={"ok": True, "results": [], "page_state": {}})
-
-    assert _run(BrowserCloseTool(runtime).invoke({})).success is True
-    assert _run(BrowserSnapshotTool(runtime).invoke({})).success is True
-    assert _run(
-        BrowserDragTool(runtime).invoke(
-            {
-                "generation_id": "g1",
-                "source_selector": "#a",
-                "target_selector": "#b",
-            }
-        )
-    ).success is True
-    assert _run(
-        BrowserFileUploadTool(runtime).invoke(
-            {
-                "generation_id": "g1",
-                "selector": "input[type=file]",
-                "paths": ["/tmp/a.txt"],
-            }
-        )
-    ).success is True
-    assert _run(
-        BrowserFillFormTool(runtime).invoke(
-            {
-                "generation_id": "g1",
-                "fields": [{"type": "textbox", "selector": "#name", "value": "Ada"}],
-            }
-        )
-    ).success is True
-
-    runtime.close_page.assert_called_once()
-    runtime.snapshot.assert_called_once_with(include_screenshot=False)
-    runtime.drag.assert_called_once()
-    runtime.file_upload.assert_called_once()
-    runtime.fill_form.assert_called_once()
-
-
-def test_runtime_click_calls_driver_click() -> None:
-    from openjiuwen.harness.tools.browser_move.backends.contract.base import ActResult, SelectorRef
-
-    runtime = _make_runtime()
-    driver = AsyncMock()
-    driver.click = AsyncMock(
-        return_value=ActResult(ok=True, detail="clicked", document_changed=False, driver_generation=3)
-    )
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime._ensure_browser_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
-    runtime._resolve_catalog_element_ref = AsyncMock(return_value=SelectorRef(css="#go"))  # type: ignore[method-assign]
-    runtime._apply_document_changed = MagicMock()  # type: ignore[method-assign]
-
-    result = _run(
-        runtime.click(
-            generation_id="g1",
-            selector="#go",
-        )
-    )
-
-    runtime._resolve_catalog_element_ref.assert_called_once()
-    driver.click.assert_called_once()
-    assert result["ok"] is True
-    assert result["detail"] == "clicked"
-
-
-def test_runtime_navigate_back_calls_driver_go_back() -> None:
-    from openjiuwen.harness.tools.browser_move.backends.contract.base import NavResult
-
-    runtime = _make_runtime()
-    driver = AsyncMock()
-    driver.go_back = AsyncMock(
-        return_value=NavResult(
-            url="https://example.com/",
-            title="Example Domain",
-            changed_document=True,
-            driver_generation=4,
-        )
-    )
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime._ensure_browser_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
-    runtime._apply_document_changed = MagicMock()  # type: ignore[method-assign]
-
-    result = _run(runtime.navigate_back())
-    driver.go_back.assert_called_once_with()
-    assert result["ok"] is True
-    assert result["url"] == "https://example.com/"
 
 
 def test_clear_cancel_tool_calls_runtime_clear_cancel() -> None:
