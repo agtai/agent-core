@@ -26,9 +26,6 @@ from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_process
 from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessorConfig,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_rail import (
-    BrowserWorkingContextRail,
-)
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
 from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     DEFAULT_BROWSER_CAPABILITIES,
@@ -349,10 +346,10 @@ def create_browser_agent(
     injected_tools = build_browser_runtime_tools(browser_backend, language=resolved_language)
     working_context_config = BrowserWorkingContextProcessorConfig(
         language=resolved_language,
+        runtime_projection_only=True,
     )
     injected_rails: List[AgentRail] = [
         BrowserRuntimeRail(browser_backend),
-        BrowserWorkingContextRail(working_context_config),
     ]
     # Non-CORE exception: recall offloaded browser tool results from working context.
     injected_tools.append(BrowserOffloadRecallTool(workspace, language=resolved_language))
@@ -367,13 +364,25 @@ def create_browser_agent(
     )
     browser_windowed_tool_names = [
         "browser_snapshot",
+        "browser_find",
         "browser_evaluate",
     ]
+    browser_tool_result_window_processor = (
+        "ToolResultWindowProcessor",
+        ToolResultWindowProcessorConfig(
+            tool_names=browser_windowed_tool_names,
+            keep_last_k=1,
+            trim_size=1000,
+            min_offload_chars=4096,
+            small_result_trim_size=800,
+        ),
+    )
     caller_context_rails = [rail for rail in (rails or []) if isinstance(rail, ContextProcessorRail)]
     if caller_context_rails:
         for context_rail in caller_context_rails:
             context_rail.add_processors(
                 [
+                    browser_tool_result_window_processor,
                     browser_state_processor,
                     browser_working_context_processor,
                 ]
@@ -382,16 +391,7 @@ def create_browser_agent(
         injected_rails.append(
             ContextProcessorRail(
                 processors=[
-                    (
-                        "ToolResultWindowProcessor",
-                        ToolResultWindowProcessorConfig(
-                            tool_names=browser_windowed_tool_names,
-                            keep_last_k=1,
-                            trim_size=1000,
-                            min_offload_chars=4096,
-                            small_result_trim_size=800,
-                        ),
-                    ),
+                    browser_tool_result_window_processor,
                     browser_state_processor,
                     browser_working_context_processor,
                 ],

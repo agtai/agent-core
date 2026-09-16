@@ -1996,15 +1996,13 @@ def build_browser_runtime_tools(
     """
 
     if not _runtime_uses_browser_driver(runtime):
+        # Ported from agtai/develop #1147: routing the browser through the
+        # synchronous task tool makes the cancel / custom-action / list-actions /
+        # health tools redundant on the Playwright MCP path.
         return [
-            BrowserCancelTool(runtime, language),
-            BrowserClearCancelTool(runtime, language),
             BrowserProbeInteractivesTool(runtime, language),
             BrowserProbeCardsTool(runtime, language),
             BrowserBatchInteractTool(runtime, language),
-            BrowserCustomActionTool(runtime, language),
-            BrowserListActionsTool(runtime, language),
-            BrowserRuntimeHealthTool(runtime, language),
         ]
 
     return [

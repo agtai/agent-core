@@ -397,6 +397,109 @@ def _copy_non_none_values(
     return copied
 
 
+
+# ---- ported from agtai/develop (base-only constants) ----
+_BROWSER_SCREENSHOT_TOOL_NAMES = frozenset({"browser_take_screenshot"})
+
+_BROWSER_INVOCATION_DEADLINE_KEY = "__browser_invocation_deadline__"
+
+_BROWSER_SIMPLE_TASK_DEADLINE_S = 240.0
+
+_BROWSER_COMPLEX_TASK_DEADLINE_S = 600.0
+
+_BROWSER_OBSERVATION_MESSAGE_MAX_CHARS = 12_000
+
+_BROWSER_BOUNDED_OBSERVATION_TOOL_TOKENS = (
+    "browser_probe_cards",
+    "browser_probe_interactives",
+    "browser_snapshot",
+    "browser_find",
+    "browser_evaluate",
+)
+
+_BROWSER_TOOL_ERROR_PREFIX_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:ability execution error|tool execution error|"
+    r"workflow execution error|agent execution error|error|failed)\s*(?::|\n|$)",
+    re.IGNORECASE,
+)
+
+_BROWSER_TIMEOUT_ERROR_RE = re.compile(
+    r"\b(?:timed?\s*out|timeout(?:error)?|deadline\s+exceeded)\b",
+    re.IGNORECASE,
+)
+
+_BROWSER_EVALUATE_FIELD_ALIASES = {
+    "article_title": "title",
+    "page_title": "title",
+    "product_title": "title",
+    "result_title": "title",
+    "author_name": "author",
+    "author_raw": "author",
+    "creator_name": "author",
+    "profile_name": "author",
+    "writer_name": "author",
+    "like_count": "likes",
+    "likes_count": "likes",
+    "like_raw": "likes",
+    "upvote_count": "likes",
+    "favorite_count": "favorites",
+    "favorites_count": "favorites",
+    "favourite_count": "favorites",
+    "bookmark_count": "favorites",
+    "fav_raw": "favorites",
+    "comment_count": "comments",
+    "comments_count": "comments",
+    "reply_count": "comments",
+    "comment_raw": "comments",
+    "com_raw": "comments",
+    "active_tab": "sort_state",
+    "active_tabs": "sort_state",
+    "selected_tab": "sort_state",
+    "selected_tabs": "sort_state",
+    "sort_selected": "sort_state",
+}
+
+_BROWSER_CONTEXTUAL_EVALUATE_FIELD_ALIASES = frozenset(
+    {
+        "name",
+        "profile_name",
+        "active_tab",
+        "active_tabs",
+        "selected_tab",
+        "selected_tabs",
+    }
+)
+
+_BROWSER_SELECTED_SORT_LABELS = {
+    "sale": "щФАщЗП",
+    "sales": "щФАщЗП",
+    "volume": "щФАщЗП",
+    "щФАщЗП": "щФАщЗП",
+    "price": "ф╗╖ца╝",
+    "ф╗╖ца╝": "ф╗╖ца╝",
+    "latest": "цЬАцЦ░",
+    "newest": "цЬАцЦ░",
+    "цЬАцЦ░": "цЬАцЦ░",
+    "comprehensive": "ч╗╝хРИ",
+    "relevance": "ч╗╝хРИ",
+    "default": "ч╗╝хРИ",
+    "ч╗╝хРИ": "ч╗╝хРИ",
+    "rating": "шпДхИЖ",
+    "score": "шпДхИЖ",
+    "шпДхИЖ": "шпДхИЖ",
+}
+
+_BROWSER_UNKNOWN_VALUE_RE = re.compile(
+    r"^(?:unknown|n/?a|not available|not found|цЬкцЙ╛хИ░|цЬкчЯе|цЪВцЧа|цЬкцШ╛чд║|ф╕НхПпчФи)$",
+    re.IGNORECASE,
+)
+
+_BROWSER_ZERO_COMMENT_RE = re.compile(
+    r"^(?:0|no comments?|no replies|ш┐Шц▓бцЬЙшпДшо║|цЪВцЧашпДшо║|ц▓бцЬЙшпДшо║|цЪВцЧахЫЮхдН|0\s*цЭбшпДшо║)$",
+    re.IGNORECASE,
+)
+
+
 class BrowserAgentRuntime:
     """Runtime kernel for browser lifecycle and deterministic helper actions."""
 
@@ -3593,6 +3696,229 @@ class BrowserAgentRuntime:
             self._semantic_state_tracker = tracker
         return tracker
 
+    # ---- ported from agtai/develop (base-only BrowserAgentRuntime methods) ----
+    def set_task_requested_fields(self, fields: Iterable[str]) -> None:
+        """Keep PageState projection scoped to fields requested by this task."""
+
+        self._ensure_page_state().set_requested_fields(fields)
+
+    def resolve_model_target_id(self, target_id: str) -> BrowserTarget:
+        """Resolve or safely refresh a runtime-owned model target."""
+
+        page_state = self._ensure_page_state()
+        normalized = str(target_id or "").strip()
+        target = page_state.get_target(normalized)
+        if target is None:
+            raise ValueError(
+                f"Unknown PageState target_id {normalized}; current generation is "
+                f"{page_state.generation_id}."
+            )
+        if target.generation != page_state.generation:
+            target = page_state.get_target(page_state.refresh_target_id(normalized))
+        if target is None:
+            raise ValueError(
+                f"PageState target_id {normalized} could not be refreshed in "
+                f"{page_state.generation_id}."
+            )
+        return target
+
+    def target_recovery_state(self, target_id: str) -> Dict[str, Any]:
+        """Return bounded current-generation recovery details for one target."""
+
+        page_state = self._ensure_page_state()
+        return {
+            "current_generation": page_state.generation_id,
+            "candidate_fresh_targets": page_state.recovery_candidates(target_id, limit=5),
+        }
+
+    @classmethod
+    def classify_tool_result(cls, value: Any) -> Dict[str, Any]:
+        """Return one normalized success/error view for every tool transport."""
+
+        nested = value
+        explicit_failure = bool(
+            getattr(value, "success", None) is False
+            or getattr(value, "isError", getattr(value, "is_error", None)) is True
+        )
+        denied = False
+        error_text = str(getattr(value, "error", "") or "").strip() if explicit_failure else ""
+        data = getattr(value, "data", None)
+        if data is not None:
+            nested = data
+
+        if isinstance(nested, dict):
+            mapping_failure, denied, mapping_error = cls._classify_mapping_tool_result(nested)
+            explicit_failure = explicit_failure or mapping_failure
+            error_text = mapping_error or error_text
+        elif isinstance(nested, str):
+            stripped = nested.strip()
+            try:
+                parsed = json.loads(stripped)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                parsed_outcome = cls.classify_tool_result(parsed)
+                explicit_failure = explicit_failure or not parsed_outcome["success"]
+                denied = denied or parsed_outcome["denied"]
+                error_text = error_text or str(parsed_outcome["error"] or "")
+            elif _BROWSER_TOOL_ERROR_PREFIX_RE.match(stripped):
+                explicit_failure = True
+                error_text = stripped
+
+        timed_out = bool(error_text and _BROWSER_TIMEOUT_ERROR_RE.search(error_text))
+        return {
+            "success": not explicit_failure,
+            "error": error_text[:2_000],
+            "denied": denied,
+            "timed_out": timed_out,
+        }
+
+    @staticmethod
+    def _classify_mapping_tool_result(value: Dict[str, Any]) -> tuple[bool, bool, str]:
+        status = str(value.get("status") or "").strip().lower()
+        denied = value.get("denied") is True or status == "denied"
+        nested_error = value.get("error")
+        if isinstance(nested_error, dict):
+            nested_error = nested_error.get("message") or nested_error.get("code")
+        error_text = str(nested_error or "").strip()
+        failure = bool(
+            value.get("ok") is False
+            or value.get("success") is False
+            or value.get("isError") is True
+            or value.get("is_error") is True
+            or error_text
+            or status in {"error", "failed", "failure", "partial", "denied", "timeout", "timed_out"}
+        )
+        for step in value.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            step_status = str(step.get("status") or "").strip().lower()
+            if step.get("ok") is not False and step_status not in {
+                "error",
+                "failed",
+                "failure",
+                "timeout",
+                "timed_out",
+            }:
+                continue
+            failure = True
+            error_text = error_text or str(step.get("error") or f"batch step {step.get('index')} failed").strip()
+            break
+        if not failure and isinstance(value.get("content"), list):
+            for item in value["content"]:
+                if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                    continue
+                if _BROWSER_TOOL_ERROR_PREFIX_RE.match(item["text"]):
+                    return True, denied, item["text"].strip()
+        return failure, denied, error_text
+
+    async def capture_reconciliation_browser_state(self, *, action_group_id: str) -> Dict[str, Any]:
+        """Reconcile an ambiguous mutation without capturing a full AX snapshot."""
+
+        await self.ensure_runtime_ready()
+        metadata, metadata_error = await self._capture_browser_metadata()
+        self._observe_page_url(metadata.get("url"))
+        self._ensure_page_state().observe(title=metadata.get("title"))
+        page_state = self.export_page_state()
+        semantic_state = metadata.get("semantic_state")
+        if not isinstance(semantic_state, dict):
+            semantic_state = {}
+        semantic_state.update(
+            {
+                "url": metadata.get("url") or page_state.get("url") or "",
+                "field_coverage": page_state.get("field_coverage") or [],
+            }
+        )
+        tracker = self._ensure_semantic_state_tracker()
+        if metadata_error:
+            semantic_progress = tracker.latest
+            semantic_progress.update(
+                {
+                    "progress": "unknown",
+                    "observable_progress": False,
+                    "capture_error": metadata_error,
+                }
+            )
+        else:
+            semantic_progress = tracker.observe(semantic_state, action_group_id=action_group_id)
+        semantic_state = self._with_semantic_provenance(
+            semantic_progress,
+            fallback_state=semantic_state,
+        )
+        return {
+            "ok": not metadata_error,
+            "error": metadata_error,
+            "url": metadata.get("url") or page_state.get("url") or "",
+            "title": metadata.get("title") or page_state.get("title") or "",
+            "tabs": metadata.get("tabs") or [],
+            "page_position": metadata.get("page_position") or {},
+            "semantic_state": semantic_state,
+            "semantic_progress": semantic_progress,
+            "field_coverage": semantic_state.get("field_coverage") or [],
+            "page_state": page_state,
+            "dom": "",
+            "dom_error": None,
+            "reconciliation_only": True,
+        }
+
+    def _with_semantic_provenance(
+        self,
+        semantic_progress: Dict[str, Any],
+        *,
+        fallback_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        tracked_state = semantic_progress.get("semantic_state")
+        semantic_state = dict(tracked_state) if isinstance(tracked_state, dict) else dict(fallback_state)
+        semantic_state["generation_id"] = self.generation_id
+        semantic_progress["semantic_state"] = semantic_state
+        return semantic_state
+
+    async def _capture_browser_metadata(self) -> tuple[Dict[str, Any], Optional[str]]:
+        """Capture the bounded metadata used for semantic reconciliation."""
+
+        try:
+            raw_metadata = await self._call_playwright_run_code_unsafe(build_browser_state_metadata_js())
+            raw_metadata = self._unwrap_mcp_text_result(raw_metadata)
+            metadata = extract_json_object(raw_metadata)
+            if not metadata:
+                return {}, "Could not parse browser state metadata result JSON"
+            if metadata.get("ok") is False:
+                return metadata, str(metadata.get("error") or "browser state metadata capture failed")
+            return metadata, None
+        except Exception as exc:
+            logger.warning(
+                "[BrowserAgentRuntime] current browser metadata capture failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return {}, f"browser state metadata capture failed: {exc}"
+
+    async def _execute_probe_json(
+        self,
+        js_code: str,
+        *,
+        artifact_kind: str,
+    ) -> tuple[Dict[str, Any], Any, int]:
+        """Execute a probe and recover one malformed JSON response internally."""
+
+        last_raw: Any = ""
+        for attempt in range(2):
+            last_raw = await self._code_executor(js_code)
+            last_raw = self._unwrap_mcp_text_result(last_raw)
+            parsed = extract_json_object(last_raw)
+            if parsed:
+                return (
+                    parsed,
+                    write_browser_agent_audit_artifact(artifact_kind, last_raw),
+                    attempt,
+                )
+        return (
+            {},
+            write_browser_agent_audit_artifact(artifact_kind, last_raw),
+            1,
+        )
+
+
 
 async def reset_active_browser_runtimes() -> int:
     """Reset every live browser runtime owned by this process."""
@@ -6480,3 +6806,814 @@ class BrowserRuntimeRail(AgentRail):
         )
         if allowed_tool_names is not None:
             ability_manager.set_mcp_tool_allowlist(mcp_cfg, allowed_tool_names)
+
+    # ---- ported from agtai/develop (base-only BrowserRuntimeRail methods) ----
+    def _handle_progress_tool_alias(self, ctx: AgentCallbackContext) -> bool:
+        inputs = getattr(ctx, "inputs", None)
+        tool_name = str(getattr(inputs, "tool_name", "") or "").strip().lower()
+        if tool_name != "browser_progress" and not tool_name.endswith("_browser_progress"):
+            return False
+        session = getattr(ctx, "session", None)
+        if session is None:
+            self._deny_tool_call(ctx, ValueError("browser_progress requires an active browser task session"))
+            return True
+        payload = self._coerce_tool_args(getattr(inputs, "tool_args", None))
+        state = session.get_state(_BROWSER_PHASE_STATE_KEY)
+        state = state if isinstance(state, dict) else {}
+        reported_status = str(payload.get("status") or "").strip().lower()
+        if not reported_status:
+            missing = self._missing_completion_requirements(state)
+            blockers = [str(item) for item in state.get("blockers") or [] if str(item).strip()]
+            runtime_ready = bool(
+                state.get("structured_evidence")
+                or state.get("evidence_slots")
+                or state.get("field_coverage")
+            )
+            if not blockers and not missing and runtime_ready:
+                payload["status"] = "completed"
+                reported_status = "completed"
+            elif missing and not self._missing_evidence_slots(state) and self._unavailable_evidence_slots(state):
+                payload["status"] = "partial"
+                reported_status = "partial"
+            else:
+                self._deny_tool_call(
+                    ctx,
+                    ValueError(
+                        "browser_progress did not include a terminal status and runtime evidence is "
+                        "not yet complete. Continue this browser task and collect only the unresolved "
+                        "requirements before finishing."
+                    ),
+                )
+                return True
+        if reported_status not in _BROWSER_TERMINAL_STATUSES:
+            self._deny_tool_call(
+                ctx,
+                ValueError(
+                    "<browser_progress> is a final text protocol. Continue with a real browser tool "
+                    "until status is completed, partial, or blocked."
+                ),
+            )
+            return True
+        self._apply_worker_progress_to_task_state(session, payload, "")
+        state = session.get_state(_BROWSER_PHASE_STATE_KEY)
+        state = state if isinstance(state, dict) else {}
+        ctx.request_force_finish(self._structured_terminal_result(state))
+        return True
+
+    def _runtime_evidence_fields(self, tool_args: Any) -> list[str]:
+        args = self._coerce_tool_args(tool_args)
+        fields: set[str] = set()
+        for value in (args.get("field"), args.get("fields")):
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str):
+                    canonical = self._canonical_field_name(item)
+                    if canonical in _BROWSER_FIELD_ALIASES:
+                        fields.add(canonical)
+
+        target_id = str(args.get("target_id") or args.get("target") or "").strip()
+        if target_id.startswith("t_g"):
+            try:
+                target = self._runtime.resolve_model_target_id(target_id)
+            except ValueError:
+                target = None
+            if target is not None and target.field_name in _BROWSER_FIELD_ALIASES:
+                fields.add(target.field_name)
+        return sorted(fields)
+
+    def _rewrite_primary_link_click(
+        self,
+        inputs: Any,
+        tool_name: str,
+        tool_args: Any,
+    ) -> tuple[str, Any]:
+        normalized_tool_name = tool_name.strip().lower()
+        if "playwright" not in normalized_tool_name or not normalized_tool_name.endswith("browser_click"):
+            return tool_name, tool_args
+        primary_link = self._runtime.resolve_primary_link(tool_args)
+        if not isinstance(primary_link, str) or not primary_link:
+            return tool_name, tool_args
+        inputs.tool_name = re.sub(
+            r"browser_click$",
+            "browser_navigate",
+            tool_name,
+            flags=re.IGNORECASE,
+        )
+        inputs.tool_args = {"url": primary_link}
+        return inputs.tool_name, inputs.tool_args
+
+    def _tool_evidence_args(self, ctx: AgentCallbackContext, inputs: Any) -> Dict[str, Any]:
+        args = dict(self._coerce_tool_args(getattr(inputs, "tool_args", None)))
+        extra = getattr(ctx, "extra", None)
+        runtime_states = extra.get(_BROWSER_TOOL_RUNTIME_STATE_KEY) if isinstance(extra, dict) else None
+        call_state = runtime_states.get(self._tool_call_id(inputs)) if isinstance(runtime_states, dict) else None
+        if isinstance(call_state, dict) and call_state.get("evidence_fields"):
+            args["_runtime_evidence_fields"] = list(call_state["evidence_fields"])
+        return args
+
+    @classmethod
+    def _enrich_probe_result_contract(
+        cls,
+        session: Any,
+        inputs: Any,
+        tool_name: str,
+        tool_result: Dict[str, Any],
+    ) -> None:
+        if "probe_cards" not in str(tool_name or "").strip().lower():
+            return
+        state = session.get_state(_BROWSER_PHASE_STATE_KEY) if session is not None else None
+        state = state if isinstance(state, dict) else {}
+        requested_count = int(state.get("requested_result_count") or 0)
+        observed_count = int(tool_result.get("observed_count") or 0)
+        diagnostics = tool_result.get("diagnostics")
+        diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+        diagnostics.update(
+            {
+                "requested_count": requested_count,
+                "observed_count": observed_count,
+            }
+        )
+
+        current_classes = cls._probe_card_classifications(tool_result.get("cards"))
+        conflicts = cls._probe_classification_conflicts(state, current_classes)
+        has_conflict = bool(conflicts or diagnostics.get("classification_conflict"))
+        if has_conflict:
+            diagnostics["classification_conflict"] = True
+            if conflicts:
+                diagnostics["classification_conflicts"] = conflicts
+            fallback_count = int(state.get("probe_classification_fallback_count") or 0)
+            if fallback_count < 1:
+                diagnostics["recommended_fallback"] = "one_precise_probe"
+                state["probe_classification_fallback_count"] = fallback_count + 1
+            else:
+                diagnostics["recommended_fallback"] = "retain_unknown_classification"
+            diagnostics["precise_fallback_remaining"] = max(
+                0,
+                1 - int(state.get("probe_classification_fallback_count") or 0),
+            )
+        tool_result["requested_count"] = requested_count
+        tool_result["observed_count"] = observed_count
+        tool_result["diagnostics"] = diagnostics
+        page_state = tool_result.get("page_state")
+        if isinstance(page_state, dict):
+            page_state["requested_count"] = requested_count
+            page_state["observed_count"] = observed_count
+            if has_conflict:
+                page_state["classification_conflict"] = True
+        state["last_card_probe"] = {
+            "url": str(tool_result.get("url") or "")[:500],
+            "generation_id": str(tool_result.get("generation_id") or ""),
+            "classifications": current_classes,
+        }
+        if session is not None:
+            session.update_state({_BROWSER_PHASE_STATE_KEY: state})
+        cls._rewrite_tool_message_contract(inputs, tool_result)
+
+    @staticmethod
+    def _probe_classification_conflicts(
+        state: Dict[str, Any],
+        current_classes: Dict[str, str],
+    ) -> list[str]:
+        previous_probe = state.get("last_card_probe")
+        previous_probe = previous_probe if isinstance(previous_probe, dict) else {}
+        previous_classes = previous_probe.get("classifications")
+        previous_classes = previous_classes if isinstance(previous_classes, dict) else {}
+        return [
+            identity
+            for identity, classification in current_classes.items()
+            if identity in previous_classes and previous_classes[identity] != classification
+        ][:5]
+
+    @staticmethod
+    def _probe_card_classifications(cards: Any) -> Dict[str, str]:
+        classifications: Dict[str, str] = {}
+        for card in cards if isinstance(cards, list) else []:
+            if not isinstance(card, dict):
+                continue
+            identity = " ".join(
+                str(card.get("primary_link") or card.get("href") or card.get("title") or "").split()
+            ).lower()[:300]
+            if not identity:
+                continue
+            classifications[identity] = ":".join(
+                (
+                    str(card.get("region") or ""),
+                    str(card.get("kind") or ""),
+                    str(bool(card.get("is_ad"))).lower(),
+                )
+            )
+        return classifications
+
+    @staticmethod
+    def _rewrite_tool_message_contract(inputs: Any, tool_result: Dict[str, Any]) -> None:
+        tool_msg = getattr(inputs, "tool_msg", None)
+        content = getattr(tool_msg, "content", None)
+        if tool_msg is None or not isinstance(content, str):
+            return
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        for key in ("requested_count", "observed_count", "diagnostics"):
+            parsed[key] = tool_result.get(key)
+        tool_msg.content = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+    def _consume_tool_call_timing(self, ctx: AgentCallbackContext, inputs: Any) -> tuple[str, int]:
+        extra = getattr(ctx, "extra", None)
+        tool_runtime_state = extra.get(_BROWSER_TOOL_RUNTIME_STATE_KEY, {}) if isinstance(extra, dict) else {}
+        call_state = (
+            tool_runtime_state.pop(self._tool_call_id(inputs), {})
+            if isinstance(tool_runtime_state, dict)
+            else {}
+        )
+        if isinstance(extra, dict) and not tool_runtime_state:
+            extra.pop(_BROWSER_TOOL_RUNTIME_STATE_KEY, None)
+        started_at = call_state.get("started_at") if isinstance(call_state, dict) else None
+        action_class = str(call_state.get("action_class") or "") if isinstance(call_state, dict) else ""
+        elapsed_ms = int(max(0.0, (time.perf_counter() - started_at) * 1000)) if started_at else 0
+        return action_class, elapsed_ms
+
+    @staticmethod
+    def _set_tool_message_outcome(
+        inputs: Any,
+        *,
+        success: bool,
+        executed: bool,
+        state_changed: bool,
+        denied: bool,
+    ) -> None:
+        tool_msg = getattr(inputs, "tool_msg", None)
+        if tool_msg is None:
+            return
+        metadata = dict(tool_msg.metadata) if isinstance(tool_msg.metadata, dict) else {}
+        metadata.update(
+            {
+                "success": success,
+                "executed": executed,
+                "state_changed": state_changed,
+                "denied": denied,
+            }
+        )
+        tool_msg.metadata = metadata
+
+    @staticmethod
+    def _compact_large_observation_message(inputs: Any, tool_name: str, tool_result: Any) -> None:
+        """Bound one model-visible raw observation after runtime evidence extraction."""
+
+        tool_msg = getattr(inputs, "tool_msg", None)
+        content = getattr(tool_msg, "content", None)
+        if tool_msg is None or not isinstance(content, str):
+            return
+        if not _contains_any_token(
+            str(tool_name or "").strip().lower(),
+            _BROWSER_BOUNDED_OBSERVATION_TOOL_TOKENS,
+        ):
+            return
+        if len(content) <= _BROWSER_OBSERVATION_MESSAGE_MAX_CHARS:
+            return
+
+        audit = write_browser_agent_audit_artifact("large_browser_observation", tool_result)
+        payload = {
+            "ok": BrowserAgentRuntime.tool_result_succeeded(tool_result),
+            "observation": "bounded_browser_tool_result",
+            "tool": str(tool_name or "").rsplit("_", 1)[-1],
+            "truncated": True,
+            "original_chars": len(content),
+            "preview_head": content[:6_000],
+            "preview_tail": content[-2_000:],
+            "note": (
+                "Runtime evidence and targets were recorded before compaction. "
+                "Use browser_working_context and browser_state for subsequent actions."
+            ),
+        }
+        if audit:
+            payload["audit"] = audit
+        rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) > _BROWSER_OBSERVATION_MESSAGE_MAX_CHARS:
+            payload["preview_head"] = content[:4_000]
+            payload["preview_tail"] = content[-1_000:]
+            rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) > _BROWSER_OBSERVATION_MESSAGE_MAX_CHARS:
+            payload["preview_head"] = content[:2_000]
+            payload.pop("preview_tail", None)
+            rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) > _BROWSER_OBSERVATION_MESSAGE_MAX_CHARS:
+            payload.pop("preview_head", None)
+            rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        tool_msg.content = rendered
+
+    @classmethod
+    def _result_may_have_changed_browser_state(
+        cls,
+        tool_name: str,
+        tool_result: Any,
+        outcome: Dict[str, Any],
+    ) -> bool:
+        if not cls._tool_may_change_browser_state(tool_name):
+            return False
+        if outcome.get("success"):
+            return True
+        if outcome.get("timed_out"):
+            return True
+        if not isinstance(tool_result, dict):
+            return False
+        if str(tool_result.get("status") or "").strip().lower() != "partial":
+            return False
+        for step in tool_result.get("steps") or []:
+            if not isinstance(step, dict) or step.get("ok") is not True:
+                continue
+            if str(step.get("op") or "").strip().lower() in _BATCH_MUTATING_TARGET_OPS:
+                return True
+        return False
+
+    def _normalize_playwright_target_payload(
+        self,
+        tool_args: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], bool]:
+        parsed = dict(tool_args)
+        changed = self._normalize_playwright_target_aliases(parsed)
+        for key in _BROWSER_REF_TARGET_KEYS:
+            value = str(parsed.get(key) or "").strip()
+            if not value.startswith("t_g"):
+                continue
+            target = self._runtime.resolve_model_target_id(value)
+            executable_target = str(target.ref or target.selector or "").strip()
+            if not executable_target:
+                raise ValueError(f"PageState target_id {target.target_id} has no executable locator.")
+            parsed[key] = executable_target
+            element_key = {
+                "target": "element",
+                "startTarget": "startElement",
+                "endTarget": "endElement",
+            }.get(key)
+            if element_key and not str(parsed.get(element_key) or "").strip():
+                parsed[element_key] = str(target.text or target.kind or target.target_id)[:200]
+            changed = True
+
+        fields = parsed.get("fields")
+        if isinstance(fields, list):
+            normalized_fields = []
+            for field in fields:
+                if not isinstance(field, dict):
+                    normalized_fields.append(field)
+                    continue
+                nested, nested_changed = self._normalize_playwright_target_payload(field)
+                normalized_fields.append(nested)
+                changed = changed or nested_changed
+            parsed["fields"] = normalized_fields
+        return parsed, changed
+
+    @staticmethod
+    def _normalize_playwright_target_aliases(parsed: Dict[str, Any]) -> bool:
+        changed = False
+
+        if "target_id" in parsed:
+            parsed["target"] = parsed.pop("target_id")
+            changed = True
+        if "generation_id" in parsed:
+            parsed.pop("generation_id", None)
+            changed = True
+
+        for alias, target_key in _BROWSER_REF_ALIAS_KEYS.items():
+            if alias not in parsed:
+                continue
+            if target_key not in parsed:
+                parsed[target_key] = parsed[alias]
+            parsed.pop(alias, None)
+            changed = True
+
+        for key in _BROWSER_REF_TARGET_KEYS:
+            value = parsed.get(key)
+            if not isinstance(value, str):
+                continue
+            match = _BROWSER_EXPLICIT_REF_RE.fullmatch(value)
+            if match is None:
+                continue
+            parsed[key] = match.group(1)
+            changed = True
+        return changed
+
+    @staticmethod
+    def _bind_shared_task_deadline(
+        ctx: AgentCallbackContext,
+        session: Any,
+        state: Dict[str, Any],
+    ) -> float:
+        if session is None or not isinstance(state, dict) or not state:
+            return 0.0
+        extra = getattr(ctx, "extra", None)
+        run_context = extra.get("run_context") if isinstance(extra, dict) else None
+        shared_context = run_context if isinstance(run_context, dict) else {}
+        context_budget_s = float(shared_context.get("browser_query_budget_s") or 0.0)
+        budget_s = float(
+            state.get("deadline_budget_s")
+            or context_budget_s
+            or (
+                _BROWSER_COMPLEX_TASK_DEADLINE_S
+                if str(state.get("task_type") or "") == "complex"
+                else _BROWSER_SIMPLE_TASK_DEADLINE_S
+            )
+        )
+        now = time.time()
+        context_started_at = float(shared_context.get("browser_query_started_at") or 0.0)
+        context_deadline_at = float(shared_context.get("browser_query_deadline_at") or 0.0)
+        started_at = float(state.get("deadline_started_at") or context_started_at or now)
+        deadline_at = float(state.get("deadline_at") or context_deadline_at or started_at + budget_s)
+        if context_deadline_at:
+            deadline_at = min(deadline_at, context_deadline_at)
+        query_id = str(shared_context.get("browser_query_id") or state.get("query_id") or "").strip()
+        if query_id:
+            state["query_id"] = query_id[:128]
+        state["deadline_budget_s"] = budget_s
+        state["deadline_started_at"] = started_at
+        state["deadline_at"] = deadline_at
+        remaining_s = max(0.0, deadline_at - now)
+        state["deadline_remaining_s"] = round(remaining_s, 3)
+        session.update_state({_BROWSER_PHASE_STATE_KEY: state})
+        if isinstance(extra, dict):
+            invocation_deadline = float(extra.get(_BROWSER_INVOCATION_DEADLINE_KEY) or 0.0)
+            if not invocation_deadline:
+                invocation_deadline = time.monotonic() + remaining_s
+                extra[_BROWSER_INVOCATION_DEADLINE_KEY] = invocation_deadline
+            effective_remaining_s = min(
+                remaining_s,
+                max(0.0, invocation_deadline - time.monotonic()),
+            )
+            extra[_BROWSER_TASK_DEADLINE_KEY] = time.monotonic() + effective_remaining_s
+            state["invocation_remaining_s"] = round(effective_remaining_s, 3)
+            session.update_state({_BROWSER_PHASE_STATE_KEY: state})
+            return effective_remaining_s
+        return remaining_s
+
+    @classmethod
+    def _finish_if_task_deadline_exhausted(
+        cls,
+        ctx: AgentCallbackContext,
+        session: Any,
+        state: Dict[str, Any],
+    ) -> bool:
+        if session is None or not isinstance(state, dict) or not state:
+            return False
+        deadline_at = float(state.get("deadline_at") or 0.0)
+        shared_exhausted = bool(deadline_at and time.time() >= deadline_at)
+        extra = getattr(ctx, "extra", None)
+        invocation_deadline = (
+            float(extra.get(_BROWSER_INVOCATION_DEADLINE_KEY) or 0.0)
+            if isinstance(extra, dict)
+            else 0.0
+        )
+        invocation_exhausted = bool(invocation_deadline and time.monotonic() >= invocation_deadline)
+        if not shared_exhausted and not invocation_exhausted:
+            return False
+        status = str(state.get("status") or "in_progress").strip().lower()
+        if status not in _BROWSER_TERMINAL_STATUSES:
+            missing = cls._missing_completion_requirements(state)
+            evidence_available = cls._has_task_evidence(state)
+            if evidence_available and not missing and not state.get("blockers"):
+                state["status"] = "completed"
+                state["terminal_reason"] = "task_deadline_completed_from_evidence"
+            else:
+                state["status"] = "partial" if evidence_available else "blocked"
+                blockers = list(state.get("blockers") or [])
+                blocker = "task_deadline_exhausted" if shared_exhausted else "task_invocation_slice_exhausted"
+                if blocker not in blockers:
+                    blockers.append(blocker)
+                state["blockers"] = blockers[:10]
+                state["terminal_reason"] = blocker
+            state["next_action_class"] = "finish"
+            state["deadline_remaining_s"] = (
+                0.0 if shared_exhausted else round(max(0.0, deadline_at - time.time()), 3)
+            )
+            state["invocation_remaining_s"] = 0.0
+            session.update_state({_BROWSER_PHASE_STATE_KEY: state})
+        ctx.request_force_finish(cls._structured_terminal_result(state))
+        return True
+
+    @staticmethod
+    def _terminalize_invoke_failure(session: Any, reason: str) -> bool:
+        state = session.get_state(_BROWSER_PHASE_STATE_KEY) if session is not None else None
+        if not isinstance(state, dict) or not state:
+            return False
+        status = str(state.get("status") or "in_progress").strip().lower()
+        if status not in _BROWSER_TERMINAL_STATUSES:
+            evidence_available = BrowserRuntimeRail._has_task_evidence(state)
+            state["status"] = "partial" if evidence_available else "blocked"
+            state["next_action_class"] = "finish"
+            state["terminal_reason"] = reason
+            blockers = list(state.get("blockers") or [])
+            if reason not in blockers:
+                blockers.append(reason)
+            state["blockers"] = blockers[:10]
+            session.update_state({_BROWSER_PHASE_STATE_KEY: state})
+        return True
+
+    @staticmethod
+    def _infer_requested_result_count(task: str) -> int:
+        normalized = str(task or "").lower()
+        patterns = (
+            r"(?:top|first)\s*(\d{1,2})(?:\s*(?:results?|items?|articles?|links?))?",
+            r"(?:хЙН|цЬАхЙН)\s*(\d{1,2})\s*(?:цЭб|ф╕к|чпЗ|щб╣|щГи|хРН|хИЩ)?",
+            r"(\d{1,2})\s*(?:цЭб|ф╕к|чпЗ|щб╣|щГи)\s*(?:ч╗УцЮЬ|шо░х╜Х|цЦЗчла|хХЖхУБ|шзЖщвС|щУ╛цОе)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match is not None:
+                return min(20, max(1, int(match.group(1))))
+        return 0
+
+    @staticmethod
+    def _snake_case_field_name(value: Any) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+        text = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "_", text)
+        return text.strip("_").lower()
+
+    @classmethod
+    def _canonical_evaluate_field_name(cls, value: Any) -> str:
+        snake_name = cls._snake_case_field_name(value)
+        if not snake_name:
+            return ""
+        explicit = _BROWSER_EVALUATE_FIELD_ALIASES.get(snake_name)
+        if explicit:
+            return explicit
+        canonical = cls._canonical_field_name(snake_name)
+        if canonical != snake_name:
+            return canonical
+        for suffix in ("_raw", "_text", "_value"):
+            if not snake_name.endswith(suffix):
+                continue
+            base_name = snake_name[: -len(suffix)]
+            canonical_base = cls._canonical_field_name(base_name)
+            if canonical_base in _BROWSER_FIELD_ALIASES:
+                return canonical_base
+        return snake_name[:80]
+
+    @staticmethod
+    def _has_task_evidence(state: Dict[str, Any]) -> bool:
+        """Use evidence records, not compatibility coverage, as task truth."""
+
+        return bool(state.get("evidence_slots") or state.get("structured_evidence"))
+
+    @classmethod
+    def _unavailable_evidence_slots(cls, state: Dict[str, Any]) -> list[Dict[str, str]]:
+        required_slots = set()
+        for slot in state.get("required_evidence_slots") or []:
+            if isinstance(slot, dict):
+                required_slots.add(cls._evidence_slot_key(slot))
+
+        unavailable = []
+        for slot in state.get("evidence_slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            key = cls._evidence_slot_key(slot)
+            status = str(slot.get("status") or "").strip().lower()
+            if key not in required_slots or status not in {"missing", "unknown"}:
+                continue
+            unavailable.append(
+                {
+                    "entity": key[0],
+                    "variant": key[1],
+                    "field": key[2],
+                    "status": status or "unknown",
+                }
+            )
+        return unavailable
+
+    @staticmethod
+    def _evaluate_result_value(result: Dict[str, Any]) -> Any:
+        value = next(
+            (result.get(key) for key in ("result", "value", "data") if result.get(key) is not None),
+            None,
+        )
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return extract_json_object(value) or value
+
+    @classmethod
+    def _evaluate_field_scope(
+        cls,
+        tool_args: Dict[str, Any],
+        required_fields: Iterable[str],
+    ) -> tuple[set[str], set[str]]:
+        trusted_fields = {
+            cls._canonical_field_name(field_name)
+            for field_name in tool_args.get("_runtime_evidence_fields") or []
+        }
+        trusted_fields.discard("")
+        allowed_fields = {
+            cls._canonical_field_name(field_name)
+            for field_name in required_fields
+        }
+        allowed_fields.discard("")
+        allowed_fields.update(trusted_fields)
+        return trusted_fields, allowed_fields
+
+    @staticmethod
+    def _evaluate_execution_provenance(tool_args: Dict[str, Any], target: str) -> Dict[str, str]:
+        expression = str(
+            tool_args.get("function")
+            or tool_args.get("expression")
+            or tool_args.get("script")
+            or tool_args.get("code")
+            or ""
+        )
+        return {
+            "target": target,
+            "expression_sha256": hashlib.sha256(expression.encode("utf-8")).hexdigest()[:16] if expression else "",
+        }
+
+    @classmethod
+    def _compact_evaluate_mapping(
+        cls,
+        value: Dict[str, Any],
+        *,
+        allowed_fields: set[str],
+        trusted_fields: set[str],
+    ) -> tuple[Dict[str, str], list[str], Dict[str, str], Dict[str, str]]:
+        compact_values: Dict[str, str] = {}
+        field_status: Dict[str, str] = {}
+        raw_values: Dict[str, str] = {}
+        for key, item in list(value.items())[:20]:
+            normalized = cls._normalize_evaluate_mapping_item(
+                key,
+                item,
+                allowed_fields=allowed_fields,
+                trusted_fields=trusted_fields,
+            )
+            if normalized is None:
+                continue
+            field_name, field_value, status, raw_value = normalized
+            field_status[field_name] = status
+            raw_values[field_name] = raw_value
+            if status == "present":
+                compact_values[field_name] = field_value
+        return compact_values, sorted(compact_values), field_status, raw_values
+
+    @classmethod
+    def _normalize_evaluate_mapping_item(
+        cls,
+        key: Any,
+        item: Any,
+        *,
+        allowed_fields: set[str],
+        trusted_fields: set[str],
+    ) -> tuple[str, str, str, str] | None:
+        selected_sort = cls._selected_sort_value(key, item)
+        normalized: tuple[str, str, str, str] | None = None
+        if selected_sort:
+            if not allowed_fields or "sort_state" in allowed_fields:
+                normalized = ("sort_state", selected_sort, "present", f"{key}={item}"[:600])
+        else:
+            snake_name = cls._snake_case_field_name(key)
+            canonical = cls._canonical_evaluate_field_name(key)
+            field_allowed = canonical in _BROWSER_FIELD_ALIASES and (
+                not allowed_fields or canonical in allowed_fields
+            )
+            contextual_alias_allowed = (
+                snake_name not in _BROWSER_CONTEXTUAL_EVALUATE_FIELD_ALIASES
+                or canonical in trusted_fields
+            )
+            if field_allowed and contextual_alias_allowed and not (
+                canonical == "sort_state" and isinstance(item, bool)
+            ):
+                normalized_value, status = cls._normalize_evaluate_field_value(canonical, item)
+                normalized = (canonical, normalized_value, status, str(item)[:600])
+        return normalized
+
+    @staticmethod
+    def _merge_first_values(target: Dict[str, str], source: Dict[str, str]) -> None:
+        for field_name, field_value in source.items():
+            target.setdefault(field_name, field_value)
+
+    @classmethod
+    def _compact_evaluate_list(
+        cls,
+        value: list[Dict[str, Any]],
+        *,
+        allowed_fields: set[str],
+        trusted_fields: set[str],
+    ) -> tuple[Dict[str, str], list[str], Dict[str, str], Dict[str, str]]:
+        compact_values: Dict[str, str] = {}
+        field_status: Dict[str, str] = {}
+        raw_values: Dict[str, str] = {}
+        fields: set[str] = set()
+        for item in value[:5]:
+            item_values, item_fields, item_status, item_raw = cls._compact_evaluate_mapping(
+                item,
+                allowed_fields=allowed_fields,
+                trusted_fields=trusted_fields,
+            )
+            fields.update(item_fields)
+            cls._merge_first_values(compact_values, item_values)
+            cls._merge_first_values(field_status, item_status)
+            cls._merge_first_values(raw_values, item_raw)
+        if not fields and not field_status:
+            return {}, [], {}, {}
+        compact_values["items"] = json.dumps(value[:3], ensure_ascii=False, default=str)[:800]
+        return compact_values, sorted(fields), field_status, raw_values
+
+    @classmethod
+    def _selected_sort_value(cls, key: Any, value: Any) -> str:
+        snake_name = cls._snake_case_field_name(key)
+        if snake_name in {"active_tab", "active_tabs", "selected_tab", "selected_tabs"}:
+            if isinstance(value, bool):
+                return ""
+            text = " ".join(str(value or "").split())
+            return text[:120] if text else ""
+        if not snake_name.endswith(("_selected", "_tab_selected")) or value is not True:
+            return ""
+        base_name = re.sub(r"(?:_tab)?_selected$", "", snake_name)
+        for token, label in _BROWSER_SELECTED_SORT_LABELS.items():
+            if token in base_name:
+                return label
+        return ""
+
+    @staticmethod
+    def _normalize_evaluate_field_value(field_name: str, value: Any) -> tuple[str, str]:
+        if value in (None, "", [], {}):
+            return "", "missing"
+        text = " ".join(str(value).split())[:300]
+        if field_name == "comments" and _BROWSER_ZERO_COMMENT_RE.fullmatch(text):
+            return "0", "present"
+        if _BROWSER_UNKNOWN_VALUE_RE.fullmatch(text):
+            return "", "unknown"
+        return text, "present"
+
+    @staticmethod
+    def _is_sort_interactive_target(target: Dict[str, Any]) -> bool:
+        if str(target.get("kind") or "") in {"sort", "sort_tab", "sort_option"}:
+            return True
+        name = str(target.get("name") or "").strip().lower()
+        region = str(target.get("region") or "").strip().lower()
+        return bool(
+            region in {"sort", "filtering", "search_controls"}
+            or any(token in name for token in _BROWSER_SELECTED_SORT_LABELS)
+        )
+
+    @classmethod
+    def _condition_evidence(cls, result: Dict[str, Any]) -> Dict[str, Any]:
+        values, provenance = cls._successful_condition_values(result)
+        if not values:
+            return {}
+        return {
+            "kind": "condition_observation",
+            "generation_id": str(result.get("generation_id") or ""),
+            "fields": sorted(values),
+            "values": values,
+            "provenance": provenance,
+        }
+
+    @staticmethod
+    def _successful_condition_values(
+        result: Dict[str, Any],
+    ) -> tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+        field_by_op = {
+            "wait_for_sort_state": "sort_state",
+            "wait_for_result_count": "result_count",
+            "wait_for_first_card_title": "title",
+            "wait_for_url": "url",
+            "wait_for_dom_text_change": "dom_text",
+            "wait_for_tab": "tab_state",
+        }
+        values: Dict[str, str] = {}
+        provenance: Dict[str, Dict[str, str]] = {}
+        generation_id = str(result.get("generation_id") or "")
+        conditions = result.get("conditions")
+        for item in conditions if isinstance(conditions, list) else []:
+            if not isinstance(item, dict) or item.get("ok") is not True:
+                continue
+            field_name = field_by_op.get(str(item.get("op") or "").strip().lower())
+            if not field_name:
+                continue
+            observed = item.get("observed")
+            if isinstance(observed, dict):
+                value = next(
+                    (
+                        observed[key]
+                        for key in ("value", "text", "url", "count", "tabs", "stable")
+                        if observed.get(key) not in (None, "", [], {})
+                    ),
+                    None,
+                )
+            else:
+                value = observed
+            if value in (None, "", [], {}):
+                continue
+            rendered = (
+                json.dumps(value, ensure_ascii=False, default=str)
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+            values[field_name] = rendered[:500]
+            provenance[field_name] = {
+                "source": "browser_batch_interact",
+                "raw_text": rendered[:600],
+                "generation_id": generation_id,
+            }
+        return values, provenance
+

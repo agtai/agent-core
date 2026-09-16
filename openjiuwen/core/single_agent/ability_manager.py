@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import traceback
 from dataclasses import dataclass
 from typing import List, Any, Union, Optional, Tuple, Dict, Iterable
 
@@ -38,7 +39,7 @@ from openjiuwen.core.workflow import WorkflowCard
 from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
 from openjiuwen.core.session.agent import create_agent_session
 from openjiuwen.core.single_agent.interrupt.state import INTERRUPT_AUTO_CONFIRM_KEY
-from openjiuwen.core.single_agent.kv_cache import kv_cache_hooks
+from openjiuwen.core.single_agent.kv_cache import kv_cache_child_session
 
 # Ability type definition
 Ability = Union[ToolCard, WorkflowCard, AgentCard, McpServerConfig]
@@ -1071,7 +1072,11 @@ class AbilityManager:
                     continue
 
                 error_msg = f"Ability execution error: {str(result)}"
-                logger.error(error_msg)
+                # `result` is a captured exception from gather()/sequential fallback,
+                # not the active exception, so logger.exception() would record nothing.
+                # Format its own traceback explicitly instead.
+                tb = "".join(traceback.format_exception(type(result), result, result.__traceback__))
+                logger.error("%s\n%s", error_msg, tb)
 
                 # Trigger TOOL_CALL_ERROR event for observability
                 # This only affects telemetry collection, not business logic
@@ -1337,9 +1342,13 @@ class AbilityManager:
                 # round cancellation) propagate correctly through anyio CancelScope.
                 logger.warning("[AbilityManager] Task cancellation caught, re-raising CancelledError")
                 raise
+            except ToolInterruptException:
+                # User-interaction interrupts are control flow. In particular,
+                # deferred tools can raise one from inside the tool_call wrapper.
+                raise
             except Exception as e:
                 error_msg = f"Tool execution error: {str(e)}"
-                logger.error(error_msg)
+                logger.exception(error_msg)
                 raise self._build_execution_error(
                     tool_call,
                     error_msg,
@@ -1358,7 +1367,7 @@ class AbilityManager:
                 return await self._run_workflow(workflow, workflow_id, tool_args, session, tool_call)
             except Exception as e:
                 error_msg = f"Workflow execution error: {str(e)}"
-                logger.error(error_msg)
+                logger.exception(error_msg)
                 raise self._build_execution_error(tool_call, error_msg) from e
         elif tool_name in self._agents:
             # Execute sub-Agent - get instance from Runner.resource_mgr
@@ -1399,7 +1408,7 @@ class AbilityManager:
                         tool_args.setdefault("parent_invocation_id", parent_invocation_id)
 
                 stream_writer_manager = self._get_stream_writer_manager(session)
-                child_session_kwargs = kv_cache_hooks.build_child_session_kwargs(
+                child_session_kwargs = kv_cache_child_session.build_child_session_kwargs(
                     agent,
                     session,
                 )
@@ -1423,7 +1432,7 @@ class AbilityManager:
                 result = await Runner.run_agent(agent=agent, inputs=tool_args, session=child_session)
             except Exception as e:
                 error_msg = f"Agent execution error: {str(e)}"
-                logger.error(error_msg)
+                logger.exception(error_msg)
                 raise self._build_execution_error(
                     tool_call,
                     error_msg,
@@ -1468,7 +1477,7 @@ class AbilityManager:
                 raise
             except Exception as e:
                 error_msg = f"Tool execution error: {str(e)}"
-                logger.error(error_msg)
+                logger.exception(error_msg)
                 raise self._build_execution_error(
                     tool_call,
                     error_msg,

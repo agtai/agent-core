@@ -14,9 +14,6 @@ CORE_BROWSER_CAPABILITY_NAME = "core"
 # newly introduced Playwright tool before its capability policy is reviewed.
 CORE_BROWSER_TOOL_NAMES: tuple[str, ...] = (
     "browser_click",
-    "browser_close",
-    "browser_drag",
-    "browser_drop",
     "browser_evaluate",
     "browser_file_upload",
     "browser_fill_form",
@@ -29,7 +26,6 @@ CORE_BROWSER_TOOL_NAMES: tuple[str, ...] = (
     "browser_select_option",
     "browser_snapshot",
     "browser_tabs",
-    "browser_take_screenshot",
     "browser_type",
 )
 
@@ -38,6 +34,12 @@ CORE_BROWSER_TOOL_NAMES: tuple[str, ...] = (
 # for the legacy MCP capability catalog, but must not appear in BU allowed_tools.
 BROWSER_DRIVER_DEFERRED_CORE_TOOL_NAMES: frozenset[str] = frozenset()
 
+EXTENDED_INTERACTION_BROWSER_TOOL_NAMES: tuple[str, ...] = (
+    "browser_close",
+    "browser_drag",
+    "browser_drop",
+)
+
 ADVANCED_CODE_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code",)
 
 UNSAFE_DEV_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code_unsafe",)
@@ -45,12 +47,14 @@ UNSAFE_DEV_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_run_code_unsafe",)
 # These are model-facing policy categories, not Playwright MCP --caps values.
 POLICY_ONLY_BROWSER_CAPABILITY_NAMES: tuple[str, ...] = (
     "advanced_code",
+    "extended_interaction",
     "unsafe_dev",
 )
 
 PDF_BROWSER_TOOL_NAMES: tuple[str, ...] = ("browser_pdf_save",)
 
 VISION_BROWSER_TOOL_NAMES: tuple[str, ...] = (
+    "browser_take_screenshot",
     "browser_mouse_click_xy",
     "browser_mouse_down",
     "browser_mouse_drag_xy",
@@ -147,6 +151,11 @@ DEFAULT_BROWSER_CAPABILITIES: tuple[BrowserCapability, ...] = (
             "compact probes, evaluate, snapshot, and batch are insufficient."
         ),
         tool_names=ADVANCED_CODE_BROWSER_TOOL_NAMES,
+    ),
+    BrowserCapability(
+        name="extended_interaction",
+        description="Close pages or perform uncommon drag-and-drop interactions.",
+        tool_names=EXTENDED_INTERACTION_BROWSER_TOOL_NAMES,
     ),
     BrowserCapability(
         name="unsafe_dev",
@@ -287,6 +296,7 @@ __all__ = [
     "CORE_BROWSER_TOOL_NAMES",
     "DEFAULT_BROWSER_CAPABILITIES",
     "DEVTOOLS_BROWSER_TOOL_NAMES",
+    "EXTENDED_INTERACTION_BROWSER_TOOL_NAMES",
     "NETWORK_BROWSER_TOOL_NAMES",
     "PDF_BROWSER_TOOL_NAMES",
     "POLICY_ONLY_BROWSER_CAPABILITY_NAMES",
