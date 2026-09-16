@@ -8,10 +8,10 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools import ensure_browser_runtime_client_patch
-from openjiuwen.harness.tools.browser_move.clients.stdio_client import BrowserMoveStdioClient
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.service import BrowserService
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools import ensure_browser_runtime_client_patch
+from openjiuwen.harness.tools.browser_move.backends.playwright_mcp.clients.stdio_client import BrowserMoveStdioClient
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.core.runner.resources_manager.tool_manager import ToolMgr
 
@@ -105,8 +105,9 @@ def test_start_heartbeat_replaces_done_task() -> None:
 def test_check_connection_raises_when_client_not_found() -> None:
     async def _test():
         svc = _make_service()
+        svc._driver_backend = "playwright_mcp"  # exercise MCP ping path
         with patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.get_registered_client",
+            "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools.get_registered_client",
             return_value=None,
         ):
             try:
@@ -137,10 +138,11 @@ def test_browser_runtime_stdio_patch_creates_pingable_client() -> None:
 def test_check_connection_raises_when_ping_fails() -> None:
     async def _test():
         svc = _make_service()
+        svc._driver_backend = "playwright_mcp"  # exercise MCP ping path
         mock_client = MagicMock()
         mock_client.ping = AsyncMock(return_value=False)
         with patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.get_registered_client",
+            "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools.get_registered_client",
             return_value=mock_client,
         ):
             try:
@@ -158,7 +160,7 @@ def test_check_connection_succeeds_when_healthy() -> None:
         mock_client = MagicMock()
         mock_client.ping = AsyncMock(return_value=True)
         with patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.get_registered_client",
+            "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools.get_registered_client",
             return_value=mock_client,
         ):
             await svc._check_connection()  # must not raise
@@ -174,7 +176,7 @@ def test_check_connection_raises_when_managed_driver_not_ready() -> None:
         mock_client = MagicMock()
         mock_client.ping = AsyncMock(return_value=True)
         with patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.get_registered_client",
+            "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools.get_registered_client",
             return_value=mock_client,
         ):
             try:
@@ -313,7 +315,7 @@ def test_shutdown_cancels_heartbeat_task() -> None:
             await asyncio.sleep(9999)
 
         svc._heartbeat_task = asyncio.create_task(_long())
-        with patch("playwright_runtime.service.Runner") as mock_runner:
+        with patch("runtime.service.Runner") as mock_runner:
             mock_runner.stop = AsyncMock()
             await svc.shutdown()
 

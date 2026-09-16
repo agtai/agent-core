@@ -25,7 +25,7 @@ from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import BaseError, build_error, raise_error
 from openjiuwen.core.common.logging import logger
 try:
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
+    from openjiuwen.harness.tools.browser_move.runtime.browser_logging import (
         browser_agent_log_info,
     )
 except Exception:  # pragma: no cover - browser runtime is optional here

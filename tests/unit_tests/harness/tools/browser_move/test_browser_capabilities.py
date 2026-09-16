@@ -8,7 +8,7 @@ import pytest
 
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.harness.subagents.browser_agent import create_browser_agent
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     ADVANCED_CODE_BROWSER_TOOL_NAMES,
     CORE_BROWSER_TOOL_NAMES,
     DEVTOOLS_BROWSER_TOOL_NAMES,
