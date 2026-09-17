@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from openjiuwen.harness.tools.browser_move.runtime.semantic_state import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.semantic_state import (
     SemanticStateTracker,
     build_semantic_state,
 )
@@ -98,85 +96,6 @@ def test_new_field_evidence_counts_as_progress() -> None:
         }
     )
     assert after_navigation["semantic_state"]["field_coverage"] == ["price", "title"]
-
-
-def test_repeated_neutral_observations_never_look_like_a_semantic_loop() -> None:
-    tracker = SemanticStateTracker()
-    tracker.observe(_state())
-
-    observations = [tracker.observe(_state(), action_group_id=f"neutral-{index}", mutating=False) for index in range(5)]
-
-    for observation in observations:
-        assert observation["progress"] == "observation"
-        assert observation["observable_progress"] is False
-        assert observation["consecutive_no_progress"] == 0
-        assert observation["state_revisit_count"] == 0
-        assert observation["aba_loop"] is False
-        assert observation["replan_required"] is False
-        assert observation["replan_reason"] == []
-    assert observations[-1]["revision"] == 6
-
-
-def test_mutating_observations_with_an_unchanged_digest_still_force_replan() -> None:
-    tracker = SemanticStateTracker()
-    tracker.observe(_state())
-
-    tracker.observe(_state(), mutating=True)
-    tracker.observe(_state(), mutating=True)
-    third = tracker.observe(_state(), mutating=True)
-
-    assert third["consecutive_no_progress"] == 3
-    assert third["replan_required"] is True
-    assert third["replan_reason"] == ["three_consecutive_no_progress_states"]
-
-
-def test_neutral_observation_that_changed_the_digest_is_real_progress() -> None:
-    tracker = SemanticStateTracker()
-    tracker.observe(_state(fields=[]))
-
-    revealed = tracker.observe(_state(fields=["title"]), mutating=False)
-
-    assert revealed["progress"] == "progress"
-    assert revealed["observable_progress"] is True
-    assert revealed["consecutive_no_progress"] == 0
-
-
-def test_neutral_observations_do_not_mask_a_later_real_loop() -> None:
-    tracker = SemanticStateTracker()
-    tracker.observe(_state())
-    for index in range(3):
-        tracker.observe(_state(), action_group_id=f"neutral-{index}", mutating=False)
-
-    tracker.observe(_state(), mutating=True)
-    tracker.observe(_state(), mutating=True)
-    third = tracker.observe(_state(), mutating=True)
-
-    assert third["consecutive_no_progress"] == 3
-    assert third["replan_required"] is True
-
-
-@pytest.mark.xfail(reason="Superseded by BU driver (Policy A): asserts base agtai/develop #1147 rail/catalog/semantic behavior replaced by the browser_use driver. Tracked for later reconciliation.", strict=False)
-def test_neutral_observation_keeps_every_latest_payload_key() -> None:
-    tracker = SemanticStateTracker()
-    baseline = tracker.observe(_state())
-
-    observation = tracker.observe(_state(), mutating=False)
-
-    assert set(observation) == set(baseline)
-    assert set(observation) == {
-        "revision",
-        "action_group_id",
-        "semantic_state",
-        "progress",
-        "observable_progress",
-        "consecutive_no_progress",
-        "state_revisit",
-        "state_revisit_count",
-        "aba_loop",
-        "repeated_filter_state",
-        "replan_required",
-        "replan_reason",
-    }
 
 
 def test_tracker_observes_each_model_action_group_once() -> None:

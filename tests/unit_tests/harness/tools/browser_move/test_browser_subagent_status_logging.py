@@ -17,7 +17,7 @@ from openjiuwen.core.common.logging.browser_context import (
     reset_browser_agent_log_context,
     set_browser_agent_log_context,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_logging import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
     write_browser_agent_audit_artifact,
 )
 
@@ -27,7 +27,7 @@ _STATUS_LOGGING_PATH = (
     / "harness"
     / "tools"
     / "browser_move"
-    / "runtime"
+    / "playwright_runtime"
     / "status_logging.py"
 )
 _SPEC = importlib.util.spec_from_file_location("browser_status_logging", _STATUS_LOGGING_PATH)
@@ -243,7 +243,7 @@ def test_direct_browser_runtime_rail_wires_status_logger() -> None:
         / "harness"
         / "tools"
         / "browser_move"
-        / "runtime"
+        / "playwright_runtime"
         / "runtime.py"
     )
     source = runtime_path.read_text(encoding="utf-8")
@@ -353,7 +353,6 @@ def test_batch_interact_select_option_accepts_values_alias() -> None:
         / "harness"
         / "tools"
         / "browser_move"
-        / "runtime"
         / "controllers"
         / "action.py"
     )

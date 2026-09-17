@@ -9,17 +9,7 @@ from pathlib import Path
 
 def _load_summarizer():
     repo_root = Path(__file__).resolve().parents[5]
-    module_path = (
-        repo_root
-        / "openjiuwen"
-        / "harness"
-        / "tools"
-        / "browser_move"
-        / "backends"
-        / "playwright_mcp"
-        / "clients"
-        / "logging_utils.py"
-    )
+    module_path = repo_root / "openjiuwen" / "harness" / "tools" / "browser_move" / "clients" / "logging_utils.py"
     spec = importlib.util.spec_from_file_location("browser_move_client_logging_utils", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

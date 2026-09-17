@@ -5,11 +5,11 @@
 from unittest.mock import MagicMock, patch
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.runtime.agents import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.agents import (
     build_browser_worker_system_prompt,
     build_browser_worker_agent,
 )
-from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
     CORE_BROWSER_TOOL_NAMES,
 )
 
@@ -30,7 +30,7 @@ def _build_with_mocked_agent(
     worker = MagicMock()
     worker.configure.return_value = worker
     with patch(
-        "openjiuwen.harness.tools.browser_move.runtime.agents.ReActAgent",
+        "openjiuwen.harness.tools.browser_move.playwright_runtime.agents.ReActAgent",
         return_value=worker,
     ):
         result = build_browser_worker_agent(
