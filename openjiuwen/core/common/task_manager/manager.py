@@ -21,6 +21,8 @@ import anyio
 
 from openjiuwen.core.common.logging import (
     LogEventType,
+)
+from openjiuwen.core.common.logging import (
     runner_logger as logger,
 )
 from openjiuwen.core.common.task_manager.context import (
@@ -80,6 +82,8 @@ class TaskManager:
             timeout: Optional[float] = None,
             metadata: Optional[Dict] = None,
             catch_exceptions: bool = False,
+            on_scheduled: Optional[Callable[[Task], None]] = None,
+            finalizer: Optional[Callable[[Task], Awaitable[None]]] = None,
     ) -> Task:
         """Create and register a new coroutine task.
 
@@ -120,6 +124,10 @@ class TaskManager:
             timeout: Optional timeout in seconds
             metadata: Optional dict of metadata to attach to the task
             catch_exceptions: Whether to catch exceptions in the task
+            on_scheduled: Optional synchronous ownership receipt, called after scheduling
+                and before asynchronous creation observers. Errors do not undo scheduling.
+            finalizer: Optional resource cleanup owned by the scheduled task. Runs
+                even when startup fails, before waiters observe settlement.
 
         Returns:
             The created Task object
@@ -156,13 +164,32 @@ class TaskManager:
                 await self._trigger_event(event_type, task)
 
         # Use task.execute() to run the coroutine
-        tg.start_soon(task.execute, coro, callback_trigger, catch_exceptions)
+        tg.start_soon(task.execute, coro, callback_trigger, catch_exceptions, finalizer)
+        if on_scheduled is not None:
+            on_scheduled(task)
 
         await self._trigger_event(TaskManagerEvents.TASK_CREATED, task)
         logger.debug("Created task", event_type=LogEventType.CORO_MANAGER_TASK_STATUS_CHANGED,
                      metadata={"task_id": task_id, "name": name, "parent": task.parent_task_id,
                                "previous_status": "pending", "current_status": "running"})
         return task
+
+    async def create_root_task(
+            self, coro: Coroutine, *, task_group: anyio.abc.TaskGroup, **options: Any,
+    ) -> Task:
+        """Schedule under a service group without inheriting a request parent.
+
+        Uses create_task's scheduling receipt, observers and finalizer unchanged.
+        The scheduled body and nested tasks inherit the service group; the caller's
+        context is restored even when a creation observer raises after scheduling.
+        """
+        group_token = set_task_group(task_group)
+        parent_token = _current_task_id.set(None)
+        try:
+            return await self.create_task(coro, **options)
+        finally:
+            _current_task_id.reset(parent_token)
+            reset_task_group(group_token)
 
     @asynccontextmanager
     async def task_group(self) -> AsyncGenerator[anyio.abc.TaskGroup, None]:
@@ -711,6 +738,7 @@ async def create_task(
         timeout: Optional[float] = None,
         metadata: Optional[Dict] = None,
         catch_exceptions: bool = False,
+        on_scheduled: Optional[Callable[[Task], None]] = None,
 ) -> Task:
     """Create a task using the global TaskManager (convenience function).
 
@@ -745,6 +773,7 @@ async def create_task(
         timeout=timeout,
         metadata=metadata,
         catch_exceptions=catch_exceptions,
+        on_scheduled=on_scheduled,
     )
 
 

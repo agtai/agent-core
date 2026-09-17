@@ -4,13 +4,14 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Dict, Optional
+from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
 
 import anyio
 
-from openjiuwen.core.common.logging import LogEventType, runner_logger as logger
+from openjiuwen.core.common.logging import LogEventType
+from openjiuwen.core.common.logging import runner_logger as logger
 from openjiuwen.core.common.task_manager.context import _current_task_id
-from openjiuwen.core.common.task_manager.types import TaskStatus, TERMINAL_STATES
+from openjiuwen.core.common.task_manager.types import TERMINAL_STATES, TaskStatus
 
 
 @dataclass
@@ -41,6 +42,11 @@ class Task:
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATES
+
+    @property
+    def is_settled(self) -> bool:
+        """Whether execution and its lifecycle callbacks have finished."""
+        return self._done_event.is_set()
 
     def __hash__(self) -> int:
         return hash(self.task_id)
@@ -129,6 +135,7 @@ class Task:
         coro: Coroutine,
         callback_trigger: Optional[Callable] = None,
         catch_exceptions: bool = False,
+        finalizer: Optional[Callable[["Task"], Awaitable[None]]] = None,
     ) -> Any:
         """Execute the coroutine with task lifecycle management.
 
@@ -136,21 +143,24 @@ class Task:
             coro: The coroutine to execute
             callback_trigger: Optional callback for triggering events
             catch_exceptions: If True, catch and log exceptions instead of raising
+            finalizer: Optional resource-owner cleanup, including failure before
+                coroutine entry. Runs shielded before physical settlement.
         """
         async def _execute_core():
             token = _current_task_id.set(self.task_id)
             self.status = TaskStatus.RUNNING
             self.started_at = datetime.now(timezone.utc)
 
-            # Trigger event
-            if callback_trigger:
-                await callback_trigger(self, "running")
-
+            coro_started = False
             try:
                 result = None
                 with anyio.CancelScope() as cancel_scope:
                     self.set_cancel_scope(cancel_scope)
+                    if callback_trigger:
+                        await callback_trigger(self, "running")
+                    await anyio.lowlevel.checkpoint_if_cancelled()
 
+                    coro_started = True
                     if self.timeout:
                         with anyio.fail_after(self.timeout):
                             result = await coro
@@ -213,9 +223,21 @@ class Task:
                 raise
 
             finally:
-                self.set_done()
-                self.clear_cancel_scope()
-                _current_task_id.reset(token)
+                try:
+                    if not coro_started:
+                        coro.close()
+                    if finalizer is not None:
+                        with anyio.CancelScope(shield=True):
+                            await finalizer(self)
+                except BaseException as error:
+                    self.exception = error
+                    self.status = TaskStatus.FAILED
+                    self.finished_at = datetime.now(timezone.utc)
+                    raise
+                finally:
+                    self.set_done()
+                    self.clear_cancel_scope()
+                    _current_task_id.reset(token)
 
         if catch_exceptions:
             try:

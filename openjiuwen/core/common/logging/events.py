@@ -15,6 +15,7 @@ These events are used to record detailed information about various activities in
 - Performance metrics
 """
 
+import copy
 import uuid
 from dataclasses import (
     asdict,
@@ -269,7 +270,10 @@ class BaseLogEvent:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format for serialization"""
-        event_data = asdict(self)
+        serializable = copy.copy(self)
+        serializable.exception = None
+        event_data = asdict(serializable)
+        event_data["exception"] = self.exception
         # Handle enum types
         result: Dict[str, Any] = {}
         for key, value in event_data.items():
