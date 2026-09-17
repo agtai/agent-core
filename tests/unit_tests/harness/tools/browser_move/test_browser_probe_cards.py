@@ -13,19 +13,19 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
-from openjiuwen.harness.tools.browser_move.playwright_runtime.probes import (
+from openjiuwen.harness.tools.browser_move.runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.runtime.probes import (
     build_browser_state_metadata_js,
     build_card_probe_js,
     build_interactive_probe_js,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
     builtin_site_profiles,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime import (
     BrowserAgentRuntime,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
+from openjiuwen.harness.tools.browser_move.runtime.runtime_tools import (
     BrowserProbeCardsTool,
 )
 
@@ -221,7 +221,8 @@ def test_browser_probe_cards_tool_reports_runtime_error() -> None:
 def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "content": [
                 {
@@ -242,7 +243,7 @@ def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
     )
 
     runtime.ensure_runtime_ready.assert_called_once()
-    runtime._code_executor.assert_called_once()
+    runtime._evaluate_page_js.assert_awaited_once()
     assert result["ok"] is True
     assert result["url"] == "https://books.toscrape.com/"
     assert result["cards"][0]["title"] == "Book"
@@ -257,6 +258,7 @@ def test_runtime_probe_cards_uses_code_executor_and_parses_json() -> None:
 def test_runtime_probe_cards_handles_missing_code_executor() -> None:
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
+    runtime._uses_browser_driver = lambda: False  # type: ignore[method-assign]
     runtime._code_executor = None
 
     result = _run(runtime.probe_cards())
@@ -363,14 +365,15 @@ def test_build_card_probe_js_accepts_site_profiles_and_selector_cache_records() 
 
 
 def test_runtime_probe_cards_unwraps_result_field_and_records_cache(tmp_path, monkeypatch) -> None:
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
         BrowserSelectorCache,
     )
-    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+    import openjiuwen.harness.tools.browser_move.runtime.runtime as runtime_module
 
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "result": (
                 "### Result\n"
@@ -514,10 +517,10 @@ def test_build_card_probe_js_extracts_article_metadata_fields() -> None:
 
 def test_runtime_probe_cards_records_rejected_cache_attempt(tmp_path, monkeypatch) -> None:
     import json
-    from openjiuwen.harness.tools.browser_move.playwright_runtime.site_profiles import (
+    from openjiuwen.harness.tools.browser_move.runtime.site_profiles import (
         BrowserSelectorCache,
     )
-    import openjiuwen.harness.tools.browser_move.playwright_runtime.runtime as runtime_module
+    import openjiuwen.harness.tools.browser_move.runtime.runtime as runtime_module
 
     cache_path = tmp_path / "selector_cache.json"
     cache_path.write_text(
@@ -544,7 +547,8 @@ def test_runtime_probe_cards_records_rejected_cache_attempt(tmp_path, monkeypatc
 
     runtime = _make_runtime()
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime._code_executor = AsyncMock(
+    runtime._uses_browser_driver = lambda: True  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(  # type: ignore[method-assign]
         return_value={
             "content": [
                 {

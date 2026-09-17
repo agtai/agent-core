@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 """Tests for BrowserService guardrails, retries, and worker conversation behavior."""
@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserInstanceConfig,
     BrowserRunGuardrails,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.profiles import BrowserProfile
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import BrowserService
+from openjiuwen.harness.tools.browser_move.runtime.profiles import BrowserProfile
+from openjiuwen.harness.tools.browser_move.runtime.service import BrowserService
 
 from openjiuwen.core.foundation.tool import McpServerConfig
 
@@ -57,17 +57,17 @@ async def _capture_initial_mcp_registration(service: BrowserService) -> dict:
         "_ensure_managed_driver_started",
         AsyncMock(return_value=False),
     ), patch.object(service, "_ensure_screenshots_dir"), patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools."
+        "openjiuwen.harness.tools.browser_move.backends.playwright_mcp.browser_tools."
         "ensure_browser_runtime_client_patch"
     ), patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.service.Runner.start",
+        "openjiuwen.harness.tools.browser_move.runtime.service.Runner.start",
         new=AsyncMock(),
     ), patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.service."
+        "openjiuwen.harness.tools.browser_move.runtime.service."
         "Runner.resource_mgr.add_mcp_server",
         new=AsyncMock(side_effect=fake_add_mcp_server),
     ), patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.service."
+        "openjiuwen.harness.tools.browser_move.runtime.service."
         "BROWSER_SERVICE_REGISTRY.activate_binding",
         return_value=False,
     ):
@@ -112,8 +112,9 @@ def test_failure_summary_is_reused_then_cleared() -> None:
         observed_tasks.append(task)
         return responses[len(observed_tasks) - 1]
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         first = _run(service.run_task(task="Submit onboarding form", session_id="session-1", request_id="req-1"))
         assert first["ok"] is False
@@ -155,8 +156,9 @@ def test_timeout_failure_generates_summary() -> None:
             "error": None,
         }
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         failed = _run(service.run_task(task="Check status", session_id="session-timeout", request_id="req-timeout"))
         assert failed["ok"] is False
@@ -203,9 +205,11 @@ def test_retryable_runtime_error_retries_once() -> None:
         restart_calls["count"] += 1
         return None
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
-    ), patch.object(service, "_restart", fake_restart):
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
+        patch.object(service, "_restart", fake_restart),
+    ):
         result = _run(service.run_task(task="Open Lazada homepage", session_id="session-retry", request_id="req-retry"))
         assert result["ok"] is True
         assert result["attempt"] == 2
@@ -247,10 +251,11 @@ def test_retry_attempts_share_one_task_timeout_budget() -> None:
         observed_timeouts.append(float(timeout))
         return await awaitable
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
-    ), patch.object(service, "_restart", AsyncMock()), patch.object(
-        asyncio, "wait_for", fake_wait_for
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
+        patch.object(service, "_restart", AsyncMock()),
+        patch.object(asyncio, "wait_for", fake_wait_for),
     ):
         result = _run(
             service.run_task(
@@ -284,8 +289,9 @@ def test_max_iteration_failure_preserves_worker_output_without_progress_summary(
             "error": "max_iterations_reached",
         }
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         result = _run(
             service.run_task(
@@ -330,8 +336,9 @@ def test_max_iteration_resume_requires_opt_in_guardrail() -> None:
             "error": None,
         }
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         result = _run(
             service.run_task(
@@ -346,8 +353,6 @@ def test_max_iteration_resume_requires_opt_in_guardrail() -> None:
     assert call_count["count"] == 2
     assert len(observed_tasks) == 2
     assert "Continuation context:" in observed_tasks[1]
-
-
 
 
 def test_max_iteration_failure_includes_observed_tool_progress() -> None:
@@ -375,8 +380,9 @@ def test_max_iteration_failure_includes_observed_tool_progress() -> None:
             "error": "max_iterations_reached",
         }
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         result = _run(
             service.run_task(
@@ -427,8 +433,9 @@ def test_structured_progress_is_reused_on_next_invocation() -> None:
         observed_tasks.append(task)
         return responses[len(observed_tasks) - 1]
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         first = _run(service.run_task(task="Checkout cart", session_id="session-reuse", request_id="req-1"))
         second = _run(service.run_task(task="Checkout cart", session_id="session-reuse", request_id="req-2"))
@@ -465,14 +472,16 @@ def test_completed_status_overrides_false_ok_when_evidence_is_present() -> None:
             },
         }
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
     ):
         result = _run(service.run_task(task="Place order", session_id="session-complete", request_id="req-complete"))
 
     assert result["ok"] is True
     assert result["error"] is None
     assert result["failure_summary"] is None
+
 
 def test_run_task_once_uses_fresh_worker_conversation_ids() -> None:
     service = _make_service()
@@ -486,12 +495,11 @@ def test_run_task_once_uses_fresh_worker_conversation_ids() -> None:
         seen_request_ids.append(str(inputs["request_id"]))
         return {
             "output": (
-                '{"ok": true, "final": "done", "page": {"url": "", "title": ""},'
-                ' "screenshot": null, "error": null}'
+                '{"ok": true, "final": "done", "page": {"url": "", "title": ""}, "screenshot": null, "error": null}'
             )
         }
 
-    with patch("openjiuwen.harness.tools.browser_move.playwright_runtime.service.Runner.run_agent", fake_run_agent):
+    with patch("openjiuwen.harness.tools.browser_move.runtime.service.Runner.run_agent", fake_run_agent):
         first = _run(service.run_task_once(task="Open page", session_id="session-1", request_id="req-1"))
         second = _run(service.run_task_once(task="Open page", session_id="session-1", request_id="req-1"))
 
@@ -511,9 +519,7 @@ def test_ensure_managed_driver_started_reuses_healthy_existing_driver() -> None:
         healthy_driver.is_endpoint_ready.return_value = True
         setattr(service, "_managed_driver", healthy_driver)
 
-        with patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver"
-        ) as mock_cls:
+        with patch("openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver") as mock_cls:
             await getattr(service, "_ensure_managed_driver_started")()
 
         assert getattr(service, "_managed_driver") is healthy_driver
@@ -542,13 +548,17 @@ def test_ensure_managed_driver_started_replaces_stale_driver() -> None:
         new_driver.start.return_value = "http://127.0.0.1:9333"
         profile_store = getattr(service, "_profile_store")
 
-        with patch.object(profile_store, "get_profile", return_value=profile), patch.object(
-            profile_store,
-            "upsert_profile",
-            side_effect=lambda browser_profile, select=False: browser_profile,
-        ), patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
-            return_value=new_driver,
+        with (
+            patch.object(profile_store, "get_profile", return_value=profile),
+            patch.object(
+                profile_store,
+                "upsert_profile",
+                side_effect=lambda browser_profile, select=False: browser_profile,
+            ),
+            patch(
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
+                return_value=new_driver,
+            ),
         ):
             await getattr(service, "_ensure_managed_driver_started")()
 
@@ -563,6 +573,7 @@ def test_ensure_runtime_ready_refreshes_mcp_binding_after_managed_browser_restar
         service = _make_service()
         setattr(service, "started", True)
         setattr(service, "_driver_mode", "managed")
+        setattr(service, "_driver_backend", "playwright_mcp")
         setattr(service, "_registered_cdp_endpoint", "http://127.0.0.1:9333")
         getattr(service, "_inject_cdp_endpoint")("http://127.0.0.1:9333")
         setattr(service, "_browser_agent", object())
@@ -583,14 +594,19 @@ def test_ensure_runtime_ready_refreshes_mcp_binding_after_managed_browser_restar
         new_driver.start.return_value = "http://127.0.0.1:9333"
         profile_store = getattr(service, "_profile_store")
 
-        with patch.object(profile_store, "get_profile", return_value=profile), patch.object(
-            profile_store,
-            "upsert_profile",
-            side_effect=lambda browser_profile, select=False: browser_profile,
-        ), patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
-            return_value=new_driver,
-        ), patch.object(service, "_refresh_mcp_server_binding", AsyncMock()) as refresh_binding:
+        with (
+            patch.object(profile_store, "get_profile", return_value=profile),
+            patch.object(
+                profile_store,
+                "upsert_profile",
+                side_effect=lambda browser_profile, select=False: browser_profile,
+            ),
+            patch(
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
+                return_value=new_driver,
+            ),
+            patch.object(service, "_refresh_mcp_server_binding", AsyncMock()) as refresh_binding,
+        ):
             await service.ensure_runtime_ready()
 
         refresh_binding.assert_awaited_once()
@@ -616,7 +632,7 @@ def test_validate_mcp_command_accepts_absolute_node_without_npx(tmp_path: Path) 
     service.mcp_cfg.params["command"] = str(node.resolve())
 
     with patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.service.shutil.which",
+        "openjiuwen.harness.tools.browser_move.runtime.service.shutil.which",
         return_value=None,
     ):
         assert service._validate_mcp_command() == str(node.resolve())
@@ -627,7 +643,7 @@ def test_validate_mcp_command_reports_missing_configured_command() -> None:
     service.mcp_cfg.params["command"] = "missing-playwright-command"
 
     with patch(
-        "openjiuwen.harness.tools.browser_move.playwright_runtime.service.shutil.which",
+        "openjiuwen.harness.tools.browser_move.runtime.service.shutil.which",
         return_value=None,
     ), pytest.raises(RuntimeError, match="missing-playwright-command.*not found in PATH"):
         service._validate_mcp_command()
@@ -647,6 +663,7 @@ def test_ensure_runtime_ready_registers_expanded_tilde_command(
     monkeypatch.setenv("HOME", str(home_dir))
     monkeypatch.setenv("USERPROFILE", str(home_dir))
 
+    monkeypatch.setenv("BROWSER_DRIVER_BACKEND", "playwright_mcp")
     service = _make_service(runtime_cwd=str(mcp_cwd))
     service.mcp_cfg.params["command"] = f"~/bin/{node.name}"
 
@@ -671,6 +688,7 @@ def test_ensure_runtime_ready_registers_resolved_relative_command_with_custom_cw
     mcp_cwd.mkdir()
     monkeypatch.chdir(lookup_cwd)
 
+    monkeypatch.setenv("BROWSER_DRIVER_BACKEND", "playwright_mcp")
     service = _make_service(runtime_cwd=str(mcp_cwd))
     relative_command = str(Path("bin") / node.name)
     service.mcp_cfg.params["command"] = relative_command
@@ -741,21 +759,27 @@ def test_existing_profile_browser_binary_is_cleared_for_auto_detection() -> None
         new_driver.start.return_value = "http://127.0.0.1:9333"
         profile_store = getattr(service, "_profile_store")
 
-        with patch.dict(os.environ, {}, clear=True), patch.object(
-            service,
-            "_resolve_existing_cdp_profile",
-            return_value=None,
-        ), patch.object(
-            profile_store,
-            "get_profile",
-            return_value=profile,
-        ), patch.object(
-            profile_store,
-            "upsert_profile",
-            side_effect=lambda browser_profile, select=False: browser_profile,
-        ), patch(
-            "openjiuwen.harness.tools.browser_move.playwright_runtime.service.ManagedBrowserDriver",
-            return_value=new_driver,
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                service,
+                "_resolve_existing_cdp_profile",
+                return_value=None,
+            ),
+            patch.object(
+                profile_store,
+                "get_profile",
+                return_value=profile,
+            ),
+            patch.object(
+                profile_store,
+                "upsert_profile",
+                side_effect=lambda browser_profile, select=False: browser_profile,
+            ),
+            patch(
+                "openjiuwen.harness.tools.browser_move.runtime.service.ManagedBrowserDriver",
+                return_value=new_driver,
+            ),
         ):
             await service._ensure_managed_driver_started()
 
@@ -808,9 +832,11 @@ def test_run_task_does_not_reset_browser_runtime_after_completion() -> None:
     async def fake_reset_browser_runtime() -> None:
         reset_calls["count"] += 1
 
-    with patch.object(service, "ensure_started", fake_ensure_started), patch.object(
-        service, "run_task_once", fake_run_task_once
-    ), patch.object(service, "_reset_browser_runtime", fake_reset_browser_runtime):
+    with (
+        patch.object(service, "ensure_started", fake_ensure_started),
+        patch.object(service, "run_task_once", fake_run_task_once),
+        patch.object(service, "_reset_browser_runtime", fake_reset_browser_runtime),
+    ):
         result = _run(service.run_task(task="Open Baidu", session_id="keep-after-task", request_id="req-keep"))
 
     assert result["ok"] is True
