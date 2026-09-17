@@ -11,12 +11,12 @@ from typing import Any, Dict
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     MISSING_API_KEY_MESSAGE,
     build_runtime_settings,
     load_repo_dotenv,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
 
 
 def _system_tests_enabled() -> bool:

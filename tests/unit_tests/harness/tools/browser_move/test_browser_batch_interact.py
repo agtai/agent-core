@@ -14,13 +14,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openjiuwen.harness.tools.browser_move.controllers import action as controller
-from openjiuwen.harness.tools.browser_move.controllers.action import (
+from openjiuwen.harness.tools.browser_move.runtime.controllers import action as controller
+from openjiuwen.harness.tools.browser_move.runtime.controllers.action import (
     _build_batch_interact_script,
     _build_drag_script,
     _compact_extraction_provenance,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.runtime.runtime import BrowserAgentRuntime
 
 
 def _run(coro: Any) -> Any:
