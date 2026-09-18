@@ -5,17 +5,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase, mock
 
-from openjiuwen.core.common.exception.errors import BaseError
-from openjiuwen.core.foundation.llm.model import Model
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError, build_error
+from openjiuwen.core.foundation.llm import Model, ModelClientConfig
+from openjiuwen.core.foundation.llm.model_clients.base_model_client import BaseModelClient
 from openjiuwen.core.foundation.tool.schema import ToolInfo
+from openjiuwen.harness.schema.decision_policy import DecisionPolicyModel
 from openjiuwen.harness.tools.browser_move.policy import jev_decisions
-from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import JevDecisionModel
+from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import (
+    MAX_CONSECUTIVE_WAITS,
+    JevDecisionModel,
+)
 
 _OPERATIONS = ["CLICK", "TYPE_TEXT", "SELECT", "SCROLL_DOWN", "WAIT", "DONE", "BLOCKED"]
+_CONTROL_OPERATIONS = ["WAIT", "DONE", "BLOCKED"]
 _SNAPSHOT: dict[str, Any] = {
     "url": "https://flights.test/",
     "title": "Flights",
@@ -46,6 +55,12 @@ _SNAPSHOT: dict[str, Any] = {
         },
     ],
 }
+_FAILED_PROBE_ENVELOPE: dict[str, Any] = {
+    "ok": False,
+    "error": "policy probe failed: boom",
+    "elements": [],
+    "page_state": {},
+}
 
 
 def _answer(choice: str, ids: list[str], confidence: float = 0.9) -> dict[str, Any]:
@@ -63,6 +78,24 @@ def _answers(operation: str, value: str) -> dict[str, Any]:
             "click_target": _answer("1", ["1", "2"]),
             "select_target": _answer("3:1", ["3:1", "3:2"]),
             "text_value": _answer(value, ["London", "none"]),
+        }
+    }
+
+
+def _control_answer(operation: str) -> dict[str, Any]:
+    """An ``operation`` answer scoped to an action space with no addressable elements."""
+    return {"answers": {"operation": _answer(operation, _CONTROL_OPERATIONS)}}
+
+
+def _malformed_operation_answer() -> dict[str, Any]:
+    """An ``operation`` answer whose probabilities do not sum to 1, over the full ``_OPERATIONS`` set."""
+    return {
+        "answers": {
+            "operation": {
+                "choice": "WAIT",
+                "confidence": 0.9,
+                "probabilities": {op: 0.3 for op in _OPERATIONS},
+            }
         }
     }
 
@@ -89,6 +122,12 @@ class TestActionSpaceAndRequest(TestCase):
         with self.assertRaises(BaseError):
             jev_decisions.validate_choice(_answer("9", ["1", "2"]), ["1", "2"])
 
+    def test_empty_elements_yield_control_only_action_space(self) -> None:
+        """B3: the probe's failure envelope must still fold into a decidable (WAIT/DONE/BLOCKED) space."""
+        space = jev_decisions.build_action_space(_FAILED_PROBE_ENVELOPE)
+        self.assertEqual(space.operations, _CONTROL_OPERATIONS)
+        self.assertEqual(space.heads, {})
+
 
 def _fake_model_init(self: Model, model_client_config: Any, model_config: Any) -> None:
     self.model_client_config = model_client_config
@@ -103,6 +142,13 @@ class _FakeRuntime:
     async def probe_for_policy(self, source: str, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(params)
         return json.loads(json.dumps(_SNAPSHOT))
+
+
+class _AlwaysFailingRuntime:
+    """A runtime whose probe never recovers, mirroring the B3-fixed ``probe_for_policy`` failure envelope."""
+
+    async def probe_for_policy(self, source: str, params: dict[str, Any]) -> dict[str, Any]:
+        return json.loads(json.dumps(_FAILED_PROBE_ENVELOPE))
 
 
 class _FakeClient:
@@ -121,6 +167,14 @@ class _FakeClient:
         return self.scripted.pop(0), 7
 
 
+class _RaisingClient(_FakeClient):
+    """A decisions client whose transport always fails, as B4 requires the model to tolerate."""
+
+    async def decide(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        self.bodies.append(body)
+        raise build_error(StatusCode.MODEL_CALL_FAILED, error_msg="decisions endpoint unavailable")
+
+
 def _fallback() -> mock.MagicMock:
     fallback = mock.MagicMock(spec=Model)
     fallback.model_client_config = None
@@ -135,16 +189,22 @@ def _fallback() -> mock.MagicMock:
     return fallback
 
 
-def _decider(scripted: list[dict[str, Any]], *, goal_value_cache: bool = True) -> JevDecisionModel:
+def _decider(
+    scripted: list[dict[str, Any]],
+    *,
+    goal_value_cache: bool = True,
+    client: Any = None,
+    runtime: Any = None,
+) -> JevDecisionModel:
     with mock.patch.object(Model, "__init__", _fake_model_init):
         decider = JevDecisionModel(
             _fallback(),
             language="en",
-            client=_FakeClient(scripted),
+            client=client or _FakeClient(scripted),
             goal_value_cache=goal_value_cache,
             value_model=None,
         )
-    decider.bind_runtime(_FakeRuntime())
+    decider.bind_runtime(runtime or _FakeRuntime())
     return decider
 
 
@@ -163,7 +223,7 @@ class TestJevDecisionModel(IsolatedAsyncioTestCase):
             {"generation_id": "g1", "target_id": "t_g1_2", "text": "London", "clear": True},
         )
         self.assertEqual(decider.ticks[0]["value_source"], "prefetch", "empty fields are prefetched at probe time")
-        self.assertNotIn("text_value", decider._client.bodies[0]["questions"])
+        self.assertNotIn("text_value", decider._decisions.bodies[0]["questions"])
 
         second = await decider.invoke(_MESSAGES, tools=_TOOLS)
         self.assertIsNone(second.tool_calls)
@@ -174,21 +234,21 @@ class TestJevDecisionModel(IsolatedAsyncioTestCase):
     async def test_cached_value_is_chosen_by_jev(self) -> None:
         decider = _decider([_answers("TYPE_TEXT", "none")])
         await decider.invoke(_MESSAGES, tools=_TOOLS)
-        await decider._values_task
-        decider._pending = None
-        decider._client.scripted.append(_answers("TYPE_TEXT", "London"))
+        await decider._run.values_task
+        decider._run.pending = None
+        decider._decisions.scripted.append(_answers("TYPE_TEXT", "London"))
 
         message = await decider.invoke(_MESSAGES, tools=_TOOLS)
         self.assertEqual(json.loads(message.tool_calls[0].arguments)["text"], "London")
-        self.assertIn("text_value", decider._client.bodies[-1]["questions"])
+        self.assertIn("text_value", decider._decisions.bodies[-1]["questions"])
         self.assertEqual(decider.ticks[-1]["value_source"], "cache")
 
     async def test_cache_off_means_no_value_head_and_prefetch_source(self) -> None:
         decider = _decider([_answers("TYPE_TEXT", "none")], goal_value_cache=False)
         message = await decider.invoke(_MESSAGES, tools=_TOOLS)
         self.assertEqual(json.loads(message.tool_calls[0].arguments)["text"], "London")
-        self.assertNotIn("text_value", decider._client.bodies[0]["questions"])
-        self.assertIsNone(decider._values_task)
+        self.assertNotIn("text_value", decider._decisions.bodies[0]["questions"])
+        self.assertIsNone(decider._run.values_task)
         self.assertEqual(decider.ticks[0]["value_source"], "prefetch")
         self.assertEqual(decider.report()["values"], {"cache": 0, "prefetch": 1, "llm": 0})
 
@@ -201,3 +261,185 @@ class TestJevDecisionModel(IsolatedAsyncioTestCase):
             )
         reply = await decider.invoke([{"role": "user", "content": "summarise"}], tools=[ToolInfo(name="read_file")])
         self.assertEqual(reply, "chat-reply")
+
+    async def test_report_before_any_turn_returns_the_zeroed_shape(self) -> None:
+        decider = _decider([])
+        self.assertEqual(
+            decider.report(),
+            {
+                "elapsed_ms": 0,
+                "jev_requests": 0,
+                "interactions": 0,
+                "waits": 0,
+                "median_jev_ms": 0,
+                "median_probe_ms": 0,
+                "values": {"cache": 0, "prefetch": 0, "llm": 0},
+                "history": [],
+            },
+        )
+        self.assertEqual(decider.ticks, [])
+        self.assertEqual(decider.started_at, 0.0)
+
+
+class TestJevRunIsolation(IsolatedAsyncioTestCase):
+    """B1: per-task state must not leak into the task that follows it."""
+
+    async def test_second_task_with_a_new_goal_starts_a_clean_run(self) -> None:
+        decider = _decider([_answers("DONE", "none")], goal_value_cache=False)
+
+        first_messages = [{"role": "user", "content": "Fly to London"}]
+        first = await decider.invoke(first_messages, tools=_TOOLS)
+        self.assertIsNone(first.tool_calls)
+        self.assertEqual(json.loads(first.content)["status"], "DONE")
+        self.assertTrue(decider._run.finished)
+
+        decider._decisions.scripted.append(_answers("TYPE_TEXT", "none"))
+        second_messages = [{"role": "user", "content": "Book a hotel in https://hotels.test/berlin"}]
+        navigate = await decider.invoke(second_messages, tools=_TOOLS)
+        self.assertEqual(navigate.tool_calls[0].name, "browser_navigate", "the URL shortcut must fire again")
+        self.assertEqual(json.loads(navigate.tool_calls[0].arguments)["url"], "https://hotels.test/berlin")
+        self.assertEqual(decider._run.goal, second_messages[0]["content"])
+
+        second = await decider.invoke(second_messages, tools=_TOOLS)
+        self.assertEqual(second.tool_calls[0].name, "browser_type")
+        body = decider._decisions.bodies[-1]
+        self.assertEqual(body["questions"]["operation"]["instructions"]["goal"], second_messages[0]["content"])
+        self.assertEqual(body["state"]["recent_actions"], [], "the second task must not inherit the first history")
+
+    async def test_starting_a_new_run_cancels_the_previous_runs_background_tasks(self) -> None:
+        decider = _decider([_answers("DONE", "none")])
+
+        await decider.invoke(_MESSAGES, tools=_TOOLS)
+        first_run = decider._run
+        self.assertIsNotNone(first_run.values_task)
+        self.assertTrue(first_run.prefetched, "the empty 'Where to?' field is prefetched on the first probe")
+        stale_values_task = first_run.values_task
+        stale_prefetch_task = next(iter(first_run.prefetched.values()))
+
+        decider._decisions.scripted.append(_answers("DONE", "none"))
+        await decider.invoke([{"role": "user", "content": "Fly to Berlin"}], tools=_TOOLS)
+
+        # Cancellation is cooperative: a task that never got a chance to run only reflects the
+        # cancel() request once the event loop actually delivers it.
+        for task in (stale_values_task, stale_prefetch_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self.assertTrue(stale_values_task.cancelled() or stale_values_task.done())
+        self.assertTrue(stale_prefetch_task.cancelled() or stale_prefetch_task.done())
+        self.assertIsNot(decider._run, first_run)
+
+
+class TestJevClientAttributeIsolation(TestCase):
+    """B2: the Jev transport must not collide with the base ``Model._client`` slot."""
+
+    def test_base_client_survives_and_decisions_client_is_the_injected_double(self) -> None:
+        client_config = ModelClientConfig(
+            client_provider="OpenAI",
+            api_key="sk-test-key",
+            api_base="https://api.openai.com/v1",
+            verify_ssl=False,
+        )
+        fallback = Model(client_config, None)
+        decisions = _FakeClient([])
+
+        decider = JevDecisionModel(
+            fallback, language="en", client=decisions, goal_value_cache=False, value_model=None
+        )
+
+        self.assertIsInstance(decider._client, BaseModelClient)
+        self.assertIsNot(decider._client, decisions)
+        self.assertIs(decider._decisions, decisions)
+
+
+class TestJevProbeFailureDegradesToBlocked(IsolatedAsyncioTestCase):
+    """B3: a probe that never recovers must not spin or raise — it must reach BLOCKED."""
+
+    async def test_always_failing_probe_terminates_blocked_within_the_wait_budget(self) -> None:
+        scripted = [_control_answer("WAIT") for _ in range(MAX_CONSECUTIVE_WAITS + 1)]
+        decider = _decider(scripted, goal_value_cache=False, runtime=_AlwaysFailingRuntime())
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+        self.assertEqual(len(decider._decisions.bodies), MAX_CONSECUTIVE_WAITS + 1)
+
+
+class TestJevDecisionFailureDegradesToBlocked(IsolatedAsyncioTestCase):
+    """B4: a decisions-endpoint failure must degrade the turn, not crash it."""
+
+    async def test_transport_failure_returns_blocked_summary(self) -> None:
+        decider = _decider([], client=_RaisingClient([]))
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+
+    async def test_malformed_answer_returns_blocked_summary(self) -> None:
+        decider = _decider([_malformed_operation_answer()])
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+
+
+class TestJevPrefetchedValueIsolation(IsolatedAsyncioTestCase):
+    """B5: prefetched values must not cross pages, and a failed prefetch must degrade gracefully."""
+
+    async def test_failed_prefetch_falls_through_to_the_blocked_path(self) -> None:
+        decider = _decider([_answers("TYPE_TEXT", "none")], goal_value_cache=False)
+
+        async def _raise(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("value generation blew up")
+
+        with mock.patch.object(JevDecisionModel, "_generate_value", _raise):
+            message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+        self.assertIn("no value for field", summary["reason"])
+
+    async def test_prefetched_value_does_not_cross_a_page_boundary(self) -> None:
+        decider = _decider([_answers("CLICK", "none")], goal_value_cache=False)
+        await decider.invoke(_MESSAGES, tools=_TOOLS)
+        run = decider._run
+        self.assertTrue(run.prefetched, "the empty 'Where to?' field is prefetched on the first probe")
+        self.assertTrue(all(key.startswith("k1|") for key in run.prefetched))
+        stale_task = next(iter(run.prefetched.values()))
+
+        other_page = json.loads(json.dumps(_SNAPSHOT))
+        other_page["page_key"] = "k2"
+        decider._prefetch_values(run, other_page)
+
+        self.assertTrue(run.prefetched, "the new page's editable field is prefetched")
+        self.assertTrue(all(key.startswith("k2|") for key in run.prefetched), "stale page-k1 prefetches must be gone")
+        with contextlib.suppress(asyncio.CancelledError):
+            await stale_task
+        self.assertTrue(stale_task.cancelled() or stale_task.done())
+
+
+class TestDecisionPolicyModelProtocol(TestCase):
+    """B6: the subagent layer recognises decision policies structurally, not by concrete class."""
+
+    def test_jev_decision_model_satisfies_the_protocol(self) -> None:
+        decider = _decider([])
+        self.assertIsInstance(decider, DecisionPolicyModel)
+
+    def test_a_minimal_stub_also_satisfies_the_protocol(self) -> None:
+        class _Stub:
+            def bind_runtime(self, runtime: Any) -> None:
+                return None
+
+        self.assertIsInstance(_Stub(), DecisionPolicyModel)
+
+    def test_an_object_without_bind_runtime_does_not_satisfy_the_protocol(self) -> None:
+        class _NotAPolicy:
+            pass
+
+        self.assertNotIsInstance(_NotAPolicy(), DecisionPolicyModel)

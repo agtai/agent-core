@@ -76,6 +76,19 @@ def test_probe_for_policy_registers_stamped_elements_as_targets() -> None:
     assert getattr(resolved, "css", None) == '[data-openjiuwen-jev="7"]'
 
 
+def test_probe_for_policy_returns_a_failure_envelope_when_evaluate_raises() -> None:
+    """B3: a page-script error must degrade to a structured failure, not propagate."""
+    runtime = _make_runtime()
+    runtime.ensure_runtime_ready = AsyncMock()  # type: ignore[method-assign]
+    runtime._evaluate_page_js = AsyncMock(side_effect=RuntimeError("detached frame"))  # type: ignore[method-assign]
+
+    result = _run(runtime.probe_for_policy("(params) => ({})", {"max_items": 250}))
+
+    assert result["ok"] is False
+    assert result["error"]
+    assert result["elements"] == []
+
+
 def test_activate_page_switches_to_the_tab_at_url() -> None:
     runtime = _make_runtime()
     driver = FakeDriver()
