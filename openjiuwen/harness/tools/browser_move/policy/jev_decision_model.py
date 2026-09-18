@@ -43,7 +43,7 @@ MAX_NO_CHANGE_STEPS = 3
 MAX_PREFETCHED_FIELDS = 8
 PROBE_SETTLE_MS = 500  # must equal probe_js.py's JS default so an un-escalated probe's timing is unchanged
 MAX_PROBE_SETTLE_MS = 1500  # keeps load(3s)+settle+1s JS lastResort >=1s under the 30s transport request timeout
-WAIT_SETTLE_BUDGET_MS = 3000  # total in-page settle time one WAIT episode may spend before re-asking the classifier
+WAIT_SETTLE_BUDGET_MS = 3000  # total in-page settle time one WAIT streak may spend before the step gives up
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 
 
@@ -64,6 +64,7 @@ class _Run:
     values_task: asyncio.Task[list[str]] | None = None
     tick: int = 0
     consecutive_waits: int = 0
+    settle_spent_ms: int = 0  # in-page wait already spent on the current WAIT streak; resets with consecutive_waits
     ticks: list[dict[str, Any]] = field(default_factory=list)
     finished: bool = False
 
@@ -209,42 +210,50 @@ class JevDecisionModel(Model):
                 run.history.append({"action": "wait", "kind": "wait", "text": None, "page_changed": None})
                 if run.consecutive_waits > MAX_CONSECUTIVE_WAITS:
                     return self._final(run, "BLOCKED", snapshot, "waited without progress")
-                snapshot, settle_probes, settle_ms = await self._settle_wait(run, snapshot)
+                snapshot, settle_probes, settle_ms, progressed = await self._settle_wait(run, snapshot)
+                if not progressed:
+                    return self._final(run, "BLOCKED", snapshot, "waited without progress")
                 probe_ms = settle_ms
                 continue
             run.consecutive_waits = 0
+            run.settle_spent_ms = 0
             if decision.operation in {"DONE", "BLOCKED"}:
                 return self._final(run, decision.operation, snapshot, "")
             return await self._act(run, decision, snapshot, record)
         return self._final(run, "BLOCKED", snapshot, "waited without progress")
 
-    async def _settle_wait(self, run: _Run, asked_snapshot: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
+    async def _settle_wait(self, run: _Run, asked_snapshot: dict[str, Any]) -> tuple[dict[str, Any], int, int, bool]:
         """Spend a WAIT verdict in-page instead of paying another decisions request.
 
         The classifier's answer on an unchanged page cannot change until the page does, so a decision
         request spent re-asking it is pure latency; re-probing costs nothing by comparison. Escalates
         ``settle_ms`` by doubling from ``PROBE_SETTLE_MS`` (clamped to ``MAX_PROBE_SETTLE_MS``) on every
         retry, and stops once either the probed ``page_key`` differs from the one the classifier just saw
-        or the requested settle budget (``WAIT_SETTLE_BUDGET_MS``) is spent -- a page that never goes
-        DOM-quiet (a CSS animation, a ticking clock) would otherwise burn its full settle cap forever. The
-        outer loop still asks the classifier once more after this returns: that request is what
-        distinguishes "still loading" from "genuinely stuck".
+        or ``WAIT_SETTLE_BUDGET_MS`` is spent -- a page that never goes DOM-quiet (a CSS animation, a
+        ticking clock) would otherwise burn its full settle cap forever.
+
+        The budget spans the whole WAIT streak (``run.settle_spent_ms``), not one verdict: a per-call
+        budget would be re-granted on every WAIT and let ``MAX_CONSECUTIVE_WAITS`` verdicts stretch one
+        stuck step to minutes. The returned flag is ``False`` once that budget is gone, and the caller
+        must treat it as terminal -- re-asking the classifier about a snapshot it already answered WAIT
+        on buys the same answer at full request cost. ``MAX_CONSECUTIVE_WAITS`` still bounds the other
+        shape of stuck, where ``page_key`` keeps flipping but the page stays unactionable.
         """
         asked_page_key = asked_snapshot.get("page_key")
         snapshot = asked_snapshot
         settle_ms = PROBE_SETTLE_MS
-        requested_ms = 0
         probes = 0
         measured_ms = 0
-        while requested_ms < WAIT_SETTLE_BUDGET_MS:
-            snapshot, probe_ms = await self._probe(run, settle_ms=settle_ms)
+        while run.settle_spent_ms < WAIT_SETTLE_BUDGET_MS:
+            requested_ms = min(settle_ms, WAIT_SETTLE_BUDGET_MS - run.settle_spent_ms)
+            snapshot, probe_ms = await self._probe(run, settle_ms=requested_ms)
             probes += 1
             measured_ms += probe_ms
-            requested_ms += settle_ms
+            run.settle_spent_ms += requested_ms
             if snapshot.get("page_key") != asked_page_key:
-                break
+                return snapshot, probes, measured_ms, True
             settle_ms = min(settle_ms * 2, MAX_PROBE_SETTLE_MS)
-        return snapshot, probes, measured_ms
+        return snapshot, probes, measured_ms, False
 
     async def _probe(self, run: _Run, *, settle_ms: int = PROBE_SETTLE_MS) -> tuple[dict[str, Any], int]:
         started = time.perf_counter()
