@@ -7,7 +7,7 @@
 | 类型 | feature |
 | 日期 | 2026-09-19 |
 | 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`openjiuwen/harness/schema/decision_policy.py`（新增，review 修订）、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`tests/unit_tests/harness/tools/browser_move/` |
-| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10）；WAIT 就地稳定优化后 **769 passed, 26 xfailed**（另增 8 个用例，覆盖决策 11-12） |
+| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10）；WAIT 就地稳定优化后 **770 passed, 26 xfailed**（另增 9 个用例，覆盖决策 11-12） |
 | 关联 feature | [[F_02_browser-semantic-neutrality]]（同一子系统；本文不改语义中立判定） |
 | 关联 spec | [[S_18_subagents-and-lifecycle]]（不变量 6 增补：策略模型直通） |
 
@@ -127,9 +127,8 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 `_probe` 因此加一个关键字参数 `settle_ms`（决策 2b），`_decide_message` 把首次探测挪到循环外，
 `WAIT` 分支不再 `continue` 去重新决策，而是调用新的 `_settle_wait` 辅助方法：用**加倍**的
 `settle_ms`（从 `PROBE_SETTLE_MS` 起，封顶 `MAX_PROBE_SETTLE_MS`）反复原地探测，直到探测到的
-`page_key` 与分类器刚看到的那次不同，或累计请求的稳定时长达到 `WAIT_SETTLE_BUDGET_MS`——这两
-个条件之一满足后才把控制权交回外层循环，让分类器**再问一次**。这最后一次决策请求不可省：
-它是区分"还在加载"与"真的卡住了"的唯一手段。
+`page_key` 与分类器刚看到的那次不同，或整条 WAIT 连击的页内等待预算 `WAIT_SETTLE_BUDGET_MS`
+用尽。只有前者把控制权交回外层循环让分类器**再问一次**；后者是终态（决策 12）。
 
 比较新鲜度用 `snapshot["page_key"]`，不用 `generation_id` 或 `marker`——`page_key` 已经是
 `_probe`（决策 9 的 `page_changed` 判定）与 `_field_key`（prefetch 隔离）在用的窄语义键，
@@ -142,8 +141,18 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 不会触发，每次 settle 探测都会烧光它的 `settle_ms` 硬上限——如果只有前者，`_settle_wait` 会在
 一次 `WAIT` 判决内无限重探测，`run.consecutive_waits` 却因为内层循环不递增它而完全看不到这
 个情况。`_settle_wait` 内层循环因此**不**触碰 `run.consecutive_waits`：它只被外层每次真正问过
-分类器后递增，继续充当"总共能忍受几次 WAIT 判决"的天花板；`WAIT_SETTLE_BUDGET_MS` 独立限制
-"单次 WAIT 判决允许烧多久的页内等待"。
+分类器后递增，继续充当"总共能忍受几次 WAIT 判决"的天花板。
+
+**墙钟预算按整条 WAIT 连击计，不按单次判决计**，记在 `_Run.settle_spent_ms` 上，与
+`consecutive_waits` 同时清零（真正动作之后）。初版把它做成 `_settle_wait` 的局部变量，于是每
+次 `WAIT` 判决都重新发一份完整预算：一个永不 DOM 静默的页面会把 3 s 预算乘上
+`MAX_CONSECUTIVE_WAITS + 1` 次判决，到 BLOCKED 的时间从 ~3.8 s 涨到 ~21 s——这条路径正是优化
+前最快的那条（卡死页面原本只花几次决策请求就放弃），反而被"优化"成了最慢的。
+
+预算耗尽因此是**终态**（`_settle_wait` 返回 `progressed=False`，调用方直接 `BLOCKED`），不再
+交回分类器多问一次：被问的是一张 `page_key` 与上次逐字相同的快照，历史也没变，换来的只会是
+同一个 `WAIT`，代价却是一整次决策请求。区分"还在加载"与"真的卡住了"的判据因此从"再问一次
+分类器"换成"给足 3 s 页内等待后交互表面是否动过"——后者不花钱，且对这个问题是更直接的证据。
 
 三个新常量（`policy/jev_decision_model.py`，紧邻 `MAX_CONSECUTIVE_WAITS`）：
 
@@ -151,7 +160,7 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 |---|---|---|
 | `PROBE_SETTLE_MS` | 500 | 必须等于 `probe_js.py` 的 JS 默认值，不升级时探测耗时不变 |
 | `MAX_PROBE_SETTLE_MS` | 1500 | `load(3s) + settle + 1s` 的 JS 兜底 resolver 必须比 driver 请求超时至少低 1s |
-| `WAIT_SETTLE_BUDGET_MS` | 3000 | 一次 WAIT 判决允许花费的页内等待总量，用完必须交回分类器 |
+| `WAIT_SETTLE_BUDGET_MS` | 3000 | 整条 WAIT 连击允许花费的页内等待总量（`_Run.settle_spent_ms`），用完即 BLOCKED |
 
 `MAX_PROBE_SETTLE_MS` 的推导：`backends/browser_use/transport.py:30` 的 `_REQUEST_TIMEOUT_S = 30.0`
 是 `evaluate()` 走 sidecar wire 调用时的有效超时（`transport.py:193`，`_evaluate_page_js`
@@ -245,3 +254,7 @@ prefetch 失败路径行为一致。
    `WAIT` 分支的 `continue`，而该分支自身已经在 `run.consecutive_waits > MAX_CONSECUTIVE_WAITS`
    时提前 `return`，所以最后一次迭代必然从循环内部返回。发现于本轮但未清理——它先于 WAIT 优化
    存在，清理它是与本次改动无关的独立小重构，不在本轮范围内。
+9. 预算耗尽即 BLOCKED（决策 12）放弃了"分类器第二次可能改口"这一分支。论据是同一张
+   `page_key` 未变的快照 + 未变的历史只会换来同一个 `WAIT`；若实跑中观察到分类器对逐字相同的
+   输入给出不同判决（采样温度、服务端版本漂移），这个假设就不成立，届时应把终态改回"再问一
+   次，仅当第二次仍是 `WAIT` 才 BLOCKED"。当前无凭据可实测（同遗留 7），故按确定性假设实现。
