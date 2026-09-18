@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/subagents/`（8 文件）、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-09-03 |
-| 关联 feature | N/A |
+| 最近一次修订日期 | 2026-09-19 |
+| 关联 feature | [[F_04_jev-decision-policy]] |
 
 ## 范围 / 边界
 
@@ -55,7 +55,11 @@
    这些是 code preset 的硬语义，新增 preset 不得绕过。
 6. **browser agent 约束**：`build_browser_agent_config` 经
    `_resolve_runtime_settings` 解析浏览器运行时；`_browser_model_with_temperature(model, temp)`
-   设置浏览器模型温度；`_coerce_browser_instance` 归一实例形态。
+   设置浏览器模型温度；`_coerce_browser_instance` 归一实例形态。例外：`model` 为
+   `tools/browser_move/policy/jev_decision_model.py` 的 `JevDecisionModel` 时，
+   `create_browser_agent` 原样使用该模型（不做温度副本），不注入 LLM 专用的
+   ContextProcessorRail，关闭模型异常检测 rail，并以 `bind_runtime(browser_backend)` 绑定
+   运行时（`F_04`）。
 7. **同步创建路径**：`create_*_agent(config, ...)` 是同步（复用 `create_deep_agent` 的
    同步构造，`S_01` 不变量 3）；`enable_subagent_runtime` 时才进 `S_10` 的异步控制面。
 8. **manifest 侧预设与 `subagents/` 预设同源**：`S_12` 的 `build_*_subagent` 是
