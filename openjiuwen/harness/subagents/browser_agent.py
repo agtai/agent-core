@@ -20,17 +20,18 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
+from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import JevDecisionModel
+from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
+    DEFAULT_BROWSER_CAPABILITIES,
+    narrow_allowed_tools_for_browser_driver,
+    resolve_browser_capabilities,
+)
 from openjiuwen.harness.tools.browser_move.runtime.browser_state_context_processor import (
     BrowserStateContextProcessorConfig,
 )
 from openjiuwen.harness.tools.browser_move.runtime.browser_working_context_processor import (
     BrowserWorkingContextProcessorConfig,
-)
-from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
-from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
-    DEFAULT_BROWSER_CAPABILITIES,
-    narrow_allowed_tools_for_browser_driver,
-    resolve_browser_capabilities,
 )
 from openjiuwen.harness.tools.browser_move.runtime.config import (
     BrowserInstanceConfig,
@@ -301,7 +302,9 @@ def create_browser_agent(
 
     resolved_language = resolve_language(language)
     instance = _coerce_browser_instance(browser_instance, browser_key)
-    browser_model = _browser_model_with_temperature(model, temperature)
+    # A decision policy in the model slot is used as is: no temperature copy, no LLM-only context rails.
+    policy_model = model if isinstance(model, JevDecisionModel) else None
+    browser_model = model if policy_model is not None else _browser_model_with_temperature(model, temperature)
     resolved_settings = _resolve_runtime_settings(browser_model, settings, instance)
 
     allowed_tool_names = resolved_capabilities.allowed_tool_names
@@ -343,6 +346,8 @@ def create_browser_agent(
         "allowed_tool_names": allowed_tool_names,
     }
     browser_backend = BrowserAgentRuntime(**runtime_kwargs)
+    if policy_model is not None:
+        policy_model.bind_runtime(browser_backend)
     injected_tools = build_browser_runtime_tools(browser_backend, language=resolved_language)
     working_context_config = BrowserWorkingContextProcessorConfig(
         language=resolved_language,
@@ -378,7 +383,9 @@ def create_browser_agent(
         ),
     )
     caller_context_rails = [rail for rail in (rails or []) if isinstance(rail, ContextProcessorRail)]
-    if caller_context_rails:
+    if policy_model is not None:
+        config_kwargs.setdefault("enable_model_anomaly_detection_rail", False)
+    elif caller_context_rails:
         for context_rail in caller_context_rails:
             context_rail.add_processors(
                 [

@@ -345,8 +345,13 @@ class SessionAdapter:
                 cdp_session.cdp_client,
                 cdp_session.session_id,
                 backend_node_id,
-                "function(){ if ('value' in this) { this.value = ''; } else { this.textContent = ''; } "
-                "this.dispatchEvent(new Event('input', {bubbles: true})); }",
+                # The click above may move focus into another input (a dialog copy of the field); clear the
+                # element that will receive insertText, which is the focused editable one when there is one.
+                "function(){ const active = document.activeElement; "
+                "const target = active && active !== document.body && ('value' in active || active.isContentEditable) "
+                "? active : this; "
+                "if ('value' in target) { target.value = ''; } else { target.textContent = ''; } "
+                "target.dispatchEvent(new Event('input', {bubbles: true})); }",
             )
         await cdp.insert_text(cdp_session.cdp_client, cdp_session.session_id, text)
         if press_enter:
