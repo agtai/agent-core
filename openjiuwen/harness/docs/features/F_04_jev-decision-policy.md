@@ -7,7 +7,7 @@
 | 类型 | feature |
 | 日期 | 2026-09-19 |
 | 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`openjiuwen/harness/schema/decision_policy.py`（新增，review 修订）、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`tests/unit_tests/harness/tools/browser_move/` |
-| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10） |
+| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10）；WAIT 就地稳定优化后 **769 passed, 26 xfailed**（另增 8 个用例，覆盖决策 11-12） |
 | 关联 feature | [[F_02_browser-semantic-neutrality]]（同一子系统；本文不改语义中立判定） |
 | 关联 spec | [[S_18_subagents-and-lifecycle]]（不变量 6 增补：策略模型直通） |
 
@@ -115,6 +115,70 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 `JevDecisionsClient` 里把 HTTP 错误消息中截断的 `response.text[:300]` 整段删掉，只保留状态码
 ——避免把响应体（可能带请求回显或账号信息）写进日志。
 
+### 11. WAIT 就地稳定，不再为它多付一次决策请求（`fix/jev-policy-review`）
+
+`_decide_message` 每轮都要探测一次页面、再问一次 Jev。分类器答 `WAIT` 时，旧代码原地
+`continue`——立即重新探测（仍旧封顶 500 ms 的默认稳定窗口）、再付一次决策请求（经 OpenRouter
+代理实测中位 ~484 ms）。但 `WAIT` 的语义就是"页面还没就绪"，而**分类器在页面变化之前不可能
+给出不同的答案**——在同一张未变的页面上再问一次，纯粹是丢进水里的延迟；页内再探测一次几乎
+不花钱（`POLICY_PROBE_JS` 本就有一条 DOM 静默窗口 + 硬上限的稳定逻辑，`settle_ms` 参数
+`probe_js.py:20` 早就读了，只是 Python 侧从未真正传过更大的值）。
+
+`_probe` 因此加一个关键字参数 `settle_ms`（决策 2b），`_decide_message` 把首次探测挪到循环外，
+`WAIT` 分支不再 `continue` 去重新决策，而是调用新的 `_settle_wait` 辅助方法：用**加倍**的
+`settle_ms`（从 `PROBE_SETTLE_MS` 起，封顶 `MAX_PROBE_SETTLE_MS`）反复原地探测，直到探测到的
+`page_key` 与分类器刚看到的那次不同，或累计请求的稳定时长达到 `WAIT_SETTLE_BUDGET_MS`——这两
+个条件之一满足后才把控制权交回外层循环，让分类器**再问一次**。这最后一次决策请求不可省：
+它是区分"还在加载"与"真的卡住了"的唯一手段。
+
+比较新鲜度用 `snapshot["page_key"]`，不用 `generation_id` 或 `marker`——`page_key` 已经是
+`_probe`（决策 9 的 `page_changed` 判定）与 `_field_key`（prefetch 隔离）在用的窄语义键，
+三处共享同一个"页面变没变"的定义，不再另发明一套。
+
+### 12. 两个独立的界限：决策请求数与页内等待的墙钟预算（`fix/jev-policy-review`）
+
+`MAX_CONSECUTIVE_WAITS`（决策请求计数）与 `WAIT_SETTLE_BUDGET_MS`（页内墙钟预算）互不替代，
+都必须保留：一个带 CSS 动画或走秒表的页面永远不会 DOM 静默，`awaitQuietDom` 的静默窗口永远
+不会触发，每次 settle 探测都会烧光它的 `settle_ms` 硬上限——如果只有前者，`_settle_wait` 会在
+一次 `WAIT` 判决内无限重探测，`run.consecutive_waits` 却因为内层循环不递增它而完全看不到这
+个情况。`_settle_wait` 内层循环因此**不**触碰 `run.consecutive_waits`：它只被外层每次真正问过
+分类器后递增，继续充当"总共能忍受几次 WAIT 判决"的天花板；`WAIT_SETTLE_BUDGET_MS` 独立限制
+"单次 WAIT 判决允许烧多久的页内等待"。
+
+三个新常量（`policy/jev_decision_model.py`，紧邻 `MAX_CONSECUTIVE_WAITS`）：
+
+| 常量 | 值 | 编码的约束 |
+|---|---|---|
+| `PROBE_SETTLE_MS` | 500 | 必须等于 `probe_js.py` 的 JS 默认值，不升级时探测耗时不变 |
+| `MAX_PROBE_SETTLE_MS` | 1500 | `load(3s) + settle + 1s` 的 JS 兜底 resolver 必须比 driver 请求超时至少低 1s |
+| `WAIT_SETTLE_BUDGET_MS` | 3000 | 一次 WAIT 判决允许花费的页内等待总量，用完必须交回分类器 |
+
+`MAX_PROBE_SETTLE_MS` 的推导：`backends/browser_use/transport.py:30` 的 `_REQUEST_TIMEOUT_S = 30.0`
+是 `evaluate()` 走 sidecar wire 调用时的有效超时（`transport.py:193`，`_evaluate_page_js`
+（`runtime/runtime.py:2293-2297`）没有传自己的 timeout，用的就是这个默认值）。JS 侧的
+`lastResort` 兜底 resolver 在 `load_timeout_ms + settle_ms + 1000`（`probe_js.py:214`）后必然
+resolve；用默认参数算出的 4500 ms 已经在正常工作，说明 30 s 的余量远超需要。理论上
+`settle_ms` 可以升到 `30000 - 3000(load) - 1000 - 1000(安全边界) = 25000 ms` 而不撞超时，
+但选 1500 ms 是为了让 `WAIT_SETTLE_BUDGET_MS=3000ms` 的加倍序列（500 → 1000 → 1500 封顶）
+在正常测试和实跑中就能触发封顶行为，同时仍然留了远超所需的安全边际——不是把余量榨干。
+
+### 13. B4/B5 两个残留缺口的补完（`fix/jev-policy-review`，同批 WAIT 优化触及了同一批函数时发现）
+
+`JevDecisionsClient.decide` 以 `return response.json()` 收尾：一个 200 状态码但非 JSON 的响应体
+会抛 `json.JSONDecodeError`（继承自 `ValueError`），既不是 `BaseError` 也不是 `httpx.HTTPError`，
+逃出决策 10 加的 `except BaseError`，直接崩掉整个回合——这正是 B4 想关掉的失败类别。现在
+`response.json()` 包进 `try/except json.JSONDecodeError`，转成与 HTTP 错误路径同样的
+`MODEL_CALL_FAILED`，且不把原始响应体带进错误消息（呼应决策 10 去掉 `response.text[:300]`
+的理由：避免请求回显或账号信息进日志）。
+
+`run.values_task.result()` 在 `values_task.done()` 为真时被无保护调用；`done()` 对"以异常结束"的
+任务同样为真，`.result()` 会把那个异常重新抛出到一条没有 handler 的路径上。B5 给 `_value_for`
+里 `await task` 的 prefetch 分支加了 `try/except`，但漏了这一处；只有 `--goal-value-cache`（即
+variant-B 实验配置）才会触达。现在同样降级为空值列表并 `logger.warning`，与 `_value_for` 的
+prefetch 失败路径行为一致。
+
+两处都是 B4/B5 已关闭功能内部的完成度补丁，不是新范围；改动各一行，随 WAIT 优化一起被发现。
+
 ## 拒绝的方案
 
 1. **`browser_jev_run` 运行时工具**：LLM 仍决定何时委托，每次委托多一回合 LLM。
@@ -123,12 +187,23 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 4. **`requestAnimationFrame` 等待**：隐藏标签页永不触发，探测挂到超时。
 5. **`inception/mercury-2.5` 作为取值模型**：经本仓库 OpenAI 客户端返回空内容；保留
    `JEV_VALUE_MODEL` 显式开关。
+6. **WAIT 只在下一轮循环里升级 `settle_ms`，但仍照常付决策请求**（`fix/jev-policy-review`）：
+   评估过一个改动更小的方案——保留 `WAIT` 触发 `continue` 重新决策的循环结构不变，只是把每次
+   探测的 `settle_ms` 逐轮加倍，让探测本身多等一会儿，但每轮仍然照常再付一次决策请求。拒绝
+   的理由：**它只挽回了浪费的一部分**——被浪费的是那次请求本身（~484 ms 中位），不是探测
+   多等的那一小段稳定窗口。这个变体仍然在同一张未变的页面上反复问分类器，只是把探测窗口挪
+   大了一点，对"决策请求次数随等待轮数线性增长"这个核心问题毫无改善；本文选择的方案（决策
+   11-12）把等待完全挪进探测（零决策请求），只在页面真的变化或预算耗尽时才交还给分类器。
 
 ## 验证
 
 - 单测：`test_policy_jev.py`（动作空间/请求形状、非给出编号拒绝、首回合 LLM 取值、缓存取值、
   缓存关闭时预取、非浏览器回合转发；`fix/jev-policy-review` 新增 run 隔离、`_client`/`_decisions`
-  分离、探针失败降级、决策失败降级、prefetch 跨页隔离、`DecisionPolicyModel` 协议满足性）、
+  分离、探针失败降级、决策失败降级、prefetch 跨页隔离、`DecisionPolicyModel` 协议满足性；
+  WAIT 就地稳定优化新增 `TestJevWaitCollapsesIntoInPageSettling`——WAIT 被探测吸收而非走
+  决策请求线、`settle_ms` 逐次加倍并封顶、永不变化的页面在两个预算内收敛到 `BLOCKED`、
+  非-WAIT 路径逐字不变、`page_changed` 记账在重构后仍然正确；`TestJevDecisionsClientMalformedBody`
+  与 `TestJevGoalValueExtractionDegradesGracefully`——决策 13 补完的两个 B4/B5 残留缺口）、
   `test_browser_policy_probe.py`（`probe_for_policy` 注册目标并可解析为 `SelectorRef`、
   `activate_page` 切换标签页、探针求值异常时返回失败信封）。
 - lab：`.venv/bin/python -m openjiuwen.harness.tools.browser_move.lab.run_jiuwen_jev`，需 `.env` 中
@@ -142,15 +217,18 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 | jev-ultrafast 文档（TypeSafe 直连） | 7.1 s | 17 | 10 | 1 | 178 ms | done |
 | 本文，目标值缓存开（run 5） | 11.6 s | 14 | 10 | 3 | 543 ms | completed |
 | 本文，缓存关 + 预取（run 10） | 12.2 s | 14 | 10 | 3 | 484 ms | completed |
+| 本文，WAIT 就地稳定（`fix/jev-policy-review`） | pending | pending | pending | pending | pending | 未获得可用凭据，见已知遗留 7 |
 
 总时长含约 2.6 s 的导航与页面加载；每步约 0.69 s = Jev 0.48 s + 探测 0.15 s + 循环与动作 0.06 s。
 
 ## 已知遗留
 
 审查关闭（`fix/jev-policy-review`）：每任务状态复用（B1）、决策客户端覆盖 `Model._client`
-（B2）、`probe_for_policy` 无失败信封（B3）、决策端点失败直接抛出且日志回显响应体（B4）、
-预取值跨页泄漏且失败会崩溃（B5）、子代理装配层硬依赖具体策略类（B6）——机制见决策 8-10，
-接口约束见 `S_18` 不变量 6。以下为仍然打开的遗留项：
+（B2）、`probe_for_policy` 无失败信封（B3）、决策端点失败直接抛出且日志回显响应体（B4，
+决策 10 + 决策 13 补完的 `response.json()` 分支）、预取值跨页泄漏且失败会崩溃（B5，决策 10 +
+决策 13 补完的 `values_task.result()` 分支）、子代理装配层硬依赖具体策略类（B6）——机制见
+决策 8-10 与 13，接口约束见 `S_18` 不变量 6。WAIT 就地稳定优化见决策 11-12。以下为仍然打开
+的遗留项：
 
 1. 指令文本在 `policy/prompts.py` 常量中，按 `S_06` 应迁到 `harness/prompts/sections/`。
 2. 声明式路径（`SubAgentConfig` / `TaskTool` 派生的 browser_agent）没有 `decision_backend`，仍用父模型。
@@ -158,3 +236,12 @@ HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回
 4. 每次 sidecar `connect()` 在 Chrome 里留下额外标签页。
 5. OpenRouter 转发使每次 Jev 约 0.45 s，是当前下限；TypeSafe 直连需邀请。
 6. sidecar `type_text` 清空目标的改动无单测（sidecar 在独立 venv 中运行）。
+7. WAIT 就地稳定优化未做实跑 A/B：`TYPESAFE_API_KEY` 在本地存在，但决策端点对当前凭据返回
+   401，判断是基础设施/凭据问题而非代码缺陷，不在本轮范围内排查。上表的 pending 行只由单测
+   验证过（`TestJevWaitCollapsesIntoInPageSettling` 断言探测调用次数多于决策调用次数），实际
+   墙钟收益需要凭据可用后补测，不得用现有行数做算术推出。
+8. `_decide_message` 循环体后仍留着一条 `return self._final(run, "BLOCKED", snapshot, "waited
+   without progress")`（紧跟 `for` 循环之后）。这段代码不可达：循环唯一的非 `return` 出口是
+   `WAIT` 分支的 `continue`，而该分支自身已经在 `run.consecutive_waits > MAX_CONSECUTIVE_WAITS`
+   时提前 `return`，所以最后一次迭代必然从循环内部返回。发现于本轮但未清理——它先于 WAIT 优化
+   存在，清理它是与本次改动无关的独立小重构，不在本轮范围内。
