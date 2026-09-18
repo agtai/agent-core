@@ -396,21 +396,29 @@ class TestJevProbeFailureDegradesToBlocked(IsolatedAsyncioTestCase):
         self.assertIsNone(message.tool_calls)
         summary = json.loads(message.content)
         self.assertEqual(summary["status"], "BLOCKED")
-        self.assertEqual(len(decider._decisions.bodies), MAX_CONSECUTIVE_WAITS + 1)
+        self.assertEqual(
+            len(decider._decisions.bodies),
+            1,
+            "a probe that never recovers exhausts the streak budget on the first WAIT, and an exhausted "
+            "budget is terminal -- the classifier is never re-asked about a snapshot it already answered",
+        )
 
 
 class TestJevWaitCollapsesIntoInPageSettling(IsolatedAsyncioTestCase):
     """A WAIT verdict must be spent re-probing in-page, not by paying another decisions request."""
 
     async def test_wait_is_absorbed_by_the_probe_not_the_wire(self) -> None:
-        decider = _decider([_op_answer("WAIT"), _answers("CLICK", "none")], goal_value_cache=False)
+        # The page is still loading and settles on the second settle probe -- a constant page_key would
+        # instead mean "genuinely stuck", which is terminal rather than re-asked.
+        runtime = _ScriptedPageKeyRuntime(["k1", "k1", "k2"])
+        decider = _decider([_op_answer("WAIT"), _answers("CLICK", "none")], goal_value_cache=False, runtime=runtime)
 
         message = await decider.invoke(_MESSAGES, tools=_TOOLS)
 
         self.assertEqual(message.tool_calls[0].name, "browser_click")
         self.assertEqual(len(decider._decisions.bodies), 2, "one WAIT verdict must cost exactly one re-ask")
         self.assertGreater(
-            len(decider._runtime.calls), 2, "the extra waiting must show up as extra probes, not extra decide() calls"
+            len(runtime.calls), 2, "the extra waiting must show up as extra probes, not extra decide() calls"
         )
 
     async def test_escalating_settle_doubles_and_clamps_at_the_probe(self) -> None:
@@ -435,13 +443,45 @@ class TestJevWaitCollapsesIntoInPageSettling(IsolatedAsyncioTestCase):
         summary = json.loads(message.content)
         self.assertEqual(summary["status"], "BLOCKED")
         self.assertIn("waited without progress", summary["reason"])
-        self.assertLessEqual(len(decider._decisions.bodies), MAX_CONSECUTIVE_WAITS + 1)
+        self.assertEqual(
+            len(decider._decisions.bodies),
+            1,
+            "an exhausted settle budget is terminal: re-asking about an unchanged snapshot buys the same "
+            "WAIT verdict at full request cost",
+        )
 
         settle_calls = [call["settle_ms"] for call in runtime.calls[1:]]
-        for start in range(0, len(settle_calls), 3):
-            group = settle_calls[start : start + 3]
-            self.assertEqual(group, [PROBE_SETTLE_MS, PROBE_SETTLE_MS * 2, MAX_PROBE_SETTLE_MS])
-            self.assertLessEqual(sum(group), WAIT_SETTLE_BUDGET_MS, "the settle budget bounds each WAIT episode")
+        self.assertEqual(settle_calls, [PROBE_SETTLE_MS, PROBE_SETTLE_MS * 2, MAX_PROBE_SETTLE_MS])
+        self.assertLessEqual(
+            sum(settle_calls),
+            WAIT_SETTLE_BUDGET_MS,
+            "the budget spans the whole WAIT streak, not one verdict -- a per-verdict budget would be "
+            f"re-granted {MAX_CONSECUTIVE_WAITS + 1}x and stretch one stuck step by that factor",
+        )
+
+    async def test_settle_budget_resets_once_the_page_actually_progresses(self) -> None:
+        # calls: [0] initial probe, [1]/[2] settle probes -- the page moves on the second, so the turn
+        # ends in a CLICK. Second turn: [3] initial probe, [4]/[5]/[6] a full, freshly granted budget.
+        runtime = _ScriptedPageKeyRuntime(["k1", "k1", "k2", "k2", "k2", "k2", "k2"])
+        decider = _decider(
+            [_op_answer("WAIT"), _answers("CLICK", "none"), _op_answer("WAIT")],
+            goal_value_cache=False,
+            runtime=runtime,
+        )
+
+        first = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertEqual(first.tool_calls[0].name, "browser_click")
+        self.assertEqual(decider._run.settle_spent_ms, 0, "a real action ends the streak and clears its budget")
+
+        second = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertEqual(json.loads(second.content)["status"], "BLOCKED")
+        self.assertEqual(
+            [call["settle_ms"] for call in runtime.calls[4:]],
+            [PROBE_SETTLE_MS, PROBE_SETTLE_MS * 2, MAX_PROBE_SETTLE_MS],
+            "the next streak must start from a full budget, not the remainder of the previous one",
+        )
 
     async def test_non_wait_path_is_unchanged_one_probe_one_decide_one_action(self) -> None:
         decider = _decider([_answers("CLICK", "none")], goal_value_cache=False)
