@@ -26,16 +26,19 @@ DEFAULT_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_MODEL = "typesafe/jev-1.13"
 NONE_VALUE = "none"
 _OPERATION_LABELS = {
-    "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
-    "TYPE_TEXT": "Enter or replace text in an editable field.",
-    "SELECT": "Select an observed dropdown value.",
-    "SCROLL_DOWN": "Scroll down.",
-    "SCROLL_UP": "Scroll up.",
-    "WAIT": "Wait for the page to update.",
-    "DONE": "Every requirement is visibly satisfied.",
-    "BLOCKED": "No supported operation can progress.",
+    "CLICK": (
+        "Press a control on the page: a button, a link, a menu entry, an autocomplete suggestion or a calendar day."
+    ),
+    "TYPE_TEXT": "Type a value into an editable field, replacing what it holds.",
+    "SELECT": "Pick one of the listed options of a native dropdown.",
+    "SCROLL_DOWN": "Move the viewport down the page.",
+    "SCROLL_UP": "Move the viewport up the page.",
+    "WAIT": "Give the page time to finish updating.",
+    "DONE": "The page shows every requirement of the task met.",
+    "BLOCKED": "None of the offered operations can move the task forward.",
 }
 _RETRY_STATUSES = frozenset({429, 503, 529})
+_HISTORY_KEYS = ("action", "kind", "text", "page_changed")
 
 
 @dataclass(frozen=True)
@@ -162,29 +165,30 @@ def build_request(
                 "text": snapshot.get("text", ""),
             },
             "elements": space.elements,
-            "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
-            ],
+            "recent_actions": [{key: entry.get(key) for key in _HISTORY_KEYS} for entry in history[-10:]],
         },
         "questions": questions,
     }
 
 
+def _unit_interval(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1
+
+
 def validate_choice(answer: Any, ids: list[str]) -> dict[str, Any]:
-    """jev's acceptance test: the choice is offered, probabilities cover the ids, sum to one, argmax is the choice."""
-    try:
-        probabilities = answer["probabilities"]
-        numbers = [*probabilities.values(), answer["confidence"]]
-        valid = (
-            answer["choice"] in ids
-            and set(probabilities) == set(ids)
-            and all(isinstance(n, (int, float)) and math.isfinite(n) and 0 <= n <= 1 for n in numbers)
-            and abs(sum(probabilities.values()) - 1) < 0.02
-            and probabilities[answer["choice"]] >= max(probabilities.values()) - 1e-6
-        )
-    except (KeyError, TypeError, ValueError, AttributeError):
-        valid = False
-    if not valid:
+    """Accept only a choice among ``ids`` whose distribution covers exactly ``ids`` and peaks at that choice."""
+    fields = answer if isinstance(answer, dict) else {}
+    choice, distribution, confidence = fields.get("choice"), fields.get("probabilities"), fields.get("confidence")
+    accepted = (
+        isinstance(distribution, dict)
+        and choice in ids
+        and set(distribution) == set(ids)
+        and _unit_interval(confidence)
+        and all(_unit_interval(weight) for weight in distribution.values())
+        and math.isclose(sum(distribution.values()), 1.0, abs_tol=0.02)
+        and distribution[choice] >= max(distribution.values()) - 1e-6
+    )
+    if not accepted:
         raise build_error(StatusCode.MODEL_CALL_FAILED, error_msg="decisions answer is not an offered choice")
     return answer
 
