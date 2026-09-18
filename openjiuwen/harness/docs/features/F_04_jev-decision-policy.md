@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | feature |
 | 日期 | 2026-09-19 |
-| 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`tests/unit_tests/harness/tools/browser_move/` |
-| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例） |
+| 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`openjiuwen/harness/schema/decision_policy.py`（新增，review 修订）、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`tests/unit_tests/harness/tools/browser_move/` |
+| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10） |
 | 关联 feature | [[F_02_browser-semantic-neutrality]]（同一子系统；本文不改语义中立判定） |
 | 关联 spec | [[S_18_subagents-and-lifecycle]]（不变量 6 增补：策略模型直通） |
 
@@ -65,9 +65,55 @@ browser-use 以后台标签页驱动页面，`document.visibilityState == "hidde
 
 ### 7. 策略模型直通 `create_browser_agent`
 
-`model` 为 `JevDecisionModel` 时：不做温度副本、不注入三个 LLM 专用 ContextProcessor、
-`enable_model_anomaly_detection_rail=False`、`bind_runtime(browser_backend)`。声明式路径
+`model` 满足 `openjiuwen/harness/schema/decision_policy.py:DecisionPolicyModel` 结构化协议
+（暴露 `bind_runtime(runtime)`）时：不做温度副本、不注入三个 LLM 专用 ContextProcessor、
+`enable_model_anomaly_detection_rail=False`、`bind_runtime(browser_backend)`。装配层按结构
+而非具体类判定（决策 8），`JevDecisionModel` 只是当前唯一实现。声明式路径
 （`build_browser_agent_config`）暂不支持，见已知遗留 2。
+
+### 8. 策略模型的类型契约是结构化 Protocol，不是具体类（review, `fix/jev-policy-review`）
+
+`harness/subagents` 是通用装配层，不应为了识别一个模型槽位而 `import` 某个具体策略实现——
+那样会把 `httpx` 依赖的策略模块拖进每一次浏览器子代理构造的导入图，也让新增第二种决策策略
+必须回来改 `browser_agent.py`。`openjiuwen/harness/schema/decision_policy.py` 定义
+`@runtime_checkable class DecisionPolicyModel(Protocol)`，只要求一个 `bind_runtime(runtime)`
+方法；`browser_agent.py` 改用 `isinstance(model, DecisionPolicyModel)` 判定，不再 import
+`JevDecisionModel`。`JevDecisionModel` 无需显式继承该协议，结构上已经满足。
+
+### 9. 每个任务是一个隔离的 `_Run`，绝不跨任务共享可变状态（review, `fix/jev-policy-review`）
+
+`create_browser_agent` 按 agent 构造一次 `JevDecisionModel`，但一个 agent 会服务多个任务。
+早期实现把 goal / history / pending / prefetched 等状态直接放在模型实例上：第二个任务会静默
+继承第一个任务的目标与历史，`_consecutive_waits`/`_tick` 跨任务累积耗尽等待预算，陈旧的
+`_pending` 与新页面的 `page_key` 比对出虚假的 `page_changed`。`policy/jev_decision_model.py:_Run`
+把这些字段收进一个 dataclass；模型至多持有一个当前 run。新 run 的判定是"没有 run，或这次
+`_goal_from(messages)` 算出的目标和当前 run 不同，或当前 run 已经被 `_final()` 标记为
+`finished`"。起新 run 时先取消上一个 run 的 `values_task` 与全部 `prefetched` 任务再丢弃它，
+不让后台工作跨任务泄漏成"Task exception was never retrieved"噪音。`prefetched` 的 key 额外
+并入探测快照的 `page_key`，使一个页面生成的字段值不会被下一页的同名字段复用，页面切换时
+上一页遗留的 prefetch 任务同样被取消。`ticks` / `started_at` 保留为公开只读 property，委托给
+当前 run；`report()` 的键形状不变（`lab/run_jiuwen_jev.py` 消费它）。
+
+同批把决策客户端从 `self._client` 改名为 `self._decisions`：`Model.__init__` 已经把
+`self._client` 建成一个真正挂了遥测的 `BaseModelClient`，旧代码在 `super().__init__()` 之后
+立刻把它整个换成 `JevDecisionsClient`，任何继承来的、触碰 `self._client` 的方法（图像/语音/
+视频生成、KV-cache 亲和性探测）都会在类型不对的对象上操作。
+
+### 10. 探针与决策端点的失败必须降级为 `BLOCKED`，不得让整个回合崩溃（review, `fix/jev-policy-review`）
+
+`BrowserAgentRuntime.probe_for_policy` 原先对 `_evaluate_page_js` 的异常没有任何防护，一次
+页面脚本报错（探测帧被卸载、driver 抖动、导航中途求值）会直接从 `Model.invoke` 里抛出去，
+杀掉整个 agent 回合——即便调用方 `_probe()` 早就按"探针可能报 error"的信封形状写好了消费
+逻辑。现在它用与同类 `INTERACTIVE_PROBE_JS` 路径一致的失败信封包住：
+`{"ok": False, "error": ..., "elements": [], "page_state": ...}`，`asyncio.CancelledError`
+照常传播、不被吞掉。`build_action_space` 对空 `elements` 天然只产出 `WAIT`/`DONE`/`BLOCKED`
+三个控制操作，tick 循环因此能正常收敛到 `BLOCKED` 而不是抛异常或原地打转。
+
+决策端点一侧同理：`decide` + `interpret` 现在包在 `try/except BaseError` 里，失败（连接错误、
+HTTP 错误、重试耗尽、概率分布校验失败）时记 warning 并返回 `_final(run, "BLOCKED", ...)`，
+调用方仍能拿到 url/title/steps/page_text 等可用的终态摘要，而不是收到一个模型层崩溃。
+`JevDecisionsClient` 里把 HTTP 错误消息中截断的 `response.text[:300]` 整段删掉，只保留状态码
+——避免把响应体（可能带请求回显或账号信息）写进日志。
 
 ## 拒绝的方案
 
@@ -81,8 +127,10 @@ browser-use 以后台标签页驱动页面，`document.visibilityState == "hidde
 ## 验证
 
 - 单测：`test_policy_jev.py`（动作空间/请求形状、非给出编号拒绝、首回合 LLM 取值、缓存取值、
-  缓存关闭时预取、非浏览器回合转发）、`test_browser_policy_probe.py`（`probe_for_policy`
-  注册目标并可解析为 `SelectorRef`、`activate_page` 切换标签页）。
+  缓存关闭时预取、非浏览器回合转发；`fix/jev-policy-review` 新增 run 隔离、`_client`/`_decisions`
+  分离、探针失败降级、决策失败降级、prefetch 跨页隔离、`DecisionPolicyModel` 协议满足性）、
+  `test_browser_policy_probe.py`（`probe_for_policy` 注册目标并可解析为 `SelectorRef`、
+  `activate_page` 切换标签页、探针求值异常时返回失败信封）。
 - lab：`.venv/bin/python -m openjiuwen.harness.tools.browser_move.lab.run_jiuwen_jev`，需 `.env` 中
   OpenRouter key（`TYPESAFE_API_KEY` / `TYPESAFE_API_URL` / `TYPESAFE_MODEL`）、`BROWSER_CDP_URL`、
   `.venvs/browser-use` sidecar，以及以 `--remote-debugging-port=9222` 启动的 Chrome（每次计时前换新
@@ -98,6 +146,11 @@ browser-use 以后台标签页驱动页面，`document.visibilityState == "hidde
 总时长含约 2.6 s 的导航与页面加载；每步约 0.69 s = Jev 0.48 s + 探测 0.15 s + 循环与动作 0.06 s。
 
 ## 已知遗留
+
+审查关闭（`fix/jev-policy-review`）：每任务状态复用（B1）、决策客户端覆盖 `Model._client`
+（B2）、`probe_for_policy` 无失败信封（B3）、决策端点失败直接抛出且日志回显响应体（B4）、
+预取值跨页泄漏且失败会崩溃（B5）、子代理装配层硬依赖具体策略类（B6）——机制见决策 8-10，
+接口约束见 `S_18` 不变量 6。以下为仍然打开的遗留项：
 
 1. 指令文本在 `policy/prompts.py` 常量中，按 `S_06` 应迁到 `harness/prompts/sections/`。
 2. 声明式路径（`SubAgentConfig` / `TaskTool` 派生的 browser_agent）没有 `decision_backend`，仍用父模型。
