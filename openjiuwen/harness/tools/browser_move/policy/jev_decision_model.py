@@ -169,7 +169,11 @@ class JevDecisionModel(Model):
             space = build_action_space(snapshot)
             values = run.values if run.values_task is None or run.values_task.done() else []
             if run.values_task is not None and run.values_task.done() and not run.values:
-                run.values = run.values_task.result()
+                try:
+                    run.values = run.values_task.result()
+                except Exception:  # noqa: BLE001 - a failed goal-value extraction degrades to an empty value list
+                    logger.warning("[JevDecisionModel] goal-value extraction failed", exc_info=True)
+                    run.values = []
                 values = run.values
             body = build_request(
                 space,
