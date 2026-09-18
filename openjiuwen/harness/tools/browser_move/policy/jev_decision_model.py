@@ -41,6 +41,9 @@ BROWSER_TURN_TOOL = "browser_click"
 MAX_CONSECUTIVE_WAITS = 5
 MAX_NO_CHANGE_STEPS = 3
 MAX_PREFETCHED_FIELDS = 8
+PROBE_SETTLE_MS = 500  # must equal probe_js.py's JS default so an un-escalated probe's timing is unchanged
+MAX_PROBE_SETTLE_MS = 1500  # keeps load(3s)+settle+1s JS lastResort >=1s under the 30s transport request timeout
+WAIT_SETTLE_BUDGET_MS = 3000  # total in-page settle time one WAIT episode may spend before re-asking the classifier
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 
 
@@ -160,8 +163,9 @@ class JevDecisionModel(Model):
                 nav_args = {"url": url.group(0).rstrip(".,)")}
                 return self._tool_message(run, "browser_navigate", nav_args, label="navigate")
 
+        snapshot, probe_ms = await self._probe(run)
+        settle_probes, settle_ms = 0, 0
         for _ in range(MAX_CONSECUTIVE_WAITS + 1):
-            snapshot, probe_ms = await self._probe(run)
             space = build_action_space(snapshot)
             values = run.values if run.values_task is None or run.values_task.done() else []
             if run.values_task is not None and run.values_task.done() and not run.values:
@@ -186,6 +190,8 @@ class JevDecisionModel(Model):
             record = {
                 "tick": run.tick,
                 "probe_ms": probe_ms,
+                "settle_probes": settle_probes,
+                "settle_ms": settle_ms,
                 "jev_ms": jev_ms,
                 "operation": decision.operation,
                 "target": decision.candidate.item.get("label") if decision.candidate else None,
@@ -199,6 +205,8 @@ class JevDecisionModel(Model):
                 run.history.append({"action": "wait", "kind": "wait", "text": None, "page_changed": None})
                 if run.consecutive_waits > MAX_CONSECUTIVE_WAITS:
                     return self._final(run, "BLOCKED", snapshot, "waited without progress")
+                snapshot, settle_probes, settle_ms = await self._settle_wait(run, snapshot)
+                probe_ms = settle_ms
                 continue
             run.consecutive_waits = 0
             if decision.operation in {"DONE", "BLOCKED"}:
@@ -206,12 +214,40 @@ class JevDecisionModel(Model):
             return await self._act(run, decision, snapshot, record)
         return self._final(run, "BLOCKED", snapshot, "waited without progress")
 
-    async def _probe(self, run: _Run) -> tuple[dict[str, Any], int]:
+    async def _settle_wait(self, run: _Run, asked_snapshot: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
+        """Spend a WAIT verdict in-page instead of paying another decisions request.
+
+        The classifier's answer on an unchanged page cannot change until the page does, so a decision
+        request spent re-asking it is pure latency; re-probing costs nothing by comparison. Escalates
+        ``settle_ms`` by doubling from ``PROBE_SETTLE_MS`` (clamped to ``MAX_PROBE_SETTLE_MS``) on every
+        retry, and stops once either the probed ``page_key`` differs from the one the classifier just saw
+        or the requested settle budget (``WAIT_SETTLE_BUDGET_MS``) is spent -- a page that never goes
+        DOM-quiet (a CSS animation, a ticking clock) would otherwise burn its full settle cap forever. The
+        outer loop still asks the classifier once more after this returns: that request is what
+        distinguishes "still loading" from "genuinely stuck".
+        """
+        asked_page_key = asked_snapshot.get("page_key")
+        snapshot = asked_snapshot
+        settle_ms = PROBE_SETTLE_MS
+        requested_ms = 0
+        probes = 0
+        measured_ms = 0
+        while requested_ms < WAIT_SETTLE_BUDGET_MS:
+            snapshot, probe_ms = await self._probe(run, settle_ms=settle_ms)
+            probes += 1
+            measured_ms += probe_ms
+            requested_ms += settle_ms
+            if snapshot.get("page_key") != asked_page_key:
+                break
+            settle_ms = min(settle_ms * 2, MAX_PROBE_SETTLE_MS)
+        return snapshot, probes, measured_ms
+
+    async def _probe(self, run: _Run, *, settle_ms: int = PROBE_SETTLE_MS) -> tuple[dict[str, Any], int]:
         started = time.perf_counter()
         after = None
         if run.pending is not None:
             after = {"kind": run.pending["kind"], "node": run.pending["node"]}
-        params = {"stamp_attribute": STAMP_ATTRIBUTE, "after": after, "max_items": 250}
+        params = {"stamp_attribute": STAMP_ATTRIBUTE, "after": after, "max_items": 250, "settle_ms": settle_ms}
         snapshot = await self._runtime.probe_for_policy(POLICY_PROBE_JS, params)
         if snapshot.get("error"):
             logger.warning("[JevDecisionModel] policy probe reported %s", snapshot["error"])
@@ -401,6 +437,8 @@ class JevDecisionModel(Model):
                 "waits": 0,
                 "median_jev_ms": 0,
                 "median_probe_ms": 0,
+                "settle_probes": 0,
+                "settle_ms": 0,
                 "values": {"cache": 0, "prefetch": 0, "llm": 0},
                 "history": [],
             }
@@ -412,6 +450,8 @@ class JevDecisionModel(Model):
             "waits": len([h for h in run.history if h["kind"] == "wait"]),
             "median_jev_ms": int(statistics.median(jev)) if jev else 0,
             "median_probe_ms": int(statistics.median(t["probe_ms"] for t in run.ticks)) if run.ticks else 0,
+            "settle_probes": sum(t.get("settle_probes", 0) for t in run.ticks),
+            "settle_ms": sum(t.get("settle_ms", 0) for t in run.ticks),
             "values": {
                 source: len([t for t in run.ticks if t.get("value_source") == source])
                 for source in ("cache", "prefetch", "llm")
