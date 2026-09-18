@@ -11,6 +11,8 @@ import json
 from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase, mock
 
+import httpx
+
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import BaseError, build_error
 from openjiuwen.core.foundation.llm import Model, ModelClientConfig
@@ -20,6 +22,9 @@ from openjiuwen.harness.schema.decision_policy import DecisionPolicyModel
 from openjiuwen.harness.tools.browser_move.policy import jev_decisions
 from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import (
     MAX_CONSECUTIVE_WAITS,
+    MAX_PROBE_SETTLE_MS,
+    PROBE_SETTLE_MS,
+    WAIT_SETTLE_BUDGET_MS,
     JevDecisionModel,
 )
 
@@ -87,6 +92,15 @@ def _control_answer(operation: str) -> dict[str, Any]:
     return {"answers": {"operation": _answer(operation, _CONTROL_OPERATIONS)}}
 
 
+def _op_answer(operation: str) -> dict[str, Any]:
+    """An ``operation`` answer scoped to the full ``_SNAPSHOT`` action space, with no target head.
+
+    Valid for control operations (``WAIT`` / ``DONE`` / ``BLOCKED`` / scroll) that never index into
+    ``space.heads``, on a snapshot that has real addressable elements.
+    """
+    return {"answers": {"operation": _answer(operation, _OPERATIONS)}}
+
+
 def _malformed_operation_answer() -> dict[str, Any]:
     """An ``operation`` answer whose probabilities do not sum to 1, over the full ``_OPERATIONS`` set."""
     return {
@@ -142,6 +156,25 @@ class _FakeRuntime:
     async def probe_for_policy(self, source: str, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(params)
         return json.loads(json.dumps(_SNAPSHOT))
+
+
+class _ScriptedPageKeyRuntime:
+    """A runtime that returns ``_SNAPSHOT`` with ``page_key`` overridden per probe call, in order.
+
+    Once the scripted sequence is exhausted, the last key repeats -- this only matters for the
+    settle loop's clamp behaviour, which the escalation tests exercise explicitly.
+    """
+
+    def __init__(self, page_keys: list[str]) -> None:
+        self.page_keys = page_keys
+        self.calls: list[dict[str, Any]] = []
+
+    async def probe_for_policy(self, source: str, params: dict[str, Any]) -> dict[str, Any]:
+        index = min(len(self.calls), len(self.page_keys) - 1)
+        self.calls.append(params)
+        snapshot = json.loads(json.dumps(_SNAPSHOT))
+        snapshot["page_key"] = self.page_keys[index]
+        return snapshot
 
 
 class _AlwaysFailingRuntime:
@@ -273,6 +306,8 @@ class TestJevDecisionModel(IsolatedAsyncioTestCase):
                 "waits": 0,
                 "median_jev_ms": 0,
                 "median_probe_ms": 0,
+                "settle_probes": 0,
+                "settle_ms": 0,
                 "values": {"cache": 0, "prefetch": 0, "llm": 0},
                 "history": [],
             },
@@ -342,9 +377,7 @@ class TestJevClientAttributeIsolation(TestCase):
         fallback = Model(client_config, None)
         decisions = _FakeClient([])
 
-        decider = JevDecisionModel(
-            fallback, language="en", client=decisions, goal_value_cache=False, value_model=None
-        )
+        decider = JevDecisionModel(fallback, language="en", client=decisions, goal_value_cache=False, value_model=None)
 
         self.assertIsInstance(decider._client, BaseModelClient)
         self.assertIsNot(decider._client, decisions)
@@ -364,6 +397,85 @@ class TestJevProbeFailureDegradesToBlocked(IsolatedAsyncioTestCase):
         summary = json.loads(message.content)
         self.assertEqual(summary["status"], "BLOCKED")
         self.assertEqual(len(decider._decisions.bodies), MAX_CONSECUTIVE_WAITS + 1)
+
+
+class TestJevWaitCollapsesIntoInPageSettling(IsolatedAsyncioTestCase):
+    """A WAIT verdict must be spent re-probing in-page, not by paying another decisions request."""
+
+    async def test_wait_is_absorbed_by_the_probe_not_the_wire(self) -> None:
+        decider = _decider([_op_answer("WAIT"), _answers("CLICK", "none")], goal_value_cache=False)
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertEqual(message.tool_calls[0].name, "browser_click")
+        self.assertEqual(len(decider._decisions.bodies), 2, "one WAIT verdict must cost exactly one re-ask")
+        self.assertGreater(
+            len(decider._runtime.calls), 2, "the extra waiting must show up as extra probes, not extra decide() calls"
+        )
+
+    async def test_escalating_settle_doubles_and_clamps_at_the_probe(self) -> None:
+        runtime = _ScriptedPageKeyRuntime(["k1"] * 8)
+        decider = _decider([_op_answer("WAIT"), _op_answer("DONE")], goal_value_cache=False, runtime=runtime)
+
+        await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        settle_calls = [call["settle_ms"] for call in runtime.calls[1:]]
+        self.assertEqual(settle_calls, [PROBE_SETTLE_MS, PROBE_SETTLE_MS * 2, MAX_PROBE_SETTLE_MS])
+        self.assertLessEqual(sum(settle_calls), WAIT_SETTLE_BUDGET_MS)
+        self.assertTrue(all(ms <= MAX_PROBE_SETTLE_MS for ms in settle_calls))
+
+    async def test_never_changing_page_stays_bounded_by_both_budgets(self) -> None:
+        scripted = [_op_answer("WAIT") for _ in range(MAX_CONSECUTIVE_WAITS + 1)]
+        runtime = _ScriptedPageKeyRuntime(["k1"] * 64)
+        decider = _decider(scripted, goal_value_cache=False, runtime=runtime)
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+        self.assertIn("waited without progress", summary["reason"])
+        self.assertLessEqual(len(decider._decisions.bodies), MAX_CONSECUTIVE_WAITS + 1)
+
+        settle_calls = [call["settle_ms"] for call in runtime.calls[1:]]
+        for start in range(0, len(settle_calls), 3):
+            group = settle_calls[start : start + 3]
+            self.assertEqual(group, [PROBE_SETTLE_MS, PROBE_SETTLE_MS * 2, MAX_PROBE_SETTLE_MS])
+            self.assertLessEqual(sum(group), WAIT_SETTLE_BUDGET_MS, "the settle budget bounds each WAIT episode")
+
+    async def test_non_wait_path_is_unchanged_one_probe_one_decide_one_action(self) -> None:
+        decider = _decider([_answers("CLICK", "none")], goal_value_cache=False)
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertEqual(message.tool_calls[0].name, "browser_click")
+        self.assertEqual(len(decider._decisions.bodies), 1)
+        self.assertEqual(len(decider._runtime.calls), 1)
+        self.assertEqual(decider.ticks[-1]["settle_probes"], 0)
+        self.assertEqual(decider.ticks[-1]["settle_ms"], 0)
+
+    async def test_page_changed_reflects_the_first_post_action_probe_not_a_later_settle_discovery(self) -> None:
+        # call#1: invoke1's only probe, run.pending is still None. call#2: invoke2's initial probe,
+        # consumes the pending CLICK -- page has not visibly changed yet. call#3/#4: settle probes at
+        # 500ms/1000ms; the page only actually changes on the second settle probe.
+        runtime = _ScriptedPageKeyRuntime(["k1", "k1", "k1", "k2"])
+        decider = _decider(
+            [_answers("CLICK", "none"), _op_answer("WAIT"), _op_answer("DONE")],
+            goal_value_cache=False,
+            runtime=runtime,
+        )
+
+        await decider.invoke(_MESSAGES, tools=_TOOLS)
+        second = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(second.tool_calls)
+        self.assertEqual(json.loads(second.content)["status"], "DONE")
+        click_entry = next(h for h in decider._run.history if h["kind"] == "click")
+        self.assertIs(
+            click_entry["page_changed"],
+            False,
+            "page_changed must reflect the probe immediately after the action, not a later settle discovery",
+        )
 
 
 class TestJevDecisionFailureDegradesToBlocked(IsolatedAsyncioTestCase):
@@ -386,6 +498,51 @@ class TestJevDecisionFailureDegradesToBlocked(IsolatedAsyncioTestCase):
         self.assertIsNone(message.tool_calls)
         summary = json.loads(message.content)
         self.assertEqual(summary["status"], "BLOCKED")
+
+
+class TestJevDecisionsClientMalformedBody(IsolatedAsyncioTestCase):
+    """Hole 1 (completes B4): a 200 response with a non-JSON body must not crash the run."""
+
+    @staticmethod
+    def _client_with_transport(handler: Any) -> jev_decisions.JevDecisionsClient:
+        client = jev_decisions.JevDecisionsClient(
+            api_key="test-key",
+            url="https://decisions.test/api/alpha/decisions",
+            model="typesafe/jev-test",
+            timeout_s=5.0,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return client
+
+    async def test_decide_converts_a_malformed_body_into_model_call_failed(self) -> None:
+        secret = "sk-should-not-leak-1234567890"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=f"not-json-at-all {secret}".encode())
+
+        client = self._client_with_transport(handler)
+
+        with self.assertRaises(BaseError) as ctx:
+            await client.decide({"model": "m", "questions": {}})
+
+        self.assertEqual(ctx.exception.status, StatusCode.MODEL_CALL_FAILED)
+        self.assertNotIn(secret, str(ctx.exception))
+
+    async def test_a_malformed_body_degrades_the_turn_to_blocked_without_leaking_the_raw_body(self) -> None:
+        secret = "sk-should-not-leak-1234567890"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=f"not-json-at-all {secret}".encode())
+
+        real_client = self._client_with_transport(handler)
+        decider = _decider([], goal_value_cache=False, client=real_client)
+
+        message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        self.assertIsNone(message.tool_calls)
+        summary = json.loads(message.content)
+        self.assertEqual(summary["status"], "BLOCKED")
+        self.assertNotIn(secret, message.content)
 
 
 class TestJevPrefetchedValueIsolation(IsolatedAsyncioTestCase):
@@ -422,6 +579,28 @@ class TestJevPrefetchedValueIsolation(IsolatedAsyncioTestCase):
         with contextlib.suppress(asyncio.CancelledError):
             await stale_task
         self.assertTrue(stale_task.cancelled() or stale_task.done())
+
+
+class TestJevGoalValueExtractionDegradesGracefully(IsolatedAsyncioTestCase):
+    """Hole 2 (completes B5): an unguarded ``values_task.result()`` must not crash the run."""
+
+    async def test_a_failed_values_task_degrades_to_an_empty_value_list(self) -> None:
+        decider = _decider([_answers("TYPE_TEXT", "none")], goal_value_cache=True)
+
+        async def _raise(self: JevDecisionModel, goal: str) -> list[str]:
+            raise RuntimeError("value extraction blew up")
+
+        with mock.patch.object(JevDecisionModel, "_extract_values", _raise):
+            message = await decider.invoke(_MESSAGES, tools=_TOOLS)
+
+        # `_raise` has no internal `await`, so by the time `_decide_message` reads `.result()` the
+        # task -- scheduled ahead of several other awaits in the same call -- has already failed.
+        self.assertTrue(decider._run.values_task.done())
+        self.assertEqual(decider._run.values, [])
+        self.assertEqual(message.tool_calls[0].name, "browser_type")
+        self.assertEqual(
+            json.loads(message.tool_calls[0].arguments)["text"], "London", "the per-field prefetch path still fills"
+        )
 
 
 class TestDecisionPolicyModelProtocol(TestCase):
