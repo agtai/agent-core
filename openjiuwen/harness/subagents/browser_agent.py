@@ -20,8 +20,8 @@ from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.schema.decision_policy import DecisionPolicyModel
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
-from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import JevDecisionModel
 from openjiuwen.harness.tools.browser_move.runtime.browser_capabilities import (
     DEFAULT_BROWSER_CAPABILITIES,
     narrow_allowed_tools_for_browser_driver,
@@ -303,7 +303,7 @@ def create_browser_agent(
     resolved_language = resolve_language(language)
     instance = _coerce_browser_instance(browser_instance, browser_key)
     # A decision policy in the model slot is used as is: no temperature copy, no LLM-only context rails.
-    policy_model = model if isinstance(model, JevDecisionModel) else None
+    policy_model = model if isinstance(model, DecisionPolicyModel) else None
     browser_model = model if policy_model is not None else _browser_model_with_temperature(model, temperature)
     resolved_settings = _resolve_runtime_settings(browser_model, settings, instance)
 

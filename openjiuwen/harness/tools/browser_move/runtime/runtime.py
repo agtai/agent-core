@@ -3441,7 +3441,18 @@ class BrowserAgentRuntime:
         current ``generation_id`` so the caller can issue catalog tool calls against it.
         """
         await self.ensure_runtime_ready()
-        raw = await self._evaluate_page_js(source, args=params)
+        try:
+            raw = await self._evaluate_page_js(source, args=params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[BrowserAgentRuntime] policy probe failed: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "error": f"policy probe failed: {exc}",
+                "elements": [],
+                "page_state": self.export_page_state(),
+            }
         parsed = raw if isinstance(raw, dict) else extract_json_object(self._unwrap_mcp_text_result(raw))
         if not isinstance(parsed, dict):
             return {

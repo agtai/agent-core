@@ -251,7 +251,7 @@ class JevDecisionsClient:
             if response.is_error:
                 raise build_error(
                     StatusCode.MODEL_CALL_FAILED,
-                    error_msg=f"decisions endpoint returned HTTP {response.status_code}: {response.text[:300]}",
+                    error_msg=f"decisions endpoint returned HTTP {response.status_code}",
                 )
             return response.json(), round((time.perf_counter() - started) * 1000)
         raise build_error(StatusCode.MODEL_CALL_FAILED, error_msg="decisions endpoint unavailable")
