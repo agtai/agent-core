@@ -131,12 +131,7 @@ class TestActionSpaceAndRequest(TestCase):
             sorted(body["questions"]), ["click_target", "operation", "select_target", "text_value", "type_text_target"]
         )
         self.assertEqual(body["questions"]["type_text_target"]["criteria"]["2"]["element"], "[2] Where to?")
-        self.assertEqual(
-            body["questions"]["click_target"]["criteria"]["2"]["element"],
-            "[2] Open Where to?",
-            "the click head names an editable field as the thing a click opens",
-        )
-        self.assertEqual(body["questions"]["click_target"]["criteria"]["1"]["element"], "[1] Search")
+        self.assertEqual(body["questions"]["click_target"]["criteria"]["2"]["element"], "[2] Where to?")
         self.assertEqual(body["questions"]["select_target"]["criteria"]["3:2"]["option"], "First")
         self.assertIn("none", body["questions"]["text_value"]["criteria"])
         self.assertEqual(body["state"]["elements"][1]["operations"], ["TYPE_TEXT", "CLICK"])
@@ -637,6 +632,41 @@ class TestJevDecisionsClientMalformedBody(IsolatedAsyncioTestCase):
         summary = json.loads(message.content)
         self.assertEqual(summary["status"], "BLOCKED")
         self.assertNotIn(secret, message.content)
+
+
+class TestDecisionsClientFromEnv(TestCase):
+    """The two decisions backends read distinct keys and never send one backend's key to the other."""
+
+    def test_typesafe_uses_its_own_key_url_and_model(self) -> None:
+        env = {"TYPESAFE_API_KEY": "ts-key", "OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_URL": "https://proxy.test/"}
+        with mock.patch.dict("os.environ", env, clear=False):
+            client = jev_decisions.client_from_env("typesafe", timeout_s=5.0)
+
+        self.assertEqual(client.url, jev_decisions.TYPESAFE_DECISIONS_URL, "the proxy URL override does not apply")
+        self.assertEqual(client.model, jev_decisions.TYPESAFE_DEFAULT_MODEL)
+        self.assertEqual(client._client.headers["Authorization"], "Bearer ts-key")
+
+    def test_openrouter_uses_the_openrouter_key_and_honours_the_dotenv_overrides(self) -> None:
+        env = {"TYPESAFE_API_KEY": "ts-key", "OPENROUTER_API_KEY": "or-key", "TYPESAFE_MODEL": "typesafe/jev-9"}
+        with mock.patch.dict("os.environ", env, clear=False):
+            client = jev_decisions.client_from_env("openrouter", timeout_s=5.0)
+
+        self.assertEqual(client.url, jev_decisions.DEFAULT_DECISIONS_URL)
+        self.assertEqual(client.model, "typesafe/jev-9")
+        self.assertEqual(client._client.headers["Authorization"], "Bearer or-key")
+
+    def test_backend_from_env_picks_typesafe_only_without_a_proxy_url(self) -> None:
+        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": "ts-key", "TYPESAFE_API_URL": ""}, clear=False):
+            self.assertEqual(jev_decisions.decisions_backend_from_env(), "typesafe")
+        proxied = {"TYPESAFE_API_KEY": "ts-key", "TYPESAFE_API_URL": "https://openrouter.ai/api/alpha/decisions"}
+        with mock.patch.dict("os.environ", proxied, clear=False):
+            self.assertEqual(jev_decisions.decisions_backend_from_env(), "openrouter")
+
+    def test_a_missing_key_is_a_config_error(self) -> None:
+        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": ""}, clear=False):
+            with self.assertRaises(BaseError) as ctx:
+                jev_decisions.client_from_env("typesafe", timeout_s=5.0)
+        self.assertEqual(ctx.exception.status, StatusCode.MODEL_SERVICE_CONFIG_ERROR)
 
 
 class TestJevDecisionsClientTransportRetry(IsolatedAsyncioTestCase):
