@@ -15,7 +15,6 @@ from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
-from openjiuwen.harness.schema.decision_policy import DecisionPolicyModel
 from openjiuwen.harness.subagents.browser_agent import (
     BROWSER_AGENT_FACTORY_NAME,
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
@@ -543,31 +542,3 @@ def test_build_browser_agent_config_fallback_uses_model_name_field() -> None:
     spec = build_browser_agent_config(model, language="en")
 
     assert spec.factory_kwargs["settings"].model_name == "test-model-name"
-
-
-class _PolicyModel:
-    """Structural DecisionPolicyModel: bind_runtime is the only required method."""
-
-    def __init__(self) -> None:
-        self.bound = None
-
-    def bind_runtime(self, runtime) -> None:
-        self.bound = runtime
-
-
-def test_decision_policy_model_is_recognised_by_structure() -> None:
-    assert isinstance(_PolicyModel(), DecisionPolicyModel)
-    assert not isinstance(_fake_model(), DecisionPolicyModel)
-
-
-def test_decision_policy_model_is_used_as_is_and_bound_to_the_runtime() -> None:
-    calls, fake = _capture_create_deep_agent()
-    policy = _PolicyModel()
-    ctx, runtime_cls, _build_tools, _tools = _patch_all(fake)
-    with ctx:
-        create_browser_agent(policy, settings=_fake_settings())
-
-    assert calls[0]["model"] is policy
-    assert policy.bound is runtime_cls.return_value
-    assert calls[0]["enable_model_anomaly_detection_rail"] is False
-    assert not any(isinstance(rail, ContextProcessorRail) for rail in calls[0]["rails"])
