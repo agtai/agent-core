@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol
 
-from openjiuwen.agent_teams.external.cli_agent.claude.options import load_claude_sdk
+from openjiuwen.harness_providers.claudecode.options import load_claude_sdk
 from openjiuwen.agent_teams.team_workspace.tools import WorkspaceMetaTool
 from openjiuwen.agent_teams.tools.locales import make_translator
 from openjiuwen.agent_teams.tools.team_tools import create_team_tools
@@ -155,7 +155,7 @@ def _wrap_team_tool(
         except Exception as exc:  # noqa: BLE001 - keep tool failures in-band
             team_logger.exception("claude sdk team tool {} failed", name)
             return text_content(f"Internal error: {exc}")
-        return text_content(str(result))
+        return text_content(tool.render_for_llm(result))
 
     return sdk.tool(
         name=name,

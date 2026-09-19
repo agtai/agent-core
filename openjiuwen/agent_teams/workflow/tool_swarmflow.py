@@ -107,6 +107,13 @@ class SwarmflowTool(AsyncTool):
         self._human_base_spec = human_base_spec
         self._governor = concurrency_governor
         self._budget = budget
+        # Each leader NativeHarness build creates a fresh SwarmflowTool (the
+        # team tool rail is per-harness). Register as the controller's relaunch
+        # host so paused runs resume on THIS cycle's harness, not the one that
+        # launched them (which a team pause has since torn down).
+        controller = getattr(parent_agent, "background_task_controller", None)
+        if controller is not None and hasattr(controller, "set_launcher"):
+            controller.set_launcher(self)
         # Four script sources mirror the reference tool's surface
         # (script_path / script / name / resume_id). "At least one" is enforced
         # in ``invoke`` rather than via JSON-Schema ``required`` because the rule
@@ -368,11 +375,60 @@ class SwarmflowTool(AsyncTool):
         op = ops.get(action)
         if op is None:
             return ToolOutput(success=False, error=f"unknown action {action!r}")
+        # A paused run has already unwound, so the engine will never emit
+        # WORKFLOW_STOPPED for it — whether the controller still holds its
+        # ticket (drops it, reports True) or not (cold start, reports False).
+        # Announce it here either way so the embedder's card closes; an active
+        # run announces its own stop while unwinding.
+        was_paused = action == "stop" and controller.is_paused(resume_id)
         ok = await op(resume_id)
+        if action == "stop" and (was_paused or not ok):
+            ok = await self._announce_stopped(resume_id) or ok
         return ToolOutput(
             success=ok,
             data={"run_id": resume_id, "action": action, "status": "done" if ok else "not_found"},
         )
+
+    async def _announce_stopped(self, run_id: str) -> bool:
+        """Publish WORKFLOW_STOPPED for a run that has no engine task left.
+
+        Covers a paused run (unwound at pause time) and a cold-started one
+        (registries empty): the embedder's snapshot still shows it paused and
+        lists it for the leader to resume or stop, so the Monitor card needs
+        this event to reach its terminal state. No journal seal: the pause
+        record stays, so a manual ``resume_id + script_path`` relaunch remains
+        possible.
+        """
+        if self._messager is None:
+            return False
+        from openjiuwen.agent_teams.context import get_session_id
+        from openjiuwen.agent_teams.schema.events import (
+            EventMessage,
+            TeamEvent,
+            TeamTopic,
+            WorkflowProgressTeamEvent,
+        )
+        from openjiuwen.agent_teams.workflow.engine.progress import ProgressKind
+
+        event = WorkflowProgressTeamEvent(
+            team_name=self._team_name,
+            kind=ProgressKind.WORKFLOW_STOPPED,
+            run_id=run_id,
+            text="workflow stopped",
+        )
+        message = EventMessage(
+            event_type=TeamEvent.WORKFLOW_PROGRESS,
+            payload=event.model_dump(),
+            sender_id="swarmflow",
+        )
+        try:
+            await self._messager.publish(
+                topic_id=TeamTopic.TEAM.build(get_session_id(), self._team_name), message=message,
+            )
+        except Exception:  # noqa: BLE001 - best-effort card close
+            team_logger.debug("[swarmflow] stopped announce skipped", exc_info=True)
+            return False
+        return True
 
     @staticmethod
     def _launch_input_error(script_path: str, script: str, name: str, resume_id: str) -> str | None:
@@ -414,18 +470,28 @@ class SwarmflowTool(AsyncTool):
     async def _seal_guard(self, script_path: str, resume_id: str) -> str:
         """Blank out a resume_id that points at a TERMINAL (sealed) run.
 
-        Relaunching under it would wrongly replay the sealed cache. Best-effort:
-        failures only debug-log, never block the launch.
+        Relaunching under it would wrongly replay the sealed cache. Reads the
+        run's own journal snapshot + WAL (per-run_id paths): the seal record of
+        ``resume_id`` lives in exactly those files, so the guard stays O(1)
+        with no cross-run scanning. Best-effort: failures only debug-log,
+        never block the launch.
         """
         if not (resume_id and script_path):
             return resume_id
         try:
             from openjiuwen.agent_teams.context import get_session_id
             from openjiuwen.agent_teams.workflow.engine.journal import Journal
-            from openjiuwen.agent_teams.workflow.runner import _resolve_journal_path
+            from openjiuwen.agent_teams.workflow.runner import (
+                _resolve_journal_path,
+                _resolve_legacy_resume,
+                _resolve_wal_path,
+            )
 
-            journal_path = _resolve_journal_path(script_path, self._team_name, get_session_id())
-            journal = await Journal.load(journal_path, wal_path=f"{journal_path}.wal")
+            session_id = get_session_id()
+            journal_path = _resolve_journal_path(script_path, self._team_name, session_id, resume_id)
+            wal_path = _resolve_wal_path(script_path, self._team_name, session_id, resume_id)
+            legacy_path = _resolve_legacy_resume(script_path, self._team_name, session_id, resume_id)
+            journal = await Journal.load(journal_path, wal_path=wal_path, legacy_path=legacy_path)
             if journal.find_run_record(resume_id, "seal") is not None:
                 team_logger.warning(
                     "[swarmflow] resume_id %s is terminal (sealed); forcing a fresh run_id", resume_id
@@ -458,7 +524,7 @@ class SwarmflowTool(AsyncTool):
         enriched[_COMPLETION_CTX_KEY] = {}
         return enriched
 
-    def map_result(self, output: ToolOutput) -> str:
+    def render_for_llm(self, output: ToolOutput) -> str:
         if not output.success:
             return output.error or "Failed to launch async tool"
         data = output.data or {}
@@ -499,7 +565,7 @@ class SwarmflowTool(AsyncTool):
         name_box: dict[str, Any] = {"name": None, "description": None}
         # Capture the session once. A resume relaunch runs from an external
         # coroutine (the controller) that lacks the leader's session contextvar,
-        # so ``_relaunch`` restores it — otherwise the resumed run would publish
+        # so ``relaunch`` restores it — otherwise the resumed run would publish
         # progress on the wrong topic and resume from the wrong journal path.
         session_id = get_session_id()
 
@@ -517,13 +583,12 @@ class SwarmflowTool(AsyncTool):
                     abort_event=abort_event,
                     backend=backend,
                     native=self._parent_agent,
-                    relaunch=lambda: self._relaunch(inputs, session_id),
+                    inputs=inputs,
+                    session_id=session_id,
                 )
             )
 
-        def _publish(progress: Any) -> None:
-            if messager is None:
-                return
+        def _build_progress_message(progress: Any) -> tuple[str, EventMessage]:
             if progress.kind == "workflow_started":
                 name_box["name"] = progress.name
                 name_box["description"] = progress.description
@@ -537,6 +602,7 @@ class SwarmflowTool(AsyncTool):
                 relaunch_kind=inputs.get(_RELAUNCH_KIND_KEY),
                 workflow_name=name_box["name"],
                 description=name_box.get("description"),
+                script_path=progress.script_path,
                 phase=progress.phase,
                 label=progress.label,
                 prompt=progress.prompt,
@@ -561,12 +627,33 @@ class SwarmflowTool(AsyncTool):
                 payload=team_event.model_dump(),
                 sender_id="swarmflow",  # non-leader sender so kernel does not self-filter
             )
-            topic = TeamTopic.TEAM.build(session_id, team_name)
+            return TeamTopic.TEAM.build(session_id, team_name), message
+
+        def _publish(progress: Any) -> None:
+            """Mid-run progress sink: fire-and-forget so the engine never blocks."""
+            if messager is None:
+                return
+            topic, message = _build_progress_message(progress)
             try:
                 team_logger.debug("[swarmflow] workflow progress message: {}", message)
                 asyncio.create_task(messager.publish(topic_id=topic, message=message))
             except RuntimeError:
                 team_logger.debug("[swarmflow] no running loop to publish workflow progress")
+
+        async def _publish_terminal(progress: Any) -> None:
+            """Terminal status publish: awaited, so delivery is complete when the
+            unwind finishes. The controller returns the moment this task is done
+            and the embedder then tears the leader harness (and its bus) down —
+            a merely-scheduled publish would land on the closed bus and the
+            Monitor card would stay 'running'. Best-effort: a dead bus must
+            not mask the run's own outcome."""
+            if messager is None:
+                return
+            topic, message = _build_progress_message(progress)
+            try:
+                await messager.publish(topic_id=topic, message=message)
+            except Exception:  # noqa: BLE001 - teardown races must not surface here
+                team_logger.debug("[swarmflow] terminal progress publish skipped", exc_info=True)
 
         observer = WorkflowObserver(on_event=_publish)
         completion_ctx[_OBSERVER_CTX_KEY] = observer
@@ -598,7 +685,7 @@ class SwarmflowTool(AsyncTool):
                 msg = self._format_early_return(exc.reply, exc.edit_hints, run_id=run_id)
                 # Resumable pause (edit & re-run under the same run_id): flip
                 # the Monitor card to paused, then surface the edit guidance.
-                _publish(
+                await _publish_terminal(
                     WorkflowProgressEvent(
                         kind=ProgressKind.WORKFLOW_PAUSED,
                         message="workflow paused for script edit",
@@ -609,7 +696,7 @@ class SwarmflowTool(AsyncTool):
                 # A control-state change, not a leader failure: announce it on
                 # the team topic BEFORE surfacing the stopped message, so the
                 # Monitor can flip the workflow card to stopped.
-                _publish(
+                await _publish_terminal(
                     WorkflowProgressEvent(
                         kind=ProgressKind.WORKFLOW_STOPPED,
                         message="workflow stopped",
@@ -623,7 +710,7 @@ class SwarmflowTool(AsyncTool):
             # async-tool runtime treats it as a silent cancellation (no completion
             # injected) — matching the cancel the controller triggers as pause's
             # third step.
-            _publish(
+            await _publish_terminal(
                 WorkflowProgressEvent(
                     kind=ProgressKind.WORKFLOW_PAUSED,
                     message="workflow paused",
@@ -636,7 +723,7 @@ class SwarmflowTool(AsyncTool):
             # reason. External cancels (signal unset) stay silent.
             if abort_event.is_set():
                 if abort_event.reason == "stop":
-                    _publish(
+                    await _publish_terminal(
                         WorkflowProgressEvent(
                             kind=ProgressKind.WORKFLOW_STOPPED,
                             message="workflow stopped",
@@ -644,7 +731,7 @@ class SwarmflowTool(AsyncTool):
                     )
                     raise BackendError(self._format_stopped(run_id=run_id)) from exc
                 # pause (default reason): silent cancel, controller relaunches on resume.
-                _publish(
+                await _publish_terminal(
                     WorkflowProgressEvent(
                         kind=ProgressKind.WORKFLOW_PAUSED,
                         message="workflow paused",
@@ -657,8 +744,13 @@ class SwarmflowTool(AsyncTool):
             if self._governor is not None:
                 await self._governor.release_workflow(ticket)
 
-    def _relaunch(self, inputs: dict[str, Any], session_id: str) -> None:
+    def relaunch(self, inputs: dict[str, Any], session_id: str) -> None:
         """Re-launch the paused swarmflow with the SAME inputs (resume path).
+
+        Called by the controller through :meth:`BackgroundTaskController.set_launcher`
+        — always on the current cycle's tool, never the one that launched the
+        run — so the resumed run and its completion injection land on the live
+        leader harness.
 
         A fresh task id + a new background task; the journal path is unchanged
         (same team / session / name), so the completed prefix is a cache hit and

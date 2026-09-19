@@ -9,10 +9,10 @@ import pytest
 
 import openjiuwen.harness.personal_context.personal_context as personal_context_module
 from openjiuwen.core.common.exception.errors import BaseError
+from openjiuwen.core.foundation.store.base_embedding import EmbeddingConfig
 from openjiuwen.harness.personal_context.config import PersonalContextConfig
 from openjiuwen.harness.personal_context.personal_context import PersonalContext
 from openjiuwen.harness.personal_context.status_codes import StatusCode, build_error
-
 
 _ALL_FEISHU_READ_SCOPES = {
     "calendar:calendar.event:read",
@@ -310,6 +310,65 @@ async def test_authorize_feishu_returns_authorized_when_lark_cli_scope_is_ready(
         "expires_at": None,
         "error": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_reauthorize_feishu_starts_and_reuses_challenge_when_scopes_are_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    personal_context = PersonalContext(home=tmp_path)
+    await personal_context.set_configuration(_feishu_config(("docs",)))
+    status, begin, finish = _mock_authorization_io(
+        monkeypatch,
+        granted_scopes=set(_ALL_FEISHU_READ_SCOPES),
+    )
+    finish_release = asyncio.Event()
+
+    async def wait_for_authorization(
+        _device_code: str,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        del timeout_seconds
+        await finish_release.wait()
+
+    begin.return_value = (
+        "device-secret",
+        "https://open.feishu.cn/authorize",
+        "2099-09-15T12:00:00Z",
+    )
+    finish.side_effect = wait_for_authorization
+
+    first = await personal_context.authorize_provider("feishu", reauthorize=True)
+    second = await personal_context.authorize_provider("feishu", reauthorize=True)
+    await asyncio.sleep(0)
+
+    assert first == second
+    assert first["state"] == "authorizing"
+    assert first["verification_url"] == "https://open.feishu.cn/authorize"
+    status.assert_awaited_once()
+    begin.assert_awaited_once()
+    finish.assert_awaited_once()
+
+    finish_release.set()
+    task = personal_context._authorization_task
+    assert task is not None
+    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_reauthorize_feishu_requires_boolean(
+    tmp_path: Path,
+) -> None:
+    personal_context = PersonalContext(home=tmp_path)
+    await personal_context.set_configuration(_feishu_config(("docs",)))
+
+    with pytest.raises(PersonalContext.Error, match="reauthorize must be a boolean"):
+        await personal_context.authorize_provider(  # type: ignore[arg-type]
+            "feishu",
+            reauthorize="true",
+        )
 
 
 @pytest.mark.asyncio
@@ -801,6 +860,59 @@ async def test_identical_configuration_keeps_active_authorization_task_and_chall
 
 def _ready_auth_status() -> tuple[bool, set[str]]:
     return True, set(_ALL_FEISHU_READ_SCOPES)
+
+
+@pytest.mark.asyncio
+async def test_private_embedding_configuration_is_passed_to_each_new_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[EmbeddingConfig | None] = []
+
+    class RecordingPipeline:
+        def __init__(self, *, embedding_config: EmbeddingConfig | None = None, **_kwargs: object) -> None:
+            received.append(embedding_config)
+            self.running = False
+
+        async def start(self) -> None:
+            self.running = True
+
+        async def stop(self, *, timeout_seconds: float) -> None:
+            del timeout_seconds
+            self.running = False
+
+        def is_running(self) -> bool:
+            return self.running
+
+    monkeypatch.setattr(personal_context_module, "ContextPipelineService", RecordingPipeline)
+    personal_context = PersonalContext(home=tmp_path)
+    personal_context._set_embedding_configuration(
+        model_name="embedding-model",
+        base_url="https://embedding.invalid/v1/embeddings",
+        api_key="top-secret",
+    )
+    await personal_context.set_configuration(_config(service_enabled=False))
+    await personal_context.activate_runtime()
+
+    assert len(received) == 1
+    assert received[0] == EmbeddingConfig(
+        model_name="embedding-model",
+        base_url="https://embedding.invalid/v1/embeddings",
+        api_key="top-secret",
+    )
+    assert "top-secret" not in str((await personal_context.snapshot()).model_dump(mode="json"))
+    with pytest.raises(BaseError, match="embedding configuration can only change while stopped"):
+        personal_context._set_embedding_configuration(
+            model_name="other",
+            base_url="https://other.invalid/v1/embeddings",
+            api_key="other-secret",
+        )
+
+    await personal_context.deactivate_runtime(timeout_seconds=1)
+    personal_context._set_embedding_configuration(model_name=None, base_url=None, api_key=None)
+    await personal_context.activate_runtime()
+    assert received == [received[0], None]
+    await personal_context.deactivate_runtime(timeout_seconds=1)
 
 
 @pytest.mark.asyncio

@@ -205,6 +205,8 @@ class TeamAgentSpec(BaseModel):
 
     agents: dict[str, DeepAgentSpec]
     team_name: str = "agent_team"
+    enable_group_chat: bool = False
+    group_context_tail: int = Field(default=5, ge=1, le=20)
     lifecycle: str = TeamLifecycle.TEMPORARY
     evolution_enabled: bool = True
     """Team switch for self-evolution coverage.
@@ -940,27 +942,33 @@ class TeamAgentSpec(BaseModel):
                 )
 
     def _validate_hitt_consistency(self) -> None:
-        """Reject configs where predefined HUMAN_AGENT members exist without HITT enabled.
+        """Reject configs where predefined human members exist without HITT enabled.
 
         ``enable_hitt`` acts as the spec-level capability ceiling. Declaring
-        a HUMAN_AGENT predefined member without opening that ceiling is a
-        misconfiguration. The reverse (``enable_hitt=True`` with no
-        predefined HUMAN_AGENT) is allowed: callers may rely on dynamic
+        a human member (avatar ``HUMAN_AGENT`` or ``PASSIVE_HUMAN``) without
+        opening that ceiling is a misconfiguration. The reverse
+        (``enable_hitt=True`` with no predefined human member) is allowed:
+        callers may rely on dynamic
         ``spawn_member(role_type='human_agent', ...)`` after build.
         """
+        human_roles = (TeamRole.HUMAN_AGENT, TeamRole.PASSIVE_HUMAN)
         if self.enable_hitt:
             return
-        if not any(m.role_type == TeamRole.HUMAN_AGENT for m in self.predefined_members):
+        if not any(m.role_type in human_roles for m in self.predefined_members):
             return
 
         from openjiuwen.core.common.exception.codes import StatusCode
         from openjiuwen.core.common.exception.errors import raise_error
 
-        offenders = [m.member_name for m in self.predefined_members if m.role_type == TeamRole.HUMAN_AGENT]
+        offenders = [
+            m.member_name
+            for m in self.predefined_members
+            if m.role_type in human_roles
+        ]
         raise_error(
             StatusCode.AGENT_TEAM_CONFIG_INVALID,
             reason=(
-                f"predefined_members contains HUMAN_AGENT role(s) {offenders} "
+                f"predefined_members contains human member role(s) {offenders} "
                 f"but enable_hitt=False; set enable_hitt=True (capability ceiling) "
                 f"or remove the human member(s)"
             ),

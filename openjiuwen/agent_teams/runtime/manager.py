@@ -32,6 +32,7 @@ from openjiuwen.agent_teams.interaction import (
     HumanAgentInbox,
     HumanAgentMessage,
     HumanAgentNotEnabledError,
+    HumanAgentToolCall,
     InteractPayload,
     OperatorMessage,
     UnknownHumanAgentError,
@@ -164,13 +165,17 @@ class TeamRuntimeManager:
             team_db_state,
             pool_entry is not None,
         )
-        return await self._apply_action(
+        activation = await self._apply_action(
             action,
             spec=spec,
             team_session=team_session,
             pool_entry=pool_entry,
             inputs=inputs,
         )
+        backend = getattr(activation.agent, "team_backend", None)
+        if backend is not None and hasattr(backend, "bind_group_session"):
+            backend.bind_group_session(target_session_id)
+        return activation
 
     async def finalize(
         self,
@@ -249,6 +254,7 @@ class TeamRuntimeManager:
             MemberStatus.STOPPED,
             MemberStatus.PAUSED,
             MemberStatus.SHUTDOWN,
+            MemberStatus.ERROR,
         }
     )
 
@@ -267,7 +273,8 @@ class TeamRuntimeManager:
 
         When ``team_member`` is already in
         :data:`_MEMBER_FINALIZED_STATUSES` someone else has written the
-        outcome (leader's ``_mark_live_teammates`` or ``shutdown_self``),
+        outcome (leader's ``_mark_live_teammates``, ``shutdown_self``, or a
+        runtime failure reporter),
         so we only tear down the kernel and skip the status write entirely.
         """
         member = agent.team_member
@@ -295,8 +302,8 @@ class TeamRuntimeManager:
                     await release_kvc()
 
             if already_finalized:
-                # External party (leader stop/pause, shutdown_self) already
-                # wrote a terminal/quiescent status. Just close the kernel.
+                # Another lifecycle owner already wrote the persisted outcome.
+                # Just close the kernel without erasing STOPPED/PAUSED/ERROR.
                 team_logger.info(
                     "finalize_member: team member {} already finalized (status={}); closing kernel only",
                     member_name,
@@ -445,7 +452,7 @@ class TeamRuntimeManager:
             # routing directives — they fold back into a no-mention
             # message for the leader / avatar instead of silently
             # writing a bus message to a non-existent member.
-            return await self.dispatch_payloads(entry.agent, payloads)
+            return await self.dispatch_payloads(entry.agent, payloads, entry=entry)
         finally:
             await entry.interact_gate.consume_done(ticket)
 
@@ -531,13 +538,15 @@ class TeamRuntimeManager:
     async def dispatch_payloads(
         agent: "TeamAgent",
         payloads: list[InteractPayload],
+        *,
+        entry: Optional["ActiveTeam"] = None,
     ) -> DeliverResult:
         """Resolve and dispatch interact payloads through the runtime router."""
         payloads = await TeamRuntimeManager._resolve_recipients(agent, payloads)
 
         last_result: DeliverResult = DeliverResult.success(None)
         for entry_payload in payloads:
-            last_result = await TeamRuntimeManager._dispatch_payload(agent, entry_payload)
+            last_result = await TeamRuntimeManager._dispatch_payload(agent, entry_payload, entry=entry)
             if not last_result.ok:
                 return last_result
         return last_result
@@ -565,7 +574,12 @@ class TeamRuntimeManager:
         return await resolve_targets(payloads, member_exists=_member_exists)
 
     @staticmethod
-    async def _dispatch_payload(agent: "TeamAgent", payload: InteractPayload) -> DeliverResult:
+    async def _dispatch_payload(
+        agent: "TeamAgent",
+        payload: InteractPayload,
+        *,
+        entry: Optional["ActiveTeam"] = None,
+    ) -> DeliverResult:
         backend = agent.team_backend
         if backend is None and not isinstance(payload, GodViewMessage):
             return DeliverResult.failure("no_team_backend")
@@ -594,6 +608,13 @@ class TeamRuntimeManager:
             result = await inbox.direct(payload.target, payload.body)
             return result
         if isinstance(payload, HumanAgentMessage):
+            # Bare `$passive` input (no @target) would fall through to the
+            # avatar-driving branch below — but a passive member HAS no
+            # avatar to drive. Fail with a stable token instead; the
+            # routing semantics of bare passive input belong to the
+            # upcoming communication redesign (r1 decision, kept in r2).
+            if payload.target is None and await backend.is_passive_human(payload.sender):
+                return DeliverResult.failure("passive_member_no_avatar")
             try:
                 if payload.target is not None:
                     if payload.target in {"all", "*"}:
@@ -616,7 +637,56 @@ class TeamRuntimeManager:
                 return DeliverResult.failure("human_agent_not_enabled")
             except UnknownHumanAgentError:
                 return DeliverResult.failure("unknown_human_agent")
+        if isinstance(payload, HumanAgentToolCall):
+            return await TeamRuntimeManager._dispatch_tool_call(agent, payload, entry=entry)
         return DeliverResult.failure(f"unknown_payload:{type(payload).__name__}")
+
+    @staticmethod
+    async def _dispatch_tool_call(
+        agent: "TeamAgent",
+        payload: HumanAgentToolCall,
+        *,
+        entry: Optional["ActiveTeam"] = None,
+    ) -> DeliverResult:
+        """Execute one relayed tool call under a passive member's identity.
+
+        The passthrough channel: the external protocol relays a tool call
+        for a passive human member, and the runtime executes it verbatim
+        with the same identity invariants an avatar's LLM-driven call
+        enjoys. Avatars are refused — their LLM tool loop (plus the
+        plan-mode approval chain) is the governed path, and an external
+        relay would bypass it. Synchronous RPC semantics: the tool's
+        result comes back on this ``DeliverResult`` (``output`` /
+        ``data``), so the caller never needs a second round-trip.
+        """
+        from openjiuwen.agent_teams.interaction.passive_tool_executor import PassiveToolExecutor
+
+        backend = agent.team_backend
+        if backend is None:
+            return DeliverResult.failure("no_team_backend")
+        if not backend.hitt_enabled():
+            return DeliverResult.failure("human_agent_not_enabled")
+
+        human_names = await backend.human_agent_names()
+        if payload.sender not in human_names:
+            return DeliverResult.failure("unknown_human_agent")
+        if not await backend.is_passive_human(payload.sender):
+            return DeliverResult.failure("tool_passthrough_avatar_not_supported")
+        if entry is None:
+            return DeliverResult.failure("tool_passthrough_no_runtime")
+
+        if entry.passive_tool_executor is None:
+            language = getattr(agent.blueprint, "language", None) if getattr(agent, "blueprint", None) else None
+            entry.passive_tool_executor = PassiveToolExecutor(backend, language=language or "cn")
+        executor = entry.passive_tool_executor
+
+        output = await executor.execute(payload.sender, payload.tool_name, payload.tool_args)
+        if not output.success:
+            return DeliverResult.failure(output.error or "tool_failed")
+        return DeliverResult.tool_success(
+            output=executor.map_output(payload.tool_name, output),
+            data=output.data,
+        )
 
     async def register_human_agent_inbound(
         self,
@@ -659,15 +729,13 @@ class TeamRuntimeManager:
                 session_id,
             )
             return False
+        # A failed shutdown is still a live, owned runtime. Preserve the entry
+        # and propagate the failure so callers can retry instead of orphaning it.
+        token = set_session_id(session_id)
         try:
             await entry.agent.stop_coordination()
-        except Exception as exc:
-            team_logger.warning(
-                "Failed to stop team {} on session {}: {}",
-                team_name,
-                session_id,
-                exc,
-            )
+        finally:
+            reset_session_id(token)
         await self._pool.remove(team_name)
         team_logger.info(
             "stop_team: team {} session {} stopped and removed from pool",
@@ -795,6 +863,9 @@ class TeamRuntimeManager:
                 team_names=[team_name],
                 db=db,
             )
+        from openjiuwen.agent_teams.tools.group_conversation import GroupConversationLog
+
+        await asyncio.to_thread(GroupConversationLog.delete_registered, team_name)
         for session_id in session_ids:
             await db.drop_session_tables_by_id(session_id)
             if not await remove_session_worktrees(team_name, session_id):
@@ -884,6 +955,10 @@ class TeamRuntimeManager:
             team_names=release_info.team_names,
             db=db,
         )
+        from openjiuwen.agent_teams.tools.group_conversation import GroupConversationLog
+
+        for team_name in release_info.team_names:
+            await asyncio.to_thread(GroupConversationLog.delete_registered, team_name, session_id)
         await db.drop_session_tables_by_id(session_id)
         for team_name in release_info.team_names:
             if not await remove_session_worktrees(team_name, session_id):

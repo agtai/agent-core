@@ -32,12 +32,15 @@ def _trajectory() -> Trajectory:
                                                 {
                                                     "role": "assistant",
                                                     "parts": [
-                                                        {"type": "text", "content": "Use the lookup tool."}
+                                                        {"type": "text", "content": "Use the lookup tool."},
+                                                        {
+                                                            "type": "tool_call",
+                                                            "id": "call-1",
+                                                            "name": "lookup",
+                                                            "arguments": {"q": "x"},
+                                                        },
                                                     ],
                                                 }
-                                            ],
-                                            semconv.GEN_AI_TOOL_CALLS: [
-                                                {"id": "call-1", "name": "lookup", "arguments": {"q": "x"}}
                                             ],
                                         }
                                     ),
@@ -52,8 +55,8 @@ def _trajectory() -> Trajectory:
                                     "attributes": attributes_from_map(
                                         {
                                             semconv.GEN_AI_TOOL_NAME: "lookup",
-                                            semconv.GEN_AI_TOOL_INPUT: {"q": "x"},
-                                            semconv.GEN_AI_TOOL_OUTPUT: {"answer": 1},
+                                            semconv.GEN_AI_TOOL_CALL_ARGUMENTS: {"q": "x"},
+                                            semconv.GEN_AI_TOOL_CALL_RESULT: {"answer": 1},
                                         }
                                     ),
                                     "status": {"code": "STATUS_CODE_ERROR", "message": "temporary failure"},
