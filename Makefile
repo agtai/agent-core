@@ -88,7 +88,7 @@ SPEEDSCOPE_OUT := $(call quote-path,$(SPEEDSCOPE).json)
 # Detect uv
 UV ?= $(strip $(shell uv --version >$(NULL) 2>&1 && echo yes || echo no))
 ifeq ($(UV),yes)
-	RUN_CMD ?= uv run
+	RUN_CMD ?= uv run --no-sync
 	INSTALL_CMD := uv pip install
 else ifeq ($(UV),no)
 	RUN_CMD ?= $(PYTHON) -m

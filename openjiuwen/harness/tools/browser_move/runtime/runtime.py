@@ -3433,6 +3433,56 @@ class BrowserAgentRuntime:
             **(params or {}),
         )
 
+    async def probe_for_policy(self, source: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a policy-owned page probe and register its elements as PageState targets.
+
+        ``source`` is a ``(params) => ...`` page function whose result carries ``elements`` items with
+        validated ``selector_hint`` values; the returned dict gains ``target_id`` per element and the
+        current ``generation_id`` so the caller can issue catalog tool calls against it.
+        """
+        await self.ensure_runtime_ready()
+        try:
+            raw = await self._evaluate_page_js(source, args=params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[BrowserAgentRuntime] policy probe failed: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "error": f"policy probe failed: {exc}",
+                "elements": [],
+                "page_state": self.export_page_state(),
+            }
+        parsed = raw if isinstance(raw, dict) else extract_json_object(self._unwrap_mcp_text_result(raw))
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "error": "policy probe returned no result",
+                "elements": [],
+                "page_state": self.export_page_state(),
+            }
+        parsed.setdefault("ok", True)
+        parsed.setdefault("elements", [])
+        self._observe_page_url(parsed.get("url"))
+        self._annotate_probe_generation(parsed)
+        self._ensure_page_state().register_interactives(parsed)
+        parsed["generation_id"] = self.generation_id
+        return parsed
+
+    async def activate_page(self, url: str) -> bool:
+        """Foreground the driven tab (the one at ``url``, else the active one) so timers and menus run.
+
+        A background tab throttles timers to about one second and never renders dropdown menus, which
+        stalls any policy that decides on a fresh probe.
+        """
+        driver = await self._ensure_browser_driver()
+        tabs = await driver.list_tabs()
+        tab = next((t for t in tabs if t.url == url), None) or next((t for t in tabs if t.active), None)
+        if tab is None:
+            return False
+        await driver.switch_tab(tab)
+        return True
+
     async def probe_interactives(
         self,
         *,
