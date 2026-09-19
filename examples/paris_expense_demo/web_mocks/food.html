@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QuickBite — Food orders</title>
+  <link rel="stylesheet" href="shared.css" />
+  <link rel="stylesheet" href="platforms.css" />
+</head>
+<body class="plat">
+  <header class="plat-top food">
+    <div class="plat-top-row">
+      <div class="plat-logo"><span class="mark">Q</span> QuickBite</div>
+      <nav class="plat-nav"><a href="index.html">Hub</a><a href="photos.html">Photos OCR</a><span>Paris · near Opera</span></nav>
+    </div>
+    <div class="plat-search"><input value="Search restaurants" readonly /><button type="button">Search</button></div>
+  </header>
+  <main class="plat-wrap">
+    <div class="hero-banner" style="background:linear-gradient(120deg,#0095ff,#36cfc9)">
+      <h1>Order history · trip lunch</h1>
+      <p>Paris · near Opera</p>
+    </div>
+    <div class="plat-tabs"><span class="on">All orders</span><span>To review</span><span>Refunds</span></div>
+    <article class="order-card">
+      <div class="shop"><strong>Café de l'Opéra · Pickup</strong><span class="badge ok">Completed</span></div>
+      <div class="goods">
+        <div class="thumb food" data-emoji="☕"></div>
+        <div>
+          <p class="title">Business lunch set (sandwich + coffee)</p>
+          <p class="sub">Pickup code 8821 · matches photo-2201 OCR</p>
+          <div class="kv">
+            <span>Ordered</span><span>2026-03-11 12:36</span>
+            <span>Address</span><span>Near Opera</span>
+            <span>Payment</span><span>Personal card · invoiceable</span>
+          </div>
+          <div class="chip-row"><span class="chip">meal</span><span class="chip">photos source</span></div>
+        </div>
+        <div class="price"><div class="now">24.80</div><div class="unit">EUR</div></div>
+      </div>
+      <div class="order-foot">
+        <span>Delivery €0 (pickup)</span>
+        <div class="actions"><span class="btn">Reorder</span><span class="btn primary-blue">Invoice</span></div>
+      </div>
+    </article>
+    <article class="order-card">
+      <div class="shop"><strong>Nearby popular</strong><span class="badge gray">Suggested</span></div>
+      <div class="goods">
+        <div class="thumb food" data-emoji="🥐"></div>
+        <div>
+          <p class="title">Croissant platter</p>
+          <p class="sub">Popular add-on</p>
+        </div>
+        <div class="price"><div class="now">9.50</div><div class="unit">EUR</div></div>
+      </div>
+    </article>
+    <p class="plat-note">Request invoices after the order completes; contact support for issues.</p>
+  </main>
+</body>
+</html>

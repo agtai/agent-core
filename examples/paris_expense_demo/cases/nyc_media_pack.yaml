@@ -1,0 +1,41 @@
+case_id: nyc_media_pack
+template: media_pack
+title: "NYC launch assets pack"
+actor: "Casey Ng"
+query: "Pack media from the NYC launch day."
+date_start: "2026-04-08"
+date_end: "2026-04-08"
+sources:
+  - photos
+  - browser
+merge:
+  sort_by: [date, source, line_id]
+  dedupe_by: null
+  category_map:
+    photo: photo
+    web_clip: web_clip
+sink: archive
+policy:
+  enabled: true
+  max_meal_amount: null
+  max_taxi_amount: null
+  require_categories: ["photo"]
+notes:
+  - "Media-pack template: archive assets, money fields usually empty."
+fixtures:
+  photos:
+    - asset_id: photo-n1
+      date: "2026-04-08"
+      category: photo
+      description: "Stage wide shot"
+    - asset_id: photo-n2
+      date: "2026-04-08"
+      category: photo
+      description: "Product close-up"
+  browser:
+    - page_id: web-press
+      date: "2026-04-08"
+      category: web_clip
+      description: "Press kit landing page"
+      url: "https://press.example/nyc"
+      evidence_ref: "browser:nyc-press"

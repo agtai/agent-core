@@ -1,0 +1,43 @@
+# Local memory pack for the Paris expense demo (not a live Memory service).
+# The agent recalls these records *before* opening email/photos/apps.
+actor: "Alex Chen"
+user_id: alex.chen
+records:
+  - id: profile-alex
+    kind: profile
+    scope: read:memory.profile
+    text: "Alex Chen, cost center CC-1402, default currency EUR. Files customer-visit trips as lodging + meals + airport transfers."
+    data:
+      cost_center: CC-1402
+      default_currency: EUR
+      preferred_sources: [email, photos, booking, rides]
+
+  - id: policy-alex
+    kind: policy
+    scope: read:memory.policy
+    text: "Alex's usual policy: meals ≤ 80 EUR, airport taxis ≤ 50 EUR."
+    data:
+      max_meal_amount: 80
+      max_taxi_amount: 50
+
+  - id: convo-paris
+    kind: conversation
+    scope: read:memory.chat
+    date: "2026-03-08"
+    text: "Slack #sales: I'll be in Paris Mar 10–13 for the Acme customer visit. Book the usual hotel near Grands Boulevards."
+    data:
+      trip_city: Paris
+      date_start: "2026-03-10"
+      date_end: "2026-03-13"
+      keywords: [paris, acme, customer visit]
+
+  - id: claim-berlin-2025
+    kind: past_claim
+    scope: read:memory.claims
+    date: "2025-11-18"
+    text: "Last similar trip (Berlin, EXP-BERLIN-2025-014): hotel from booking, meals from photo receipts, taxis from the ride app. Finance bounced a dinner over the 80 EUR cap."
+    data:
+      claim_id: EXP-BERLIN-2025-014
+      lodging_source: booking
+      meal_source: photos
+      taxi_source: rides
