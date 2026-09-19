@@ -187,7 +187,6 @@ async def _exec_loaded(loaded, rt: Runtime) -> Any:
             description=description,
             message=f"Workflow started, args: {args_text}",
             phases=phases,
-            script_path=rt.script_path,
             # Ledgers exist (possibly unbounded) before the run starts, so the
             # budget badges can render from the first event instead of waiting
             # for the first agent to complete.
@@ -298,8 +297,6 @@ async def run_workflow(
     backend: AgentBackend | None = None,
     resume: str | None = None,
     journal_path: str | None = None,
-    wal_path: str | None = None,
-    legacy_resume: str | None = None,
     strict: bool = False,
     log_sink: Callable[[str], None] | None = None,
     progress_sink: ProgressSink | None = None,
@@ -323,30 +320,14 @@ async def run_workflow(
 
         raise LintError(f"{len(loaded.warnings)} lint warning(s) in strict mode")
 
-    # The WAL is a sidecar of the canonical journal write-path: fresh records
-    # are appended to it as they complete, so a mid-run crash (no save) stays
-    # recoverable, and the WAL is replayed on the next load. The swarmflow
-    # integration threads a per-run WAL path (``wal/{run_id}.wal``) so two
-    # concurrent runs of the same workflow never share one append log; absent
-    # that, derive the legacy shared sidecar ``<journal>.wal`` in-engine (no
-    # agent_teams import — engine stays business-agnostic).
-    if wal_path is None and journal_path:
-        wal_path = f"{journal_path}.wal"
-    journal = await Journal.load(resume, wal_path=wal_path, legacy_path=legacy_resume)
+    # The WAL is a sidecar of the canonical journal write-path (``<journal>.wal``):
+    # fresh records are appended to it as they complete, so a mid-run crash (no
+    # save) stays recoverable, and a residual WAL is replayed on the next load.
+    # Derived in-engine from the given path (no agent_teams import — engine stays
+    # business-agnostic); the journal path itself comes from the caller (paths.py).
+    wal_path = f"{journal_path}.wal" if journal_path else None
+    journal = await Journal.load(resume, wal_path=wal_path)
     log(f"[wf] journal loaded: prior_records={len(journal.prior)} path={resume} wal={wal_path}")
-    # Cold-start resume recovers the launch args: the advisory template carries
-    # resume_id + script_path but no args, so a resume would otherwise run
-    # ``run(args=None)`` — a different path than the first run, defeating the
-    # cache (F_110 / S_18). Read them back from the run-level journal record.
-    resolved_args = args
-    if resolved_args is None and run_id is not None:
-        args_rec = journal.find_run_record(run_id, "args")
-        if args_rec is not None:
-            resolved_args = args_rec.get("args")
-    # Persist the launch args on the first run (caller supplied args) so a later
-    # cold-start resume can replay the same path; resume re-reads, no re-write.
-    if args is not None and run_id is not None:
-        await journal.write_run_record(run_id, "args", {"args": args})
     # Per-run budget on resume is NOT restored from a snapshot — the ledger
     # starts at spent=0 and the emit hooks re-bill it by replaying cache hits:
     # every cache-hit agent adds its record's stored ``tokens`` back, so the
@@ -357,7 +338,7 @@ async def run_workflow(
     rt = Runtime(
         backend=backend or MockBackend(),
         journal=journal,
-        args=resolved_args,
+        args=args,
         log_sink=log,
         progress_sink=progress_sink or noop_progress_sink,
         strict=strict,
@@ -370,7 +351,6 @@ async def run_workflow(
         abort_event=abort_event,
         agent_gate=agent_gate,
         run_id=run_id,
-        script_path=path,
     )
     # Hand the ledger to the backend: it is the only layer that sees what a call
     # really costs, so it does the accounting and the engine only reads. The
@@ -388,9 +368,9 @@ async def run_workflow(
             log(f"[wf] backend.aclose() failed: {exc}")
     if journal_path:
         # Reached only when the workflow ran to normal completion (any
-        # interrupt / crash / cancellation re-raises and skips this line).
-        # finalize = atomic journal write only — the WAL is an append-only log
-        # that is never actively deleted. The seal record was already written
-        # by _exec_loaded's completed branch.
+        # interrupt / crash / cancellation re-raises and skips this line, leaving
+        # the WAL for recovery). finalize = atomic journal write + terminal WAL
+        # removal; a future mid-run checkpoint must call save() (keeps the WAL).
+        # The seal record was already written by _exec_loaded's completed branch.
         await rt.journal.finalize(journal_path)
     return result

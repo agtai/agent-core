@@ -507,13 +507,7 @@ class LoguruLogger(StructuredLoggerMixin, LoggerProtocol):
             if key not in payload:
                 payload[key] = value
 
-        # 失败事件（log_level >= ERROR 或携带异常）的 status 必须是 failure。
-        # 不能仅凭 had_status 判断：事件 schema 的 status 默认值是 success，
-        # 序列化后 payload 总是带 status，导致 had_status 恒为 True，错误事件
-        # 被误标为 success，遥测/告警误判（issue #4320）。
-        if self._record_is_failure(record) and (
-            not had_status or payload.get("status") == EventStatus.SUCCESS.value
-        ):
+        if not had_status and self._record_is_failure(record):
             payload["status"] = EventStatus.FAILURE.value
 
     def _build_event_payload(self, record: Dict[str, Any]) -> Dict[str, Any]:

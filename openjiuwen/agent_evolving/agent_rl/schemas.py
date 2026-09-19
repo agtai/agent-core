@@ -16,7 +16,6 @@ from openjiuwen.agent_evolving.trajectory.model import Trajectory
 from openjiuwen.agent_evolving.trajectory.spans import (
     decode_json_attribute,
     iter_spans,
-    is_compaction_span,
     read_llm_exchange,
     read_rl_fields,
     span_attributes,
@@ -133,7 +132,7 @@ def trajectory_to_rollouts(trajectory: Trajectory) -> List[Rollout]:
     """
     rollouts: List[Rollout] = []
     for span in iter_spans(trajectory):
-        if span_category(span) != "llm" or is_compaction_span(span):
+        if span_category(span) != "llm":
             continue
         prompt_messages, completion_messages = read_llm_exchange(span)
         attrs = span_attributes(span)

@@ -10,21 +10,18 @@ first connect) — see :class:`TeamJoinDescriptor`:
   The server exposes the **real** team tools (``view_task`` / ``claim_task`` /
   ``send_message``) built by ``create_team_tools(role="teammate")``, so the
   external member calls the exact same ``TeamTool`` instances — same input
-  schema, same behaviour, same ``render_for_llm()`` text — as a native in-process
-  teammate. Inbound messages reach the member the native way too: the parent
-  process's coordination layer pushes them into the CLI, so no pull tool is
-  exposed. Server-level instructions are **empty**: the team system prompt is
-  injected directly into the CLI at spawn time, so the protocol is not
-  repeated here.
+  schema, same behaviour, same ``map_result()`` text — as a native in-process
+  teammate. Plus the external-only ``read_inbox`` (natives get messages pushed
+  by coordination; an external member must pull). Server-level instructions are
+  **empty**: the team system prompt is injected directly into the CLI at spawn
+  time, so the protocol is not repeated here.
 * ``operator`` (default) — an external, non-member interface that operates and
   controls the team via tools (task board + messaging + roster + member
-  control). Server-level instructions carry the control workflow. The
-  operator has no coordination layer of its own, so it also gets the
-  operator-only ``read_inbox`` pull tool.
+  control). Server-level instructions carry the control workflow.
 
 Built on the low-level :class:`mcp.server.lowlevel.Server` (not FastMCP) so the
 member tools can advertise their own raw ``card.input_params`` JSON schema and
-return their ``render_for_llm()`` text verbatim. The descriptor is read from the
+return their ``map_result()`` text verbatim. The descriptor is read from the
 ``OPENJIUWEN_TEAM_JOIN`` environment variable; the session-id / language
 contextvars are re-bound on every tool call (each call runs in its own task).
 """
@@ -56,7 +53,7 @@ cancel, send_message to direct members (use "*" to broadcast), list_members to
 see the roster, and the task-board tools. Refer to members by name.
 """
 
-# Stable tool name (operator-only pull op; members get messages pushed).
+# Stable tool name (external-only pull op, both scopes).
 READ_INBOX = "read_inbox"
 
 # Async callable that produces a connected ExternalTeamClient.
@@ -71,7 +68,7 @@ async def connect_from_env() -> ExternalTeamClient:
 
 
 def _read_inbox_tool() -> types.Tool:
-    """The operator-only inbox tool definition (no native counterpart)."""
+    """The external-only inbox tool definition (no native counterpart)."""
     return types.Tool(
         name=READ_INBOX,
         description=(
@@ -251,10 +248,7 @@ def build_server(
     async def list_tools() -> list[types.Tool]:
         client = await holder.get()
         if client.scope == "member":
-            # Real teammate tools only — inbound messages are pushed to the
-            # member by the parent process's coordination layer, so the
-            # operator-only read_inbox pull tool is deliberately absent.
-            return [
+            tools = [
                 types.Tool(
                     name=tool.card.name,
                     description=tool.card.description,
@@ -262,26 +256,27 @@ def build_server(
                 )
                 for tool in client.tools.values()
             ]
+            tools.append(_read_inbox_tool())
+            return tools
         return _operator_tool_defs()
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
         client = await holder.get()
+        if name == READ_INBOX:
+            return [types.TextContent(type="text", text=await client.read_inbox())]
         try:
-            if name == READ_INBOX:
-                if client.scope != "operator":
-                    return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-                return [types.TextContent(type="text", text=await client.read_inbox())]
             if client.scope == "member":
                 tool = client.tools.get(name)
                 if tool is None:
                     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-                result = await tool.invoke(
-                    arguments,
-                    member_name=client.member_name,
-                    display_name=client.member_name,
+                text = str(
+                    await tool.invoke(
+                        arguments,
+                        member_name=client.member_name,
+                        display_name=client.member_name,
+                    ),
                 )
-                text = tool.render_for_llm(result)
             else:
                 text = await _dispatch_operator(client, name, arguments)
         except Exception as exc:  # noqa: BLE001 - never surface as an MCP protocol error

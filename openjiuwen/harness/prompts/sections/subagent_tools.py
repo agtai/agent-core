@@ -98,7 +98,7 @@ def build_subagent_tools_section(
     return PromptSection(
         name=SectionName.SUBAGENT_TOOLS,
         content={language: content},
-        priority=81,
+        priority=85,
     )
 
 

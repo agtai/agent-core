@@ -123,7 +123,6 @@ def _build_app(config: dict[str, Any]):
             fixed_user_id=config["model_id"],
             fixed_model_id=config["model_id"],
         ),
-        redis=redis,
         trajectory_store=store,
         pending_judge_store=pending_judge_store,
     )

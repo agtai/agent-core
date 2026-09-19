@@ -8,25 +8,22 @@ registry, or subscription.  Functions return detached dictionaries/lists and
 transformations create a new :class:`Trajectory` value through
 ``Trajectory.from_otlp``.
 
-Attributes are read only under the current observability conventions; there
-is no fallback to keys that earlier producers wrote.
+Current attributes follow the observability conventions; migration-only
+fallbacks remain explicitly owned by the trajectory package.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import re
 from copy import deepcopy
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Iterator, TypeAlias
 
-from openjiuwen.agent_evolving.trajectory.schema import (
-    RL_COMPLETION_TOKEN_IDS,
-    RL_LOGPROBS,
-    RL_PROMPT_TOKEN_IDS,
-    RL_REWARD,
-)
+from openjiuwen.agent_evolving.trajectory import legacy_semconv
 from openjiuwen.agent_evolving.trajectory.serialization import to_json_compatible
 from openjiuwen.extensions.observability import semconv
+
 
 JSONValue: TypeAlias = Any
 Span: TypeAlias = dict[str, Any]
@@ -402,43 +399,6 @@ def merge_spans(base: Any, additions: Iterable[Mapping[str, Any]]) -> Any:
     return _trajectory_from_payload(merge_payloads(payload, extra))
 
 
-def _trim_span_indices(
-    spans: Sequence[Mapping[str, Any]],
-    max_spans: int | None,
-    *,
-    start_time: int | None,
-    end_time: int | None,
-    uncounted: Callable[[Mapping[str, Any]], bool] | None = None,
-) -> list[int]:
-    """Select positions so equal or repeated span identities remain distinct."""
-
-    selected: list[int] = []
-    for index, span in enumerate(spans):
-        if start_time is not None and _time_value(span, "endTimeUnixNano") < start_time:
-            continue
-        if end_time is not None and _time_value(span, "startTimeUnixNano") > end_time:
-            continue
-        selected.append(index)
-
-    selected.sort(key=lambda index: span_sort_key(spans[index]))
-    if max_spans is None:
-        return selected
-    if max_spans <= 0:
-        return []
-    if uncounted is None:
-        return selected[-max_spans:]
-    counted = [index for index in selected if not uncounted(spans[index])]
-    kept = set(counted[-max_spans:])
-    if not kept:
-        return []
-    cutoff = min(_time_value(spans[index], "startTimeUnixNano") for index in kept)
-    return [
-        index
-        for index in selected
-        if index in kept or (uncounted(spans[index]) and _time_value(spans[index], "startTimeUnixNano") >= cutoff)
-    ]
-
-
 def trim_spans(
     spans: Iterable[Mapping[str, Any]],
     max_spans: int | None = None,
@@ -452,9 +412,17 @@ def trim_spans(
     limit yields an empty list, which is useful for a bounded clean window.
     """
 
-    normalized = [normalize_span(span) for span in spans if isinstance(span, Mapping)]
-    selected = _trim_span_indices(normalized, max_spans, start_time=start_time, end_time=end_time)
-    return [normalized[index] for index in selected]
+    selected = [normalize_span(span) for span in spans if isinstance(span, Mapping)]
+    if start_time is not None:
+        selected = [span for span in selected if _time_value(span, "endTimeUnixNano") >= start_time]
+    if end_time is not None:
+        selected = [span for span in selected if _time_value(span, "startTimeUnixNano") <= end_time]
+    selected.sort(key=span_sort_key)
+    if max_spans is not None:
+        if max_spans <= 0:
+            return []
+        selected = selected[-max_spans:]
+    return deepcopy(selected)
 
 
 def trim_trajectory(
@@ -463,36 +431,36 @@ def trim_trajectory(
     *,
     start_time: int | None = None,
     end_time: int | None = None,
-    uncounted: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> Any:
-    """Return a globally trimmed trajectory preserving original resource/scope groups.
-
-    Spans ``uncounted`` accepts do not take a place in ``max_spans``; they are
-    kept when they start no earlier than the oldest span that was.
-    """
+    """Return a new trajectory retaining only the selected span window."""
 
     payload = normalize_otlp(_payload_for(value))
     if max_spans is None and start_time is None and end_time is None:
         return _trajectory_from_payload(payload)
-
-    entries = list(_payload_spans(payload))
-    selected = _trim_span_indices(
-        [span for _, _, _, span in entries],
+    selected = trim_spans(
+        list(iter_spans(payload)),
         max_spans,
         start_time=start_time,
         end_time=end_time,
-        uncounted=uncounted,
     )
+    # Keep the first resource/scope metadata while replacing spans with the
+    # selected forest.  Empty spans are valid for a snapshot; resourceSpans is
+    # retained so Trajectory validation still sees a canonical envelope.
     result = deepcopy(payload)
+    locations: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for resource_span in result.get("resourceSpans") or []:
         for scope_span in resource_span.get("scopeSpans") or []:
             scope_span["spans"] = []
-
-    # Keep empty groups and their metadata; selected positions identify the original
-    # source even when different groups contain identical trace/span IDs.
-    for index in selected:
-        resource_index, scope_index, _, span = entries[index]
-        result["resourceSpans"][resource_index]["scopeSpans"][scope_index]["spans"].append(span)
+            locations.append((resource_span, scope_span))
+    if not locations:
+        result.setdefault("resourceSpans", []).append({"resource": {}, "scopeSpans": [{"scope": {}, "spans": []}]})
+        locations.append((result["resourceSpans"][0], result["resourceSpans"][0]["scopeSpans"][0]))
+    # Preserve each selected span's original resource/scope when possible.
+    for span in selected:
+        # The detached span does not carry its source location; using the first
+        # scope is deterministic and preserves the canonical envelope.
+        locations[0][1].setdefault("spans", []).append(span)
+    _sort_payload_spans(result)
     return _trajectory_from_payload(result)
 
 
@@ -587,39 +555,21 @@ def _flatten_structured_message(message: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     flat = {key: deepcopy(value) for key, value in message.items() if key != "parts"}
-    parts = message.get("parts") if isinstance(message.get("parts"), list) else []
-    # Reasoning is what the model thought, not what it said: it is read back
-    # as ``reasoning_content`` and never folded into ``content``.
-    reasoning_parts = [
-        part for part in parts if isinstance(part, Mapping) and part.get("type") == "reasoning"
-    ]
-    said_parts = [
-        part for part in parts if isinstance(part, Mapping) and part.get("type") != "reasoning"
-    ]
-    if reasoning_parts and "reasoning_content" not in flat:
-        flat["reasoning_content"] = _structured_parts_text(reasoning_parts)
     if not isinstance(flat.get("content"), str):
-        contents = [part["content"] for part in said_parts if "content" in part]
+        parts = message.get("parts")
+        contents = [
+            part["content"] for part in parts
+            if isinstance(part, Mapping) and "content" in part
+        ] if isinstance(parts, list) else []
         if len(contents) == 1 and not isinstance(contents[0], str):
             # Multimodal content rides in one part and comes back whole.
             flat["content"] = deepcopy(contents[0])
         elif contents:
-            flat["content"] = _structured_parts_text(said_parts)
+            flat["content"] = _structured_parts_text(parts)
     if "tool_calls" not in flat:
         tool_calls = _tool_calls_from_parts(message.get("parts"))
         if tool_calls:
             flat["tool_calls"] = tool_calls
-    if flat.get("role") == "tool":
-        parts = message.get("parts")
-        responses = [
-            part for part in parts
-            if isinstance(part, Mapping) and part.get("type") == "tool_call_response"
-        ] if isinstance(parts, list) else []
-        if responses:
-            response = responses[0]
-            flat.setdefault("content", deepcopy(response.get("response")))
-            if response.get("id") is not None:
-                flat.setdefault("tool_call_id", deepcopy(response["id"]))
     flat.setdefault("role", "unknown")
     return flat
 
@@ -627,25 +577,15 @@ def _flatten_structured_message(message: Mapping[str, Any]) -> dict[str, Any]:
 def _structure_message(message: Mapping[str, Any]) -> dict[str, Any]:
     """Render one flat role/content message as a structured GenAI message.
 
-    Text, tool calls, and tool responses become the exact part shapes defined
-    by the OpenTelemetry GenAI JSON schema.
+    Text and tool calls become ``parts``; every other field a producer carries
+    (``name``, ``tool_call_id``, ``reasoning_content``, ...) stays alongside
+    them, so the round trip through :func:`_flatten_structured_message` is
+    lossless.
     """
 
     parts: list[dict[str, Any]] = []
     content = message.get("content")
-    role = str(message.get("role") or "unknown")
-    reasoning = message.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning:
-        parts.append({"type": "reasoning", "content": reasoning})
-    if role == "tool" and content is not None:
-        response: dict[str, Any] = {
-            "type": "tool_call_response",
-            "response": deepcopy(content),
-        }
-        if message.get("tool_call_id") is not None:
-            response["id"] = deepcopy(message["tool_call_id"])
-        parts.append(response)
-    elif content is not None:
+    if content is not None:
         # Recorded even when empty: a message that carried an empty content
         # field is not the same as one that carried none.
         parts.append({"type": "text", "content": deepcopy(content)})
@@ -653,25 +593,19 @@ def _structure_message(message: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(tool_calls, list):
         for call in tool_calls:
             if isinstance(call, Mapping):
-                function = call.get("function")
-                function = function if isinstance(function, Mapping) else {}
-                part: dict[str, Any] = {"type": "tool_call"}
-                call_id = call.get("id", function.get("id"))
-                name = call.get("name", function.get("name"))
-                arguments = call.get("arguments", function.get("arguments"))
-                if call_id is not None:
-                    part["id"] = deepcopy(call_id)
-                if name is not None:
-                    part["name"] = deepcopy(name)
-                if arguments is not None:
-                    part["arguments"] = deepcopy(arguments)
-                parts.append(part)
+                # Carried whole rather than spread: a call has its own ``type``
+                # field, which would otherwise overwrite the part's.
+                parts.append({"type": "tool_call", "call": deepcopy(dict(call))})
     structured: dict[str, Any] = {
-        "role": role,
+        "role": str(message.get("role") or "unknown"),
         "parts": parts,
     }
-    if message.get("name") is not None:
-        structured["name"] = deepcopy(message["name"])
+    for field, value in message.items():
+        if field in ("role", "content", "parts"):
+            continue
+        if field == "tool_calls" and isinstance(tool_calls, list):
+            continue
+        structured[field] = deepcopy(value)
     return structured
 
 
@@ -683,7 +617,7 @@ def write_llm_exchange(
 
     The inverse of :func:`read_llm_exchange`, for the trajectory producers that
     build span attribute dictionaries by hand rather than through
-    instrumentation: offline extraction and the RL and SFT rails.
+    instrumentation: offline extraction, the RL rail, and legacy conversion.
 
     Args:
         prompts: Flat request messages, system turns included.
@@ -744,17 +678,6 @@ def _standard_prompt_messages(attrs: Mapping[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
-def is_compaction_span(span: Mapping[str, Any]) -> bool:
-    """Whether a model request summarised the conversation instead of continuing it.
-
-    Such a request's prompt is about the context, not part of it, so readers
-    that rebuild a conversation or train on its turns leave it out. It stays in
-    the trajectory: the window it produced is committed separately.
-    """
-
-    return span_attributes(span).get(semconv.OJ_REQUEST_PURPOSE) == "compaction"
-
-
 def read_llm_exchange(span: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Read detached LLM messages from the standard GenAI attributes."""
 
@@ -764,6 +687,12 @@ def read_llm_exchange(span: Mapping[str, Any]) -> tuple[list[dict[str, Any]], li
         _flatten_structured_message(message)
         for message in _message_list(attrs.get(semconv.GEN_AI_OUTPUT_MESSAGES))
     ]
+    tool_calls = _decode_structured_attribute(attrs.get(semconv.GEN_AI_TOOL_CALLS))
+    if tool_calls not in (None, ""):
+        if completions:
+            completions[0].setdefault("tool_calls", tool_calls)
+        else:
+            completions.append({"role": "assistant", "tool_calls": tool_calls})
     return deepcopy(prompts), deepcopy(completions)
 
 
@@ -783,15 +712,19 @@ def read_tool_call(span: Mapping[str, Any]) -> dict[str, Any]:
     attrs = span_attributes(span)
     result: dict[str, Any] = {}
     name = attrs.get(semconv.GEN_AI_TOOL_NAME)
-    tool_id = attrs.get(semconv.GEN_AI_TOOL_CALL_ID)
+    tool_id = attrs.get(semconv.GEN_AI_TOOL_ID) or attrs.get(legacy_semconv.LEGACY_GEN_AI_TOOL_CALL_ID)
     if name is not None:
         result["name"] = deepcopy(name)
     if tool_id is not None:
         result["id"] = deepcopy(tool_id)
-    if semconv.GEN_AI_TOOL_CALL_ARGUMENTS in attrs:
-        result["input"] = _decode_structured_attribute(attrs[semconv.GEN_AI_TOOL_CALL_ARGUMENTS])
-    if semconv.GEN_AI_TOOL_CALL_RESULT in attrs:
-        result["output"] = _decode_structured_attribute(attrs[semconv.GEN_AI_TOOL_CALL_RESULT])
+    if semconv.GEN_AI_TOOL_INPUT in attrs:
+        result["input"] = _decode_structured_attribute(attrs[semconv.GEN_AI_TOOL_INPUT])
+    elif legacy_semconv.LEGACY_GEN_AI_TOOL_CALL_ARGUMENTS in attrs:
+        result["input"] = _decode_structured_attribute(attrs[legacy_semconv.LEGACY_GEN_AI_TOOL_CALL_ARGUMENTS])
+    if semconv.GEN_AI_TOOL_OUTPUT in attrs:
+        result["output"] = _decode_structured_attribute(attrs[semconv.GEN_AI_TOOL_OUTPUT])
+    elif legacy_semconv.LEGACY_GEN_AI_TOOL_CALL_RESULT in attrs:
+        result["output"] = _decode_structured_attribute(attrs[legacy_semconv.LEGACY_GEN_AI_TOOL_CALL_RESULT])
     error = read_span_error(span)
     if error is not None:
         result["error"] = error
@@ -802,18 +735,34 @@ def read_usage(span: Mapping[str, Any]) -> dict[str, int]:
     """Return token usage using observability's canonical names."""
 
     attrs = span_attributes(span)
+    mapping = (
+        (
+            "prompt_tokens",
+            (semconv.GEN_AI_USAGE_PROMPT_TOKENS, legacy_semconv.LEGACY_GEN_AI_USAGE_INPUT_TOKENS),
+        ),
+        (
+            "completion_tokens",
+            (semconv.GEN_AI_USAGE_COMPLETION_TOKENS, legacy_semconv.LEGACY_GEN_AI_USAGE_OUTPUT_TOKENS),
+        ),
+        ("total_tokens", (semconv.GEN_AI_USAGE_TOTAL_TOKENS,)),
+    )
     result: dict[str, int] = {}
-    for output_key, key in (
-        ("prompt_tokens", semconv.GEN_AI_USAGE_INPUT_TOKENS),
-        ("completion_tokens", semconv.GEN_AI_USAGE_OUTPUT_TOKENS),
-    ):
-        try:
-            result[output_key] = int(attrs[key])
-        except (KeyError, TypeError, ValueError):
+    for output_key, input_keys in mapping:
+        value = next((attrs[key] for key in input_keys if key in attrs), None)
+        if value is None:
             continue
-    if result:
-        result["total_tokens"] = result.get("prompt_tokens", 0) + result.get("completion_tokens", 0)
+        try:
+            result[output_key] = int(value)
+        except (TypeError, ValueError):
+            continue
     return result
+
+
+def _first_suffix_attribute(attrs: Mapping[str, Any], suffixes: Sequence[str]) -> Any:
+    for key in suffixes:
+        if key in attrs:
+            return deepcopy(attrs[key])
+    return None
 
 
 def _coerce_int_list(value: Any) -> list[int] | None:
@@ -851,13 +800,19 @@ def read_rl_fields(span: Mapping[str, Any]) -> dict[str, Any]:
 
     attrs = span_attributes(span)
     fields: dict[str, Any] = {}
-    for output_key, key in (
-        ("prompt_token_ids", RL_PROMPT_TOKEN_IDS),
-        ("completion_token_ids", RL_COMPLETION_TOKEN_IDS),
-        ("logprobs", RL_LOGPROBS),
-        ("reward", RL_REWARD),
+    for output_key, suffixes in (
+        (
+            "prompt_token_ids",
+            ("evolution.rl.prompt_token_ids", "openjiuwen.rl.prompt_token_ids"),
+        ),
+        (
+            "completion_token_ids",
+            ("evolution.rl.completion_token_ids", "openjiuwen.rl.completion_token_ids"),
+        ),
+        ("logprobs", ("evolution.rl.logprobs", "openjiuwen.rl.logprobs")),
+        ("reward", ("evolution.rl.reward", "openjiuwen.rl.reward")),
     ):
-        value = deepcopy(attrs.get(key))
+        value = _first_suffix_attribute(attrs, suffixes)
         if value is None:
             continue
         if output_key in {"prompt_token_ids", "completion_token_ids"}:
@@ -907,7 +862,6 @@ __all__ = [
     "decode_json_attribute",
     "decode_otlp_value",
     "encode_otlp_value",
-    "is_compaction_span",
     "iter_spans",
     "merge_payloads",
     "merge_spans",

@@ -107,17 +107,12 @@ def test_mcp_approval_mode_is_explicit_and_codex_only():
         )
 
 
-def test_full_access_bypass_defaults_for_codex_and_can_be_disabled():
-    default_config = ExternalCliAgentSpec(cli_agent="codex")
-    disabled_config = ExternalCliAgentSpec(
+def test_full_access_bypass_is_explicit_and_codex_only():
+    config = ExternalCliAgentSpec(
         cli_agent="codex",
-        codex_bypass_approvals_and_sandbox=False,
+        codex_bypass_approvals_and_sandbox=True,
     )
-    claude_config = ExternalCliAgentSpec(cli_agent="claude")
-
-    assert default_config.codex_bypass_approvals_and_sandbox
-    assert not disabled_config.codex_bypass_approvals_and_sandbox
-    assert not claude_config.codex_bypass_approvals_and_sandbox
+    assert config.codex_bypass_approvals_and_sandbox
 
     with pytest.raises(ValidationError, match="codex_bypass_approvals_and_sandbox is only valid"):
         ExternalCliAgentSpec(
@@ -143,37 +138,6 @@ def test_codex_turn_stall_policy_is_validated_and_codex_only():
 
     with pytest.raises(ValidationError, match="codex_turn_idle_retries is only valid"):
         ExternalCliAgentSpec(cli_agent="generic", codex_turn_idle_retries=1)
-
-
-def test_claude_turn_stall_policy_is_validated_and_claude_only():
-    config = ExternalCliAgentSpec(
-        cli_agent="claude",
-        claude_turn_idle_timeout_s=45.0,
-    )
-    assert config.claude_turn_idle_timeout_s == 45.0
-
-    with pytest.raises(ValidationError, match="greater than 0"):
-        ExternalCliAgentSpec(cli_agent="claude", claude_turn_idle_timeout_s=0)
-
-    with pytest.raises(ValidationError, match="claude_turn_idle_timeout_s is only valid"):
-        ExternalCliAgentSpec(cli_agent="codex", claude_turn_idle_timeout_s=45.0)
-
-
-def test_claude_max_buffer_size_survives_codex_config_round_trip():
-    config = ExternalCliAgentSpec(cli_agent="codex")
-
-    restored = ExternalCliAgentSpec.model_validate(config.model_dump(mode="json"))
-
-    assert restored.cli_agent == "codex"
-    assert restored.claude_max_buffer_size is None
-
-
-def test_claude_max_buffer_size_is_validated_and_claude_only():
-    config = ExternalCliAgentSpec(cli_agent="claude", claude_max_buffer_size=64 * 1024 * 1024)
-    assert config.claude_max_buffer_size == 64 * 1024 * 1024
-
-    with pytest.raises(ValidationError, match="claude_max_buffer_size is only valid"):
-        ExternalCliAgentSpec(cli_agent="codex", claude_max_buffer_size=64 * 1024 * 1024)
 
 
 def test_unknown_backend_returns_none():

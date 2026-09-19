@@ -26,22 +26,18 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.schema.config import DeepAgentConfig
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.tools.tool_discovery.bm25 import BM25ToolIndex
-from openjiuwen.harness.tools.tool_discovery.tool_call import RelayedToolOutput, ToolCallTool
+from openjiuwen.harness.tools.tool_discovery.tool_call import ToolCallTool
 from openjiuwen.harness.tools.tool_discovery.tool_search import (
     DEFAULT_TOOL_SEARCH_LIMIT,
     ToolSearchTool,
 )
 
 _DISCOVERED_TOOLS_KEY = "__progressive_discovered_tool_names__"
-_DISCOVERED_TOOL_FINGERPRINTS_KEY = "__progressive_discovered_tool_fingerprints__"
 _DISCOVERY_TRACE_KEY = "__progressive_tool_discovery_trace__"
 _DEFERRED_TOOL_ATTACHMENT_SECTION = "progressive_deferred_tools"
 _DEFERRED_TOOL_ATTACHMENT_SOURCE = "progressive_tool_rail"
 _DEFERRED_TOOL_CATALOG_STATE_KEY = "__progressive_deferred_tool_catalog__"
 _DEFERRED_TOOL_CATALOG_METADATA_KEY = "catalog_tools"
-_DEFERRED_TOOL_CATALOG_FINGERPRINTS_METADATA_KEY = "catalog_fingerprints"
-_DEFERRED_TOOL_CATALOG_INITIAL_FINGERPRINTS_STATE_KEY = "initial_fingerprints"
-_DEFERRED_TOOL_CATALOG_FINGERPRINTS_STATE_KEY = "fingerprints"
 _DEFERRED_TOOL_REGISTRY_REVISION_METADATA_KEY = "registry_revision"
 _DEFERRED_TOOL_FULL_SNAPSHOT_INTERVAL = 10
 _NESTED_TOOL_CALL_KEY = "__progressive_nested_tool_call__"
@@ -363,40 +359,45 @@ class ProgressiveToolRail(DeepAgentRail):
             int(revision) if isinstance(revision, int) else None
         )
 
-    def _get_current_tool_search_documents(self, agent: Any = None) -> List[ToolInfo]:
-        """Read the current deferred catalog used by BM25 and invalidation."""
-        ability_manager = (
-            getattr(agent, "ability_manager", None) or self._tool_search_registry
-        )
-        if callable(getattr(ability_manager, "list", None)):
-            return self._list_registered_deferred_tool_infos(agent)
+    def _ensure_tool_search_index(self, agent: Any = None) -> None:
+        """Reuse the startup index unless the ability registry changed."""
+        ability_manager = getattr(agent, "ability_manager", None) or self._tool_search_registry
+        revision = getattr(ability_manager, "registry_revision", None)
+        normalized_revision = int(revision) if isinstance(revision, int) else None
 
-        return [
+        if (
+            self._tool_search_index is not None
+            and normalized_revision is not None
+            and normalized_revision == self._tool_search_index_revision
+        ):
+            return
+
+        if self._tool_search_index is not None and normalized_revision is None:
+            # Test doubles and legacy callers may not expose a registry
+            # revision. Keep the startup index stable in that case.
+            if self._tool_search_index.document_count > 0:
+                return
+
+            if not callable(getattr(ability_manager, "list", None)):
+                fallback = [
+                    tool
+                    for tool in self._cached_all_tool_infos
+                    if str(getattr(tool, "name", "") or "") not in self._meta_tool_names
+                ]
+                if fallback:
+                    self._rebuild_tool_search_index(tool_infos=fallback)
+            return
+
+        if ability_manager is not None and callable(getattr(ability_manager, "list", None)):
+            self._rebuild_tool_search_index(agent)
+            return
+
+        fallback = [
             tool
             for tool in self._cached_all_tool_infos
             if str(getattr(tool, "name", "") or "") not in self._meta_tool_names
         ]
-
-    def _ensure_tool_search_index(self, agent: Any = None) -> None:
-        """Reuse the index only while its complete deferred catalog is unchanged."""
-        ability_manager = (
-            getattr(agent, "ability_manager", None) or self._tool_search_registry
-        )
-        revision = getattr(ability_manager, "registry_revision", None)
-        normalized_revision = int(revision) if isinstance(revision, int) else None
-        current_documents = self._get_current_tool_search_documents(agent)
-        current_fingerprint = BM25ToolIndex.fingerprint(current_documents)
-
-        if self._tool_search_index is not None and (
-            self._tool_search_index.source_fingerprint == current_fingerprint
-            and normalized_revision == self._tool_search_index_revision
-        ):
-            # The registry revision covers normal registration changes; the
-            # metadata fingerprint additionally catches in-place schema edits
-            # that do not advance that revision.
-            return
-
-        self._rebuild_tool_search_index(agent, tool_infos=current_documents)
+        self._rebuild_tool_search_index(tool_infos=fallback)
 
     async def _get_real_tool_infos(self) -> List[ToolInfo]:
         """Return non-meta tools from the cached inventory."""
@@ -426,16 +427,7 @@ class ProgressiveToolRail(DeepAgentRail):
         )
 
         matched_names = [str(getattr(tool, "name", "") or "") for tool in matched]
-        matched_fingerprints = {
-            name: BM25ToolIndex.tool_fingerprint(tool)
-            for name, tool in zip(matched_names, matched)
-            if name
-        }
-        self._authorize_discovered_tools(
-            session,
-            matched_names,
-            fingerprints=matched_fingerprints,
-        )
+        self._authorize_discovered_tools(session, matched_names)
         self._append_trace(
             session,
             {
@@ -489,38 +481,6 @@ class ProgressiveToolRail(DeepAgentRail):
                 error=f"Tool '{target_name}' is not a deferred search result.",
             )
 
-        discovered_fingerprints = self._get_discovered_tool_fingerprints(session)
-        if discovered_fingerprints is not None:
-            expected_fingerprint = discovered_fingerprints.get(target_name)
-            if not expected_fingerprint:
-                return ToolOutput(
-                    success=False,
-                    error=(
-                        f"Deferred tool '{target_name}' must be searched again "
-                        "before it can be called."
-                    ),
-                )
-            try:
-                current_fingerprint = BM25ToolIndex.tool_fingerprint(card.tool_info())
-            except Exception as exc:
-                self._invalidate_discovered_tools(session, {target_name})
-                return ToolOutput(
-                    success=False,
-                    error=(
-                        f"Deferred tool '{target_name}' schema is unavailable; "
-                        f"search it again before calling it: {exc}"
-                    ),
-                )
-            if current_fingerprint != expected_fingerprint:
-                self._invalidate_discovered_tools(session, {target_name})
-                return ToolOutput(
-                    success=False,
-                    error=(
-                        f"Deferred tool '{target_name}' has changed; search it "
-                        "again before calling it."
-                    ),
-                )
-
         self._append_trace(
             session,
             {
@@ -563,53 +523,37 @@ class ProgressiveToolRail(DeepAgentRail):
         if isinstance(target_result, ToolInterruptException):
             raise target_result
 
-        # The target's message already holds its model-facing rendering (plus
-        # any AFTER_TOOL_CALL rewrite). The wrapper relays that text to the
-        # model out of band; the structured fields stay exactly what upper
-        # layers stream as the tool result.
-        target_message_content = str(getattr(target_message, "content", "") or "")
         target_success = getattr(target_result, "success", None)
         if target_success is False:
-            return RelayedToolOutput(
+            return ToolOutput(
                 success=False,
                 error=str(
                     getattr(target_result, "error", None)
                     or getattr(target_message, "content", None)
                     or target_result
                 ),
-                rendered_text=target_message_content,
             )
 
+        target_message_content = str(getattr(target_message, "content", "") or "")
         if target_result is None and target_message_content.startswith(
             ("Ability execution error:", "Tool execution error:", "[Interrupted]")
         ):
             return ToolOutput(success=False, error=target_message_content)
 
-        return RelayedToolOutput(
+        return ToolOutput(
             success=True,
             data={
                 "name": target_name,
                 "result": target_result,
             },
-            rendered_text=target_message_content,
         )
 
-    def _authorize_discovered_tools(
-        self,
-        session: Any,
-        names: List[str],
-        *,
-        fingerprints: Optional[Dict[str, str]] = None,
-    ) -> None:
+    def _authorize_discovered_tools(self, session: Any, names: List[str]) -> None:
         """Record search hits as callable through ``tool_call`` for this session."""
         if session is None:
             return
         current = self._get_discovered_tools(session)
-        self._set_discovered_tools(
-            session,
-            list(dict.fromkeys(current + names)),
-            fingerprints=fingerprints,
-        )
+        self._set_discovered_tools(session, list(dict.fromkeys(current + names)))
 
     def _get_discovered_tools(self, session: Any) -> List[str]:
         if session is None:
@@ -619,52 +563,14 @@ class ProgressiveToolRail(DeepAgentRail):
             return [str(item).strip() for item in state if str(item).strip()]
         return []
 
-    def _get_discovered_tool_fingerprints(
-        self,
-        session: Any,
-    ) -> Optional[Dict[str, str]]:
-        if session is None:
-            return None
-        state = session.get_state(_DISCOVERED_TOOL_FINGERPRINTS_KEY)
-        if not isinstance(state, dict):
-            return None
-        return {
-            str(name).strip(): str(fingerprint).strip()
-            for name, fingerprint in state.items()
-            if str(name).strip() and str(fingerprint).strip()
-        }
-
-    def _set_discovered_tools(
-        self,
-        session: Any,
-        names: List[str],
-        *,
-        fingerprints: Optional[Dict[str, str]] = None,
-    ) -> None:
+    def _set_discovered_tools(self, session: Any, names: List[str]) -> None:
         if session is None:
             return
-        normalized_names = list(
-            dict.fromkeys(str(name).strip() for name in names if str(name).strip())
-        )
-        discovered_fingerprints = self._get_discovered_tool_fingerprints(session) or {}
-        if fingerprints is not None:
-            discovered_fingerprints.update(
-                {
-                    str(name).strip(): str(fingerprint).strip()
-                    for name, fingerprint in fingerprints.items()
-                    if str(name).strip() and str(fingerprint).strip()
-                }
+        session.update_state({
+            _DISCOVERED_TOOLS_KEY: list(
+                dict.fromkeys(str(name).strip() for name in names if str(name).strip())
             )
-        session.update_state(
-            {
-                _DISCOVERED_TOOLS_KEY: normalized_names,
-                _DISCOVERED_TOOL_FINGERPRINTS_KEY: {
-                    name: discovered_fingerprints[name]
-                    for name in normalized_names
-                    if name in discovered_fingerprints
-                },
-            }
-        )
+        })
 
     def _invalidate_discovered_tools(self, session: Any, names: Set[str]) -> None:
         """Forget search authorizations for changed or removed deferred tools."""
@@ -799,7 +705,6 @@ class ProgressiveToolRail(DeepAgentRail):
             else self._collect_deferred_tool_descriptions(agent)
         )
         current_tools = self._normalize_deferred_catalog(current_tools) or {}
-        current_fingerprints = self._collect_deferred_tool_fingerprints(agent)
         registry_revision = self._get_registry_revision(agent)
         state = session.get_state(_DEFERRED_TOOL_CATALOG_STATE_KEY)
         if not isinstance(state, dict):
@@ -813,11 +718,6 @@ class ProgressiveToolRail(DeepAgentRail):
             for name, description in initial_tools.items()
             if str(name).strip()
         }
-        initial_fingerprints = self._normalize_deferred_catalog(
-            state.get(_DEFERRED_TOOL_CATALOG_INITIAL_FINGERPRINTS_STATE_KEY)
-        )
-        if initial_fingerprints is None:
-            initial_fingerprints = dict(current_fingerprints)
 
         previous_tools = state.get("tools")
         if not isinstance(previous_tools, dict):
@@ -827,11 +727,6 @@ class ProgressiveToolRail(DeepAgentRail):
             for name, description in previous_tools.items()
             if str(name).strip()
         }
-        previous_fingerprints = self._normalize_deferred_catalog(
-            state.get(_DEFERRED_TOOL_CATALOG_FINGERPRINTS_STATE_KEY)
-        )
-        if previous_fingerprints is None:
-            previous_fingerprints = {}
         initialized = bool(state.get("initialized"))
         previous_language = str(state.get("language") or "")
         try:
@@ -866,13 +761,6 @@ class ProgressiveToolRail(DeepAgentRail):
         if attachment_tools is not None:
             previous_tools = attachment_tools
             initialized = True
-            attachment_fingerprints = self._normalize_deferred_catalog(
-                attachment_metadata.get(_DEFERRED_TOOL_CATALOG_FINGERPRINTS_METADATA_KEY)
-                if isinstance(attachment_metadata, dict)
-                else None
-            )
-            if attachment_fingerprints is not None:
-                previous_fingerprints = attachment_fingerprints
             attachment_language = (
                 str(attachment_metadata.get("catalog_language") or "")
                 if isinstance(attachment_metadata, dict)
@@ -913,23 +801,16 @@ class ProgressiveToolRail(DeepAgentRail):
                 )
 
         baseline_tools = previous_tools if initialized else initial_tools
-        baseline_fingerprints = (
-            previous_fingerprints if initialized else initial_fingerprints
-        )
         added = {
             name: description
             for name, description in current_tools.items()
             if name not in baseline_tools
         }
-        updated: Dict[str, str] = {}
-        for name, description in current_tools.items():
-            if name not in baseline_tools:
-                continue
-            if baseline_tools[name] != description:
-                updated[name] = description
-                continue
-            if baseline_fingerprints.get(name) != current_fingerprints.get(name):
-                updated[name] = description
+        updated = {
+            name: description
+            for name, description in current_tools.items()
+            if name in baseline_tools and baseline_tools[name] != description
+        }
         removed = sorted(name for name in baseline_tools if name not in current_tools)
         changed = bool(added or updated or removed)
         next_version = version + 1 if changed else version
@@ -958,12 +839,6 @@ class ProgressiveToolRail(DeepAgentRail):
                             "language": str(language),
                             "initial_tools": dict(initial_tools),
                             "tools": dict(current_tools),
-                            _DEFERRED_TOOL_CATALOG_INITIAL_FINGERPRINTS_STATE_KEY: dict(
-                                initial_fingerprints
-                            ),
-                            _DEFERRED_TOOL_CATALOG_FINGERPRINTS_STATE_KEY: dict(
-                                current_fingerprints
-                            ),
                             _DEFERRED_TOOL_REGISTRY_REVISION_METADATA_KEY: registry_revision,
                         }
                     }
@@ -1025,9 +900,6 @@ class ProgressiveToolRail(DeepAgentRail):
                     "catalog_language": str(language),
                     "delta_count": next_delta_count,
                     _DEFERRED_TOOL_CATALOG_METADATA_KEY: dict(current_tools),
-                    _DEFERRED_TOOL_CATALOG_FINGERPRINTS_METADATA_KEY: dict(
-                        current_fingerprints
-                    ),
                     _DEFERRED_TOOL_REGISTRY_REVISION_METADATA_KEY: registry_revision,
                 },
                 content_kind="text/markdown",
@@ -1048,12 +920,6 @@ class ProgressiveToolRail(DeepAgentRail):
                     "language": str(language),
                     "initial_tools": dict(initial_tools),
                     "tools": dict(current_tools),
-                    _DEFERRED_TOOL_CATALOG_INITIAL_FINGERPRINTS_STATE_KEY: dict(
-                        initial_fingerprints
-                    ),
-                    _DEFERRED_TOOL_CATALOG_FINGERPRINTS_STATE_KEY: dict(
-                        current_fingerprints
-                    ),
                     _DEFERRED_TOOL_REGISTRY_REVISION_METADATA_KEY: registry_revision,
                 }
             }
@@ -1163,15 +1029,6 @@ class ProgressiveToolRail(DeepAgentRail):
             if str(getattr(tool, "name", "") or "")
         }
         return dict(sorted(descriptions.items()))
-
-    def _collect_deferred_tool_fingerprints(self, agent: Any = None) -> Dict[str, str]:
-        """Read schema-aware versions of the current deferred-tool directory."""
-        fingerprints = {
-            str(getattr(tool, "name", "") or ""): BM25ToolIndex.tool_fingerprint(tool)
-            for tool in self._list_registered_deferred_tool_infos(agent)
-            if str(getattr(tool, "name", "") or "")
-        }
-        return dict(sorted(fingerprints.items()))
 
     def _ensure_initial_deferred_catalog(
         self,

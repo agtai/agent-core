@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `workflow/concurrency.py`、`workflow/engine/admission.py`、`workflow/engine/cap.py`、`workflow/engine/runtime.py`、`workflow/engine/primitives.py`、`workflow/engine/runner.py`、`workflow/tool_swarmflow.py`、`workflow/runner.py`、`workflow/backends/team_worker_backend.py`、`harness/async_tools.py`、`harness/native_harness.py`、`schema/blueprint.py`、`agent/agent_configurator.py`、`rails/team_context.py`、`rails/team_tool_rail.py`、`tools/tool_factory.py`、`agent/coordination/handlers/workflow.py`、`i18n.py` |
-| 最近一次修订日期 | 2026-09-16 |
+| 最近一次修订日期 | 2026-08-04 |
 | 关联 feature | `F_47_swarmflow-concurrency-governor.md`、`F_48_swarmflow-inline-script-execution.md` |
 
 ## 范围 / 边界
@@ -109,13 +109,13 @@ per-Leader 单例）。`agents_per_run_cap` 由 `validate_swarmflow_concurrency`
 5. enrich inputs：复制为可变 `enriched`，注入 4 个内部键（见下）。
 6. `launch_async_tool(..., format_completed=..., format_failed=...)` 闭包捕获 `run_id` + `completion_ctx`；
    launch 抛异常 → `release_workflow(ticket)`（与 finally 互斥）+ `ToolOutput(error="Internal error: {exc}")`。
-7. `render_for_llm` → `swarmflow.launched`（`run_id` + `task_id`）。
+7. `map_result` → `swarmflow.launched`（`run_id` + `task_id`）。
 
 Leader 并行局数只认 `run_id`，不认 `task_id`（resume 会换新 `task_id`）。
 
 **四个对外方法**（`tool_swarmflow.py`）：
 
-- `render_for_llm(output) -> str`：启动期同步回执，成功调 `format_launched_message`，失败回退 `output.error`。
+- `map_result(output) -> str`：启动期同步回执，成功调 `format_launched_message`，失败回退 `output.error`。
 - `format_launched_message(run_id, task_id) -> str`：`swarmflow.launched`（显式区分 run_id 与 task_id 用途）。
 - `format_completed_injection(result, *, run_id, completion_ctx=None) -> str`：终态成功文本，`swarmflow.completed`。
 - `format_failed_injection(error, *, run_id) -> str`：终态失败文本，`swarmflow.failed`。
@@ -178,7 +178,7 @@ swarmflow_concurrency:
 
 | Key | 阶段 | 含 `{run_id}` | 通道 |
 |-----|------|---|------|
-| `swarmflow.launched` | 启动 | ✅ `{run_id}` + `{task_id}` | `render_for_llm`（当前 tool 轮闭合文案） |
+| `swarmflow.launched` | 启动 | ✅ `{run_id}` + `{task_id}` | `map_result`（当前 tool 轮闭合文案） |
 | `workflow.started` | 中途 | ✅ `{run_id}`（置于 `{name}` 前） | `WorkflowHandler` ← `WORKFLOW_PROGRESS` |
 | `workflow.phase` | 中途 | ✅ `{run_id}`（置于 `{phase}` 前） | 同上 |
 | `swarmflow.completed` | 终态 | ✅ `{run_id}` + `{result}` | async `_run` → `format_completed` 闭包 → `harness.send` |
@@ -221,7 +221,7 @@ run_id 在此无叙事价值。后果：多 run 并行时，这几类消息无�
 | governor 未装配 | — | `ToolOutput(success=False)` |
 | `launch_async_tool` 抛错 | L1 | invoke 内 `release_workflow`（幂等）+ `Internal error: ...` |
 | L2/L3 满 | L2/L3 | `agent()` 内 `acquire()` 阻塞，不上抛到工具层 |
-| worker backend 失败 | engine | `BackendError`（engine 内部异常）→ `_attempt_calls` retry → 耗尽 `agent()` 返 `None`；账本干涸的失败 fail-fast 不重试（`AGENT_FAILED` 带 budget 真因）；**不**穿透到工具层，不转 StatusCode |
+| worker backend 失败 | engine | `BackendError`（engine 内部异常）→ `_attempt_calls` retry → 耗尽 `agent()` 返 `None`；**不**穿透到工具层，不转 StatusCode |
 | 后台 run 失败 | — | `format_failed` → inject；L1 在 `finally` release |
 | pause（`F_43`） | L1 | pause 停 task 但 `WorkflowAborted → CancelledError` 触发 `run_background.finally`，**立即** release ticket；resume（`_relaunch`）复用同 ticket 但不重新 admit，故 resume 期间**不**占 L1 槽（resume 的 finally 再 release 为幂等 no-op） |
 

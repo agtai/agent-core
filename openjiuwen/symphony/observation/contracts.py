@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from openjiuwen.symphony.models._base import NonEmptyString, SymphonyModel
 
-GRAPH_EVOLUTION_INPUT_SCHEMA = "symphony.graph_evolution_input.v2"
+GRAPH_EVOLUTION_INPUT_SCHEMA = "symphony.graph_evolution_input.v1"
 
 
 class EvidenceStrength(str, Enum):
@@ -53,6 +53,23 @@ class GraphSnapshotRef(SymphonyModel):
     merged_revision: NonEmptyString | None = None
 
 
+class CapabilityEvidence(SymphonyModel):
+    """Capability identity observed while the task was running."""
+
+    capability_type: NonEmptyString = Field(default="skill", alias="type")
+    version: str | None = None
+    content_hash: NonEmptyString
+
+
+class PortMapping(SymphonyModel):
+    """One observed source-output to target-input mapping."""
+
+    source_output: NonEmptyString
+    target_input: NonEmptyString
+    source_type: str | None = None
+    target_type: str | None = None
+
+
 class EvolutionGraphNode(SymphonyModel):
     """A JGF node in a planned or observed execution graph."""
 
@@ -61,12 +78,19 @@ class EvolutionGraphNode(SymphonyModel):
 
 
 class EvolutionEdgeMetadata(SymphonyModel):
-    """Minimal local edge outcome produced by the Rail."""
-
-    model_config = ConfigDict(extra="forbid")
+    """Local edge outcome and trace references produced by the Rail."""
 
     success: bool | None = None
     failure_domain: FailureDomain | None = None
+    port_mappings: tuple[PortMapping, ...] = ()
+    port_mapping_hash: str | None = None
+    evidence_refs: tuple[NonEmptyString, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_failure_evidence(self) -> EvolutionEdgeMetadata:
+        if self.success is False and self.failure_domain is None:
+            raise ValueError("failed execution edges require failure_domain")
+        return self
 
 
 class EvolutionGraphEdge(SymphonyModel):
@@ -104,11 +128,10 @@ class TraceEvidence(SymphonyModel):
 class TaskOutcome(SymphonyModel):
     """Task-level verdict resolved outside GraphEngine."""
 
-    model_config = ConfigDict(extra="forbid")
-
     label: TaskOutcomeLabel
     evidence_strength: EvidenceStrength
     failure_domain: FailureDomain | None = None
+    evidence_refs: tuple[NonEmptyString, ...] = ()
 
     @model_validator(mode="after")
     def _validate_failure_domain(self) -> TaskOutcome:
@@ -128,15 +151,14 @@ class TaskEvidence(SymphonyModel):
 class GraphEvolutionInput(SymphonyModel):
     """Canonical input accepted by the Symphony observation layer."""
 
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["symphony.graph_evolution_input.v2"] = "symphony.graph_evolution_input.v2"
+    schema_version: Literal["symphony.graph_evolution_input.v1"] = "symphony.graph_evolution_input.v1"
     evidence_id: NonEmptyString
     graph_scope_id: NonEmptyString = "default"
     observed_at: datetime
     graph_snapshot: GraphSnapshotRef
     trace: TraceEvidence
     task: TaskEvidence
+    capabilities: dict[NonEmptyString, CapabilityEvidence]
     planned_graph: EvolutionGraph | None = None
     execution_graph: EvolutionGraph
 
@@ -147,23 +169,30 @@ class GraphEvolutionInput(SymphonyModel):
             raise ValueError("observed_at must include a timezone")
         return value.astimezone(timezone.utc)
 
+    @field_validator("capabilities")
+    @classmethod
+    def _normalize_capability_ids(
+        cls,
+        value: dict[str, CapabilityEvidence],
+    ) -> dict[str, CapabilityEvidence]:
+        normalized = {str(capability_id).strip(): evidence for capability_id, evidence in value.items()}
+        if any(not capability_id for capability_id in normalized):
+            raise ValueError("capability IDs must be non-empty")
+        return normalized
+
     @model_validator(mode="after")
     def _validate_graph_contract(self) -> GraphEvolutionInput:
         if self.planned_graph is not None and self.planned_graph.type != "planned_graph":
             raise ValueError("planned_graph.type must be planned_graph")
         if self.execution_graph.type != "execution_graph":
             raise ValueError("execution_graph.type must be execution_graph")
-        if any(node.label != "skill" for node in self.execution_graph.nodes.values()):
-            raise ValueError("execution_graph nodes must be skills")
-        if any(node.metadata for node in self.execution_graph.nodes.values()):
-            raise ValueError("execution_graph nodes must not contain metadata")
-        capability_ids = set(self.execution_graph.nodes)
+        capability_ids = set(self.capabilities)
         referenced_ids = {
             endpoint for edge in self.execution_graph.edges for endpoint in (edge.source_id, edge.target_id)
         }
         missing_ids = sorted(referenced_ids - capability_ids)
         if missing_ids:
-            raise ValueError(f"execution_graph references missing nodes: {missing_ids}")
+            raise ValueError(f"execution_graph references capabilities without identity evidence: {missing_ids}")
         return self
 
 

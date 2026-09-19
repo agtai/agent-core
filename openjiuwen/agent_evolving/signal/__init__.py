@@ -13,8 +13,6 @@ from openjiuwen.agent_evolving.signal.base import (
 from openjiuwen.agent_evolving.signal.from_conv import (
     ConversationSignalDetector,
     SignalDetector,
-    detect_tool_error_signals,
-    is_tool_execution_failure,
 )
 from openjiuwen.agent_evolving.signal.from_eval import (
     from_evaluated_case,
@@ -51,8 +49,6 @@ __all__ = [
     "make_signal_fingerprint",
     "ConversationSignalDetector",
     "SignalDetector",
-    "detect_tool_error_signals",
-    "is_tool_execution_failure",
     "REVIEW_FEEDBACK_SIGNAL",
     "REVIEW_FEEDBACK_SOURCE",
     "ReviewFeedbackAction",

@@ -1,1 +1,0 @@
-"""Extension package markers."""

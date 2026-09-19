@@ -2,9 +2,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 from openjiuwen.extensions.observability.span_context import (
-    advance_context_window,
-    context_compaction_number,
-    current_context_window_messages,
+    consume_context_window_compaction,
+    queue_context_window_compaction,
     reset_state,
 )
 
@@ -17,71 +16,60 @@ def teardown_function() -> None:
     reset_state()
 
 
-def test_subject_without_a_committed_window_reads_back_none() -> None:
-    assert current_context_window_messages(session_id="session-1", subject_id="main") is None
-
-
-def test_last_committed_window_reads_back_as_its_messages() -> None:
-    """The canonical state is enough to restate the window it describes.
-
-    A compaction commits the window it produced without any model request
-    having stated the one before it, so the previous window must be
-    readable from the state alone: message content, not just identity.
-    """
-    first = [
-        {"message_id": "openjiuwen:request-system-slot:0", "role": "system", "content": "rules"},
-        {"message_id": "u1", "role": "user", "content": "hello", "metadata": {"k": 1}},
-    ]
-    second = [*first, {"message_id": "a1", "role": "assistant", "content": "hi"}]
-    advance_context_window(
-        session_id="session-1", subject_id="main", window_id="w1", messages=first
-    )
-    advance_context_window(
-        session_id="session-1", subject_id="main", window_id="w2", messages=second
+def _queue(
+    operation_id: str,
+    *,
+    session_id: str = "session-1",
+    subject_id: str = "main",
+    request_id: str = "request-1",
+    step_id: str = "step-1",
+) -> bool:
+    return queue_context_window_compaction(
+        session_id=session_id,
+        subject_id=subject_id,
+        request_id=request_id,
+        step_id=step_id,
+        operation_id=operation_id,
     )
 
-    assert current_context_window_messages(session_id="session-1", subject_id="main") == second
-    # Another subject of the same session keeps its own window.
-    assert current_context_window_messages(session_id="session-1", subject_id="subagent:one") is None
 
-
-def test_every_attempt_of_one_compaction_states_the_same_number() -> None:
-    """A throttled compaction is retried; the retries are not new compactions.
-
-    The number belongs to the operation, so a reader sees one compaction that
-    took several tries rather than several compactions.
-    """
-    first = context_compaction_number(
-        session_id="session-1", subject_id="main", operation_id="op-a"
-    )
-    retry = context_compaction_number(
-        session_id="session-1", subject_id="main", operation_id="op-a"
-    )
-    second = context_compaction_number(
-        session_id="session-1", subject_id="main", operation_id="op-b"
+def _consume(
+    *,
+    session_id: str = "session-1",
+    subject_id: str = "main",
+    request_id: str = "request-1",
+    step_id: str = "step-1",
+) -> str | None:
+    return consume_context_window_compaction(
+        session_id=session_id,
+        subject_id=subject_id,
+        request_id=request_id,
+        step_id=step_id,
     )
 
-    assert (first, retry, second) == (1, 1, 2)
+
+def test_completed_compaction_is_consumed_once_by_the_next_matching_window() -> None:
+    assert _queue("operation-1") is True
+
+    assert _consume() == "operation-1"
+    assert _consume() is None
 
 
-def test_compaction_numbers_count_within_one_subject() -> None:
-    assert context_compaction_number(
-        session_id="session-1", subject_id="main", operation_id="op-a"
-    ) == 1
-    # A subagent compacts its own context and counts from one.
-    assert context_compaction_number(
-        session_id="session-1", subject_id="subagent:one", operation_id="op-b"
-    ) == 1
-    assert context_compaction_number(
-        session_id="session-2", subject_id="main", operation_id="op-c"
-    ) == 1
+def test_window_without_completed_compaction_has_no_transition() -> None:
+    assert _consume() is None
+    assert _queue("") is False
+    assert _queue("operation-without-step", step_id="") is False
+    assert _consume() is None
 
 
-def test_a_compaction_without_an_operation_states_no_number() -> None:
-    """Zero means unnumbered, so a caller never stamps a misleading first."""
-    assert context_compaction_number(
-        session_id="session-1", subject_id="main", operation_id=""
-    ) == 0
-    assert context_compaction_number(
-        session_id="session-1", subject_id="", operation_id="op-a"
-    ) == 0
+def test_pending_compactions_are_isolated_by_session_subject_request_and_step() -> None:
+    assert _queue("session-2-operation", session_id="session-2") is True
+    assert _queue("subject-operation", subject_id="subagent:one") is True
+    assert _queue("request-operation", request_id="request-2") is True
+    assert _queue("step-operation", step_id="step-2") is True
+
+    assert _consume() is None
+    assert _consume(session_id="session-2") == "session-2-operation"
+    assert _consume(subject_id="subagent:one") == "subject-operation"
+    assert _consume(request_id="request-2") == "request-operation"
+    assert _consume(step_id="step-2") == "step-operation"

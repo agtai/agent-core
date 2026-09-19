@@ -1,8 +1,6 @@
 # coding: utf-8
 
-from unittest.mock import MagicMock
-
-from openjiuwen.core.foundation.tool.base import render_tool_output
+from openjiuwen.core.single_agent.ability_manager import AbilityManager
 from openjiuwen.core.single_agent.agents.react_agent import ReActAgent
 from openjiuwen.harness.tools.base_tool import ToolOutput
 
@@ -21,7 +19,7 @@ def test_tool_message_content_omits_multimodal_payload() -> None:
         },
     )
 
-    assert render_tool_output(result) == "Image file read: /tmp/a.png"
+    assert AbilityManager._build_tool_message_content(result) == "Image file read: /tmp/a.png"
 
 
 def test_react_agent_builds_multimodal_user_message_from_tool_result() -> None:
@@ -131,7 +129,7 @@ def test_react_agent_labels_mcp_sourced_images() -> None:
 
 
 def test_tool_message_content_uses_mcp_tool_result_content() -> None:
-    from openjiuwen.core.foundation.tool import MCPTool, McpToolCard, McpToolResult
+    from openjiuwen.core.foundation.tool import McpToolResult
 
     result = McpToolResult(
         data={
@@ -140,8 +138,7 @@ def test_tool_message_content_uses_mcp_tool_result_content() -> None:
         },
     )
 
-    tool = MCPTool(MagicMock(), McpToolCard(id="srv.get_window_state", name="get_window_state", server_name="srv"))
-    assert tool.render_for_llm(result) == "tree summary"
+    assert AbilityManager._build_tool_message_content(result) == "tree summary"
 
 
 def test_react_agent_detects_image_input_in_messages() -> None:

@@ -391,7 +391,7 @@ class AgentModeRail(DeepAgentRail):
             section = PromptSection(
                 name=SectionName.MODE_INSTRUCTIONS,
                 content={"en": content},
-                priority=84,
+                priority=85,
             )
         else:
             plan_file_path = agent.get_plan_file_path(session)

@@ -97,7 +97,7 @@ def build_session_tools_section(language: str = "cn") -> Optional["PromptSection
     return PromptSection(
         name=SectionName.SESSION_TOOLS,
         content={language: content},
-        priority=82,
+        priority=85,
         category="system_prompt",
     )
 

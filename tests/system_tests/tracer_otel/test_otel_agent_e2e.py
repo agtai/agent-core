@@ -28,7 +28,7 @@ from opentelemetry import trace
 from tests.conftest_otel import _EXPORTER, _OTEL_TRACER, jaeger_is_available
 from openjiuwen.core.session.tracer.tracer import Tracer, TracerHandlerRegistry
 from openjiuwen.core.session.tracer.handler import TracerHandlerName
-from openjiuwen.core.session.agent import create_agent_session
+from openjiuwen.core.session.agent import Session, create_agent_session
 from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAgentConfig
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.core.foundation.tool import ToolCard, LocalFunction
@@ -37,6 +37,8 @@ from openjiuwen.extensions.tracer_otel.config import OtelTracerConfig
 from openjiuwen.extensions.tracer_otel.handler import OtelAgentHandler, OtelWorkflowHandler
 from openjiuwen.extensions.tracer_otel.otel_rail import OtelRail
 from openjiuwen.extensions.tracer_otel.semconv import (
+    GEN_AI_SYSTEM,
+    GEN_AI_SYSTEM_VALUE,
     GEN_AI_OPERATION_NAME,
     GEN_AI_REQUEST_MODEL,
     OJ_AGENT_INVOKE_TYPE,
@@ -201,9 +203,11 @@ class TestE2EAgentWithLLMAndTool:
         # Tool span is auto-generated via decorate_tool_with_trace
         assert len(finished) >= 1
 
-        tool_spans = [s for s in finished if s.name.startswith("execute_tool ")]
+        # Verify tool span exists (name starts with "tool.")
+        tool_spans = [s for s in finished if s.name.startswith("tool.")]
         assert len(tool_spans) >= 1
         for ts in tool_spans:
+            assert ts.attributes.get(GEN_AI_SYSTEM) == GEN_AI_SYSTEM_VALUE
             assert ts.attributes.get(GEN_AI_OPERATION_NAME) == "execute_tool"
             assert ts.attributes.get(OJ_AGENT_INVOKE_TYPE) is not None
             assert ts.attributes.get(OJ_AGENT_NAME) is not None
@@ -246,7 +250,7 @@ class TestE2EAgentWithLLMAndTool:
 
         # No tool spans should be produced (pure conversation)
         finished = _EXPORTER.get_finished_spans()
-        tool_spans = [s for s in finished if s.name.startswith("execute_tool ")]
+        tool_spans = [s for s in finished if s.name.startswith("tool.")]
         assert len(tool_spans) == 0
 
 
@@ -326,14 +330,16 @@ class TestE2EAgentWithOtelRail:
         assert len(chain_spans) >= 1, f"Expected chain span, got: {all_names}"
         chain_span = chain_spans[0]
         assert chain_span.kind == trace.SpanKind.INTERNAL
+        assert chain_span.attributes.get(GEN_AI_SYSTEM) == GEN_AI_SYSTEM_VALUE
         assert chain_span.attributes.get(OJ_AGENT_INVOKE_TYPE) is not None
         assert chain_span.attributes.get(OJ_AGENT_NAME) == "otel_rail_agent"
 
         # LLM child span (OtelRail.before_model_call → on_llm_start)
-        llm_spans = [s for s in finished if s.attributes.get(GEN_AI_OPERATION_NAME) == "chat"]
+        llm_spans = [s for s in finished if s.name.startswith("llm.")]
         assert len(llm_spans) >= 1, f"Expected llm span, got: {all_names}"
         llm_span = llm_spans[0]
         assert llm_span.kind == trace.SpanKind.CLIENT
+        assert llm_span.attributes.get(GEN_AI_SYSTEM) == GEN_AI_SYSTEM_VALUE
         assert llm_span.attributes.get(GEN_AI_OPERATION_NAME) == "chat"
         assert llm_span.attributes.get(GEN_AI_REQUEST_MODEL) is not None
 
@@ -389,7 +395,8 @@ class TestE2EAgentSpanViaTracerTrigger:
         llm_spans = [s for s in finished if s.kind == trace.SpanKind.CLIENT]
         assert len(llm_spans) >= 1
         for ls in llm_spans:
-            assert ls.name.startswith("chat")
+            assert ls.name.startswith("llm.")
+            assert ls.attributes.get(GEN_AI_SYSTEM) == GEN_AI_SYSTEM_VALUE
             assert ls.attributes.get(GEN_AI_OPERATION_NAME) == "chat"
             assert ls.attributes.get(GEN_AI_REQUEST_MODEL) is not None
 
@@ -419,10 +426,11 @@ class TestE2EAgentSpanViaTracerTrigger:
         assert len(finished) >= 1
 
         # Verify tool span attributes
-        tool_spans = [s for s in finished if s.name.startswith("execute_tool ")]
+        tool_spans = [s for s in finished if s.name.startswith("tool.")]
         assert len(tool_spans) >= 1
         for ts in tool_spans:
             assert ts.kind == trace.SpanKind.INTERNAL
+            assert ts.attributes.get(GEN_AI_SYSTEM) == GEN_AI_SYSTEM_VALUE
             assert ts.attributes.get(GEN_AI_OPERATION_NAME) == "execute_tool"
             assert ts.attributes.get(OJ_AGENT_INVOKE_TYPE) is not None
             assert ts.attributes.get(OJ_AGENT_NAME) is not None
@@ -499,7 +507,7 @@ class TestE2EAgentJaegerIntegration:
         span_names = _query_jaeger_traces("openjiuwen")
 
         # Expect tool span names (LLM spans not auto-generated via agent invoke)
-        tool_span_names = [s for s in span_names if s.startswith("execute_tool ")]
+        tool_span_names = [s for s in span_names if s.startswith("tool.")]
         assert len(tool_span_names) >= 1, (
             f"Expected at least 1 tool span in Jaeger. Found: {span_names}"
         )

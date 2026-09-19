@@ -333,6 +333,6 @@ def build_tools_section(
     return PromptSection(
         name=SectionName.TOOLS,
         content={language: content},
-        priority=30,
+        priority=40,
         category="tools",
     )

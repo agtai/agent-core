@@ -31,10 +31,10 @@ if TYPE_CHECKING:
 
 # ---------------------------------------------------------------------------
 # Section priority
-# Priority 96: late in the assembled prompt, before the verification reminder.
+# Priority 88: after task_tool / plan_mode (85), before todo (90).
 # Sits near the end of the assembled prompt so it reads as a "last reminder".
 # ---------------------------------------------------------------------------
-_CONTRACT_PRIORITY = 96
+_CONTRACT_PRIORITY = 88
 
 # ---------------------------------------------------------------------------
 # Section content

@@ -52,10 +52,12 @@ def _finished_child_span() -> ReadableSpan:
     parent = tracer.start_span("agent.run")
     child = tracer.start_span("llm.call", context=set_span_in_context(parent))
     child.set_attribute("gen_ai.conversation.id", "conversation")
+    child.set_attribute("openjiuwen.session.id", "openjiuwen-session")
+    child.set_attribute("session.id", "legacy-session")
     child.set_attribute("openjiuwen.request.id", "request")
     child.set_attribute("openjiuwen.run.id", "run")
     child.set_attribute("openjiuwen.agent.mode", "agent.plan")
-    child.set_attribute("openjiuwen.trajectory.schema_version", "2")
+    child.set_attribute("openjiuwen.trace.schema_version", "1")
     child.set_attribute("openjiuwen.execution.subject.id", "subagent:one")
     child.set_attribute("openjiuwen.execution.subject.display_name", "Explore Agent")
     child.set_attribute("openjiuwen.execution.subject.kind", "subagent")
@@ -83,7 +85,7 @@ def test_processor_delivers_exact_file_exporter_bytes_and_hints() -> None:
     assert record.request_id == "request"
     assert record.run_id == "run"
     assert record.agent_mode == "agent.plan"
-    assert record.schema_version == "2"
+    assert record.schema_version == "1"
     assert record.execution_subject_id == "subagent:one"
     assert record.execution_subject_display_name == "Explore Agent"
     assert record.execution_subject_kind == "subagent"
@@ -133,15 +135,11 @@ def test_no_consumer_skips_encoding(monkeypatch) -> None:
 
     processor = SpanRecordProcessor()
 
-    def fail_encoding(span):
+    def fail_encoding(span) -> bytes:
         del span
         raise AssertionError("encoder should not be called")
 
-    monkeypatch.setattr(
-        processor_module,
-        "encode_span_with_addressed_sequences",
-        fail_encoding,
-    )
+    monkeypatch.setattr(processor_module, "encode_span_to_otlp_json", fail_encoding)
     processor.on_end(_finished_child_span())
 
 
@@ -233,65 +231,10 @@ def test_failing_snapshot_consumer_does_not_block_following_consumer() -> None:
     assert len(consumer.records) == 1
 
 
-def test_delivery_defers_encoding_until_the_payload_is_read(monkeypatch) -> None:
+def test_unregister_waits_for_encoder_lease_before_sink_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import openjiuwen.extensions.observability.span_record_processor as processor_module
-
-    encode_calls: list[ReadableSpan] = []
-    original_encoder = processor_module.encode_span_with_addressed_sequences
-
-    def counting_encoder(span: ReadableSpan):
-        encode_calls.append(span)
-        return original_encoder(span)
-
-    monkeypatch.setattr(
-        processor_module,
-        "encode_span_with_addressed_sequences",
-        counting_encoder,
-    )
-    processor = SpanRecordProcessor()
-    consumer = _Consumer()
-    processor.register_consumer(consumer)
-
-    processor.on_end(_finished_child_span())
-
-    assert len(consumer.records) == 1
-    assert encode_calls == [], "delivery must not encode on the calling thread"
-
-    payload = consumer.records[0].raw_json
-    assert len(encode_calls) == 1
-    assert consumer.records[0].raw_json is payload, "payload must be cached"
-    assert len(encode_calls) == 1
-
-
-def test_snapshot_payload_is_frozen_at_capture_time() -> None:
-    processor = SpanRecordProcessor()
-    consumer = _SnapshotConsumer()
-    processor.register_consumer(consumer)
-    provider = TracerProvider()
-    provider.add_span_processor(processor)
-    tracer = provider.get_tracer("span-record-freeze-test")
-
-    span = tracer.start_span("llm.call")
-    span.add_event("first.chunk")
-    processor.publish_snapshot(span, "stream_chunk")
-    captured = consumer.snapshots[-1]
-
-    # Mutate and end the span before the payload is ever read. A deferred
-    # encode must still describe the span as it was at capture time.
-    span.add_event("second.chunk")
-    span.set_attribute("gen_ai.request.model", "late-model")
-    span.end()
-
-    captured_span = json.loads(captured.raw_json)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-    assert [event["name"] for event in captured_span["events"]] == ["first.chunk"]
-    assert "endTimeUnixNano" not in captured_span
-    attribute_keys = {item["key"] for item in captured_span.get("attributes", ())}
-    assert "gen_ai.request.model" not in attribute_keys
-
-
-def test_unregister_waits_for_consumer_lease_before_sink_close() -> None:
-    consume_started = threading.Event()
-    allow_consume = threading.Event()
 
     class _ClosingSink:
         def __init__(self) -> None:
@@ -302,9 +245,6 @@ def test_unregister_waits_for_consumer_lease_before_sink_close() -> None:
 
         def consume(self, record: OtlpSpanRecord) -> None:
             del record
-            consume_started.set()
-            if not allow_consume.wait(timeout=1):
-                raise TimeoutError("test consumer was not released")
             if self.closed:
                 self.dropped += 1
                 self.events.append("dropped")
@@ -321,9 +261,18 @@ def test_unregister_waits_for_consumer_lease_before_sink_close() -> None:
     following_consumer = _Consumer()
     processor.register_consumer(sink)
     processor.register_consumer(following_consumer)
+    encoding_started = threading.Event()
+    allow_encoding = threading.Event()
     unregister_started = threading.Event()
     unregister_returned = threading.Event()
     failures: list[BaseException] = []
+    original_encoder = processor_module.encode_span_to_otlp_json
+
+    def blocking_encoder(span: ReadableSpan) -> bytes:
+        encoding_started.set()
+        if not allow_encoding.wait(timeout=1):
+            raise TimeoutError("test encoder was not released")
+        return original_encoder(span)
 
     def deliver() -> None:
         try:
@@ -341,17 +290,18 @@ def test_unregister_waits_for_consumer_lease_before_sink_close() -> None:
         finally:
             unregister_returned.set()
 
+    monkeypatch.setattr(processor_module, "encode_span_to_otlp_json", blocking_encoder)
     delivery_thread = threading.Thread(target=deliver)
     unregister_thread = threading.Thread(target=unregister_and_close)
     delivery_thread.start()
-    assert consume_started.wait(timeout=1)
+    assert encoding_started.wait(timeout=1)
     unregister_thread.start()
     assert unregister_started.wait(timeout=1)
     assert not unregister_returned.wait(timeout=0.05)
     with pytest.raises(RuntimeError, match="unregister is still in progress"):
         processor.register_consumer(sink)
 
-    allow_consume.set()
+    allow_encoding.set()
     delivery_thread.join(timeout=1)
     unregister_thread.join(timeout=1)
 

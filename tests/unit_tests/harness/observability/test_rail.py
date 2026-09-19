@@ -28,6 +28,7 @@ from openjiuwen.extensions.observability import span_context as shared_span_cont
 from openjiuwen.extensions.observability.callback_handler import OtelCallbackHandler
 from openjiuwen.extensions.observability.config import ObservabilityConfig
 from openjiuwen.extensions.observability.semconv import (
+    DA_AGENT_NAME,
     DA_TASK_ITERATION,
     GEN_AI_AGENT_DESCRIPTION,
     GEN_AI_AGENT_ID,
@@ -38,8 +39,15 @@ from openjiuwen.extensions.observability.semconv import (
     GEN_AI_TOOL_CALL_ARGUMENTS,
     GEN_AI_TOOL_CALL_ID,
     GEN_AI_TOOL_CALL_RESULT,
+    GEN_AI_TOOL_ID,
+    GEN_AI_TOOL_INPUT,
     GEN_AI_TOOL_NAME,
-    GEN_AI_TOOL_TYPE,
+    GEN_AI_TOOL_OUTPUT,
+    LANGFUSE_SESSION_ID,
+    AT_SESSION_ID,
+    LANGFUSE_OBSERVATION_INPUT,
+    LANGFUSE_OBSERVATION_OUTPUT,
+    LANGFUSE_OBSERVATION_TYPE,
     OJ_REQUEST_ID,
     OJ_EXECUTION_SUBJECT_DISPLAY_NAME,
     OJ_EXECUTION_SUBJECT_ID,
@@ -48,19 +56,18 @@ from openjiuwen.extensions.observability.semconv import (
     OJ_EXECUTION_SUBJECT_SESSION_ID,
     OJ_REQUEST_NUMBER,
     OJ_RUN_ID,
+    OJ_SESSION_ID,
     OJ_SPAN_FORCED_CLOSE,
     OJ_SPAN_FORCED_CLOSE_REASON,
-    OJ_SPAN_INPUT,
-    OJ_SPAN_OUTPUT,
     OJ_INFERENCE_ID,
     OJ_STEP_ID,
     OJ_STEP_NUMBER,
     OJ_TOOL_AUTHORITATIVE,
-    OJ_TOOL_PROTOCOL,
     OJ_TOOL_RESOURCE_ID,
+    OJ_TOOL_TYPE,
     OJ_TRACE_ROOT,
     OJ_TRACE_FORCED_CLOSE,
-    OJ_TRAJECTORY_SCHEMA_VERSION,
+    OJ_TRACE_SCHEMA_VERSION,
     OJ_TRAJECTORY_RECORD_KIND,
     OJ_TURN_ID,
 )
@@ -91,6 +98,7 @@ def tracing():
     shared_span_context.reset_state()
     root = tracer.start_span("run.root")
     root.set_attribute(GEN_AI_CONVERSATION_ID, "conversation")
+    root.set_attribute(OJ_SESSION_ID, "session")
     root.set_attribute(OJ_REQUEST_ID, "request")
     root.set_attribute(OJ_RUN_ID, "run")
     root.set_attribute(OJ_TRACE_ROOT, True)
@@ -125,19 +133,6 @@ def _iteration_ctx(agent, *, iteration: int = 1, query: str = "do it"):
 
 
 def _finished(exporter: InMemorySpanExporter, name: str):
-    if name == "llm.call":
-        return [
-            span for span in exporter.get_finished_spans()
-            if span.attributes.get(GEN_AI_OPERATION_NAME) == "chat"
-        ]
-    if name.startswith("tool."):
-        tool_name = name.removeprefix("tool.")
-        semantic = [
-            span for span in exporter.get_finished_spans()
-            if span.attributes.get(GEN_AI_OPERATION_NAME) == "execute_tool"
-            and span.attributes.get(GEN_AI_TOOL_NAME) == tool_name
-        ]
-        return semantic or [span for span in exporter.get_finished_spans() if span.name == name]
     return [span for span in exporter.get_finished_spans() if span.name == name]
 
 
@@ -155,7 +150,8 @@ async def test_iteration_span_opens_under_the_run_root_and_carries_generic_attri
     assert len(spans) == 1
     span = spans[0]
     assert span.parent.span_id == tracing.root.context.span_id
-    assert span.attributes[OJ_TRAJECTORY_RECORD_KIND] == "agent"
+    assert span.attributes[LANGFUSE_OBSERVATION_TYPE] == "agent"
+    assert span.attributes[DA_AGENT_NAME] == "solo"
     assert span.attributes[DA_TASK_ITERATION] == 1
     assert span.attributes[GEN_AI_AGENT_NAME] == "solo"
     assert span.attributes[GEN_AI_AGENT_ID] == "agent-solo"
@@ -163,13 +159,15 @@ async def test_iteration_span_opens_under_the_run_root_and_carries_generic_attri
     assert GEN_AI_AGENT_VERSION not in span.attributes
     assert span.attributes[GEN_AI_CONVERSATION_ID] == "conversation"
     assert span.attributes[GEN_AI_OPERATION_NAME] == "invoke_agent"
+    assert span.attributes[OJ_SESSION_ID] == "session"
     assert span.attributes[OJ_REQUEST_ID] == "request"
     assert span.attributes[OJ_RUN_ID] == "run"
     assert OJ_STEP_ID not in span.attributes
     assert OJ_STEP_NUMBER not in span.attributes
-    assert span.attributes[OJ_TRAJECTORY_SCHEMA_VERSION] == "2"
-    assert span.attributes[OJ_SPAN_INPUT] == "do it"
-    assert span.attributes[OJ_SPAN_OUTPUT] == "the answer"
+    assert span.attributes[OJ_TRACE_SCHEMA_VERSION] == "1"
+    assert span.attributes[OJ_TRAJECTORY_RECORD_KIND] == "agent"
+    assert span.attributes[LANGFUSE_OBSERVATION_INPUT] == "do it"
+    assert span.attributes[LANGFUSE_OBSERVATION_OUTPUT] == "the answer"
     assert not [key for key in span.attributes if key.startswith("agentteam.")]
 
 
@@ -178,7 +176,7 @@ async def test_each_llm_request_keeps_identity_parent_and_owning_step(tracing):
     tracing.root.set_attribute(OJ_TURN_ID, "turn-7")
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True, max_attributes=40),
+        ObservabilityConfig(enabled=True, backend="otlp", max_attributes=40),
         tracer=tracing.tracer,
     )
     ctx = _iteration_ctx(_agent(), iteration=3)
@@ -299,7 +297,7 @@ async def test_single_round_agent_gets_an_invoke_span(tracing):
 
     spans = _finished(tracing.exporter, "agent.explore_agent.invoke")
     assert len(spans) == 1
-    assert spans[0].attributes[OJ_SPAN_OUTPUT] == "found it"
+    assert spans[0].attributes[LANGFUSE_OBSERVATION_OUTPUT] == "found it"
 
 
 @pytest.mark.asyncio
@@ -326,7 +324,7 @@ async def test_subagent_invoke_nests_under_the_dispatching_agent_span(tracing):
 
     subagent_rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     subagent_ctx = AgentCallbackContext(
@@ -577,76 +575,18 @@ async def test_ability_tool_span_is_authoritative_and_carries_old_and_new_fields
     assert span.parent.span_id == step_span.context.span_id
     assert span.attributes[GEN_AI_OPERATION_NAME] == "execute_tool"
     assert span.attributes[GEN_AI_TOOL_NAME] == "search"
+    assert span.attributes[GEN_AI_TOOL_ID] == "resource-search"
     assert span.attributes[GEN_AI_TOOL_CALL_ID] == "call-1"
+    assert span.attributes[GEN_AI_TOOL_INPUT] == '{"q":"hello"}'
     assert span.attributes[GEN_AI_TOOL_CALL_ARGUMENTS] == '{"q":"hello"}'
     assert span.attributes[GEN_AI_TOOL_CALL_RESULT] == '{"answer": 42}'
     assert span.attributes[GEN_AI_AGENT_ID] == "agent-solo"
     assert span.attributes[GEN_AI_AGENT_DESCRIPTION] == "solo description"
     assert span.attributes[OJ_TOOL_AUTHORITATIVE] is True
     assert span.attributes[OJ_TOOL_RESOURCE_ID] == "resource-search"
-    assert span.attributes[GEN_AI_TOOL_TYPE] == "extension"
+    assert span.attributes[OJ_TOOL_TYPE] == "tool"
     assert span.attributes[OJ_STEP_ID] == f"{step_span.context.span_id:016x}"
     assert span.attributes[OJ_STEP_NUMBER] == 2
-
-
-@pytest.mark.asyncio
-async def test_team_member_tool_span_is_authoritative_and_states_its_call_id(tracing):
-    """A Team root is not a trace root, and its members' tools still get the span.
-
-    Team members used to fall back to the global tool callback span, which
-    never sees the model's tool call and so stated no call id; nothing could
-    join the call to the tool message the model read for it.
-    """
-    team_root = tracing.tracer.start_span("team.marketing")
-    team_root.set_attribute(GEN_AI_CONVERSATION_ID, "conversation")
-    team_root.set_attribute(OJ_EXECUTION_SUBJECT_ID, "team-member:conversation:marketing:leader")
-    team_root.set_attribute(OJ_EXECUTION_SUBJECT_DISPLAY_NAME, "Team Leader")
-    team_root.set_attribute(OJ_EXECUTION_SUBJECT_KIND, "team_leader")
-    team_root.set_attribute(OJ_EXECUTION_SUBJECT_SESSION_ID, "conversation")
-    shared_span_context.set_root_span(team_root)
-    card = ToolCard(id="resource-search", name="search", description="Search documents")
-    agent = _agent("leader")
-    agent.ability_manager = SimpleNamespace(get=lambda name: card)
-    rail = AgentObservabilityRail(tracer=tracing.tracer)
-    handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
-        tracer=tracing.tracer,
-    )
-    iteration_ctx = _iteration_ctx(agent)
-    await rail.before_task_iteration(iteration_ctx)
-    model_ctx = AgentCallbackContext(
-        agent=agent,
-        inputs=ModelCallInputs(react_iteration=1),
-        extra=iteration_ctx.extra,
-    )
-    await rail.before_model_call(model_ctx)
-    step_span = shared_span_context.get_current_agent_span()
-
-    # The real order: the ability hook opens the span, then the tool's own
-    # lifecycle callbacks fire inside its invocation.
-    ctx = _tool_ctx(agent, call_id="call-team-1")
-    await rail.before_tool_call(ctx)
-    await handler.on_tool_call_started(
-        tool_name="search",
-        tool_id="resource-search",
-        inputs=(({"q": "hello"},), {}),
-    )
-    await handler.on_tool_call_finished(tool_name="search", result={"answer": 42})
-    ctx.inputs.tool_result = {"answer": 42}
-    await rail.after_tool_call(ctx)
-    await rail.after_task_iteration(iteration_ctx)
-    team_root.end()
-
-    spans = _finished(tracing.exporter, "tool.search")
-    assert len(spans) == 1
-    span = spans[0]
-    assert span.parent.span_id == step_span.context.span_id
-    assert span.attributes[OJ_TOOL_AUTHORITATIVE] is True
-    assert span.attributes[GEN_AI_TOOL_CALL_ID] == "call-team-1"
-    assert span.attributes[GEN_AI_CONVERSATION_ID] == "conversation"
-    assert span.attributes[OJ_EXECUTION_SUBJECT_ID] == "team-member:conversation:marketing:leader"
-    assert span.attributes[OJ_EXECUTION_SUBJECT_KIND] == "team_leader"
-    assert span.attributes[OJ_STEP_ID] == f"{step_span.context.span_id:016x}"
 
 
 @pytest.mark.asyncio
@@ -672,7 +612,7 @@ async def test_iteration_and_tool_publish_live_snapshots_before_they_end(
 
     assert [(span.name, kind, recording) for span, kind, recording in published] == [
         ("agent.solo.task_iteration.1", "attributes", True),
-            ("execute_tool search", "attributes", True),
+        ("tool.search", "attributes", True),
     ]
     tool_ctx.inputs.tool_result = "done"
     await rail.after_tool_call(tool_ctx)
@@ -705,7 +645,7 @@ async def test_llm_child_context_propagation_inherits_agent_card_identity(tracin
     agent = _agent()
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     iteration_ctx = _iteration_ctx(agent)
@@ -728,7 +668,7 @@ async def test_subagent_ambient_session_does_not_replace_trajectory_owner(tracin
     agent = _agent("explore_agent", enable_task_loop=False)
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     ctx = AgentCallbackContext(
@@ -754,7 +694,10 @@ async def test_subagent_ambient_session_does_not_replace_trajectory_owner(tracin
         await rail.after_invoke(ctx)
 
     span = _finished(tracing.exporter, "llm.child")[0]
-    assert span.attributes[GEN_AI_CONVERSATION_ID] == "conversation"
+    assert span.attributes[OJ_SESSION_ID] == "session"
+    assert span.attributes[GEN_AI_CONVERSATION_ID] == "session"
+    assert span.attributes[LANGFUSE_SESSION_ID] == "session"
+    assert span.attributes[AT_SESSION_ID] == "session"
     assert span.attributes[OJ_EXECUTION_SUBJECT_SESSION_ID] == "session_sub_explore_1"
 
 
@@ -818,7 +761,7 @@ async def test_concrete_tool_global_callbacks_enrich_without_duplicate_span(trac
     agent.ability_manager = SimpleNamespace(get=lambda name: card)
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     iteration_ctx = _iteration_ctx(agent)
@@ -839,6 +782,7 @@ async def test_concrete_tool_global_callbacks_enrich_without_duplicate_span(trac
     spans = _finished(tracing.exporter, "tool.search")
     assert len(spans) == 1
     assert spans[0].attributes[GEN_AI_TOOL_CALL_ID] == "call-global"
+    assert spans[0].attributes[GEN_AI_TOOL_ID] == "resource-search"
 
 
 @pytest.mark.asyncio
@@ -853,7 +797,7 @@ async def test_mcp_raw_lifecycle_name_enriches_model_facing_authoritative_span(t
     )
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     iteration_ctx = _iteration_ctx(agent)
@@ -875,10 +819,7 @@ async def test_mcp_raw_lifecycle_name_enriches_model_facing_authoritative_span(t
     await rail.after_tool_call(ctx)
     await rail.after_task_iteration(iteration_ctx)
 
-    authoritative = _finished(tracing.exporter, f"tool.{model_name}")
-    assert len(authoritative) == 1
-    assert authoritative[0].attributes[GEN_AI_TOOL_TYPE] == "extension"
-    assert authoritative[0].attributes[OJ_TOOL_PROTOCOL] == "mcp"
+    assert len(_finished(tracing.exporter, f"tool.{model_name}")) == 1
     assert _finished(tracing.exporter, "tool.browser_navigate") == []
 
 
@@ -890,7 +831,7 @@ async def test_non_mcp_name_mismatch_does_not_match_by_resource_id(tracing):
     agent.ability_manager = SimpleNamespace(get=lambda name: card)
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     iteration_ctx = _iteration_ctx(agent)
@@ -936,8 +877,9 @@ async def test_a_raised_tool_call_still_records_the_result_the_model_saw(tracing
     span = _finished(tracing.exporter, "tool.search")[0]
     assert span.status.status_code.name == "ERROR"
     assert span.attributes["error.type"] == "ValueError"
+    assert span.attributes[GEN_AI_TOOL_OUTPUT] == "Ability execution error: bad tool"
     assert span.attributes[GEN_AI_TOOL_CALL_RESULT] == "Ability execution error: bad tool"
-    assert span.attributes[OJ_SPAN_OUTPUT] == "Ability execution error: bad tool"
+    assert span.attributes[LANGFUSE_OBSERVATION_OUTPUT] == "Ability execution error: bad tool"
 
 
 @pytest.mark.asyncio
@@ -960,7 +902,7 @@ async def test_a_result_reporting_failure_closes_the_span_as_an_error(tracing):
     assert span.status.status_code.name == "ERROR"
     assert span.status.description == "exit code 1"
     assert span.attributes["error.type"] == TOOL_REPORTED_FAILURE
-    assert "exit code 1" in span.attributes[GEN_AI_TOOL_CALL_RESULT]
+    assert "exit code 1" in span.attributes[GEN_AI_TOOL_OUTPUT]
 
 
 @pytest.mark.asyncio
@@ -1028,14 +970,11 @@ async def test_a_succeeding_result_still_closes_the_span_as_ok(tracing):
 
 @pytest.mark.asyncio
 async def test_the_global_tool_callbacks_also_read_failure_from_the_result(tracing):
-    """A tool run outside any ability hook owns its span in the callback handler.
-
-    That span needs the same failure reading as the authoritative one.
-    """
+    """Team mode owns the span in the callback handler; it needs the same reading."""
     agent = _agent()
     rail = AgentObservabilityRail(tracer=tracing.tracer)
     handler = OtelCallbackHandler(
-        ObservabilityConfig(enabled=True),
+        ObservabilityConfig(enabled=True, backend="otlp"),
         tracer=tracing.tracer,
     )
     iteration_ctx = _iteration_ctx(agent)
@@ -1056,130 +995,3 @@ async def test_the_global_tool_callbacks_also_read_failure_from_the_result(traci
     assert span.status.status_code.name == "ERROR"
     assert span.status.description == "exit code 1"
     assert span.attributes["error.type"] == TOOL_REPORTED_FAILURE
-
-
-class _StateSession:
-    """Session exposing just the state API the rail persists Step identity in."""
-
-    def __init__(self, state=None):
-        self._state = dict(state or {})
-
-    def get_session_id(self):
-        """Return this session's id."""
-        return "session"
-
-    def update_state(self, data):
-        """Merge *data* into the session state."""
-        self._state.update(data)
-
-    def get_state(self, key=None):
-        """Return the value stored under *key*."""
-        return self._state.get(key)
-
-
-def _resume_tool_ctx(
-    agent,
-    *,
-    call_id: str,
-    react_iteration: int,
-    session=None,
-    tool_name: str = "search",
-):
-    """A tool call carrying the step number its interrupted iteration had."""
-    return AgentCallbackContext(
-        agent=agent,
-        inputs=ToolCallInputs(
-            tool_call=ToolCall(
-                id=call_id,
-                type="function",
-                name=tool_name,
-                arguments='{"q":"hello"}',
-            ),
-            tool_name=tool_name,
-            tool_args='{"q":"hello"}',
-            react_iteration=react_iteration,
-        ),
-        session=session,
-        extra={},
-    )
-
-
-@pytest.mark.asyncio
-async def test_replayed_tool_keeps_the_step_the_interrupt_paused(tracing):
-    """A HITL resume finishes its step's tools before any step span reopens.
-
-    The resume runs as its own request, so the only parent available is the run
-    root, which carries no step number. Falling back to the iteration the tool
-    call carries is what keeps the replayed work in the step it belongs to
-    instead of reading as the turn's first step.
-    """
-    card = ToolCard(id="resource-search", name="search", description="Search documents")
-    agent = _agent()
-    agent.ability_manager = SimpleNamespace(get=lambda name: card)
-    rail = AgentObservabilityRail(tracer=tracing.tracer)
-
-    session = _StateSession({
-        rail_module.OPEN_STEP_STATE_KEY: {"step_id": "step-paused", "step_number": 4},
-    })
-
-    ctx = _resume_tool_ctx(agent, call_id="call-resume", react_iteration=4, session=session)
-    await rail.before_tool_call(ctx)
-    ctx.inputs.tool_result = {"answer": 42}
-    await rail.after_tool_call(ctx)
-
-    span = _finished(tracing.exporter, "tool.search")[0]
-    assert span.parent.span_id == tracing.root.context.span_id
-    assert span.attributes[OJ_STEP_NUMBER] == 4
-    assert span.attributes[OJ_STEP_ID] == "step-paused"
-
-
-@pytest.mark.asyncio
-async def test_an_open_step_still_owns_the_number_its_tools_report(tracing):
-    """The fallback must not override a real step span's number."""
-    card = ToolCard(id="resource-search", name="search", description="Search documents")
-    agent = _agent()
-    agent.ability_manager = SimpleNamespace(get=lambda name: card)
-    rail = AgentObservabilityRail(tracer=tracing.tracer)
-    iteration_ctx = _iteration_ctx(agent)
-    await rail.before_task_iteration(iteration_ctx)
-    model_ctx = AgentCallbackContext(
-        agent=agent,
-        inputs=ModelCallInputs(react_iteration=2),
-        extra=iteration_ctx.extra,
-    )
-    await rail.before_model_call(model_ctx)
-
-    # A stale iteration on the tool call must lose to the open step span.
-    ctx = _resume_tool_ctx(agent, call_id="call-open", react_iteration=99)
-    await rail.before_tool_call(ctx)
-    ctx.inputs.tool_result = {"answer": 42}
-    await rail.after_tool_call(ctx)
-    await rail.after_task_iteration(iteration_ctx)
-
-    span = _finished(tracing.exporter, "tool.search")[0]
-    assert span.attributes[OJ_STEP_NUMBER] == 2
-
-
-@pytest.mark.asyncio
-async def test_opening_a_step_publishes_the_identity_a_resume_reads(tracing):
-    """The Step span states its identity; the session carries it to the resume."""
-    agent = _agent()
-    rail = AgentObservabilityRail(tracer=tracing.tracer)
-    session = _StateSession()
-    iteration_ctx = _iteration_ctx(agent)
-    await rail.before_task_iteration(iteration_ctx)
-    model_ctx = AgentCallbackContext(
-        agent=agent,
-        inputs=ModelCallInputs(react_iteration=4),
-        session=session,
-        extra=iteration_ctx.extra,
-    )
-    await rail.before_model_call(model_ctx)
-    step_span = shared_span_context.get_current_agent_span()
-    await rail.after_task_iteration(iteration_ctx)
-
-    published = session.get_state(rail_module.OPEN_STEP_STATE_KEY)
-    assert published == {
-        "step_id": f"{step_span.context.span_id:016x}",
-        "step_number": 4,
-    }

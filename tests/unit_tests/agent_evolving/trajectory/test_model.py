@@ -155,19 +155,30 @@ def test_schema_exposes_canonical_and_rl_fields_only() -> None:
         assert hasattr(schema, name)
 
 
-def test_legacy_trajectory_modules_are_gone() -> None:
-    import importlib
+def test_migration_semantic_keys_are_isolated_from_current_conventions() -> None:
+    from openjiuwen.agent_evolving.trajectory import legacy_semconv
+    from openjiuwen.extensions.observability import semconv as observability_semconv
 
-    for name in ("legacy", "legacy_semconv"):
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module(f"openjiuwen.agent_evolving.trajectory.{name}")
+    migration_keys = (
+        "LEGACY_GEN_AI_INPUT_MESSAGES",
+        "LEGACY_GEN_AI_OUTPUT_MESSAGES",
+        "LEGACY_GEN_AI_TOOL_CALL_ID",
+        "LEGACY_GEN_AI_TOOL_CALL_ARGUMENTS",
+        "LEGACY_GEN_AI_TOOL_CALL_RESULT",
+        "LEGACY_GEN_AI_USAGE_INPUT_TOKENS",
+        "LEGACY_GEN_AI_USAGE_OUTPUT_TOKENS",
+        "LEGACY_TRAJECTORY_STEP_KIND",
+        "LEGACY_STEP_META",
+    )
+    assert all(hasattr(legacy_semconv, name) for name in migration_keys)
+    assert all(not hasattr(observability_semconv, name) for name in migration_keys)
 
 
 def test_schema_team_identity_values_match_observability_without_runtime_dependency() -> None:
     from openjiuwen.extensions.observability import semconv
 
-    assert MEMBER_ID == semconv.AT_MEMBER_NAME
-    assert SESSION_ID == semconv.GEN_AI_CONVERSATION_ID
+    assert MEMBER_ID == semconv.AT_MEMBER_ID
+    assert SESSION_ID == semconv.AT_SESSION_ID
     assert TEAM_ID == semconv.AT_TEAM_ID
 
 

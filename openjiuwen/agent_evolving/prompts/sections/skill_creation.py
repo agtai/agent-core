@@ -187,7 +187,7 @@ def build_skill_creation_guidance_section(language: str = "cn") -> PromptSection
     return PromptSection(
         name=SectionName.SKILL_CREATION_GUIDANCE,
         content={"cn": SKILL_CREATION_GUIDANCE_CN, "en": SKILL_CREATION_GUIDANCE_EN},
-        priority=106,
+        priority=88,
         category="skills",
     )
 
@@ -196,7 +196,7 @@ def build_team_skill_creation_guidance_section(language: str = "cn") -> PromptSe
     return PromptSection(
         name=SectionName.TEAM_SKILL_CREATION_GUIDANCE,
         content={"cn": TEAM_SKILL_CREATION_GUIDANCE_CN, "en": TEAM_SKILL_CREATION_GUIDANCE_EN},
-        priority=108,
+        priority=88,
         category="skills",
     )
 
@@ -206,7 +206,7 @@ def build_team_skill_creation_nudge_section(skills_dir: str, language: str = "cn
     return PromptSection(
         name=SectionName.TEAM_SKILL_CREATION_NUDGE,
         content={"cn": TEAM_SKILL_CREATION_NUDGE_CN, "en": TEAM_SKILL_CREATION_NUDGE_EN},
-        priority=109,
+        priority=89,
         category="skills",
     )
 

@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from openjiuwen.symphony.observation.contracts import (
-    GRAPH_EVOLUTION_INPUT_SCHEMA,
     EvidenceStrength,
     FailureDomain,
     GraphEvolutionInput,
@@ -20,10 +19,11 @@ from openjiuwen.symphony.observation.contracts import (
     TaskOutcomeLabel,
 )
 from openjiuwen.symphony.observation.identity import (
-    POINT_EDGE_IDENTITY_SCHEMA,
+    EdgeIdentity,
     StaticGraphIndex,
     build_static_graph_index,
     edge_identity_from_observation,
+    stable_hash,
 )
 from openjiuwen.symphony.observation.store import EvidenceStore, RevisionStore
 from openjiuwen.symphony.orchestration.artifacts import GraphArtifactStore
@@ -255,21 +255,29 @@ class GraphObservationService:
             reasons.append("trace_quality_flags")
         if value.task.outcome.evidence_strength != EvidenceStrength.STRONG:
             reasons.append("outcome_not_strong")
-        if not static_index.validates_nodes(value.execution_graph.nodes):
+        elif not value.task.outcome.evidence_refs:
+            reasons.append("strong_outcome_missing_evidence_ref")
+        if not static_index.validates_capabilities(value.capabilities):
             reasons.append("capability_identity_mismatch")
+        if value.task.outcome.label == TaskOutcomeLabel.VERIFIED_SUCCESS and any(
+            edge.metadata.success is False for edge in value.execution_graph.edges
+        ):
+            reasons.append("task_edge_outcome_conflict")
         snapshot_reason = self._snapshot_reference_reason(value)
         if snapshot_reason:
             reasons.append(snapshot_reason)
 
+        capabilities = value.capabilities
         normalized_edges = []
         for edge in value.execution_graph.edges:
-            identity = edge_identity_from_observation(edge, static_index)
+            identity = edge_identity_from_observation(edge, capabilities, static_index)
             if identity is None:
                 continue
             outcome = self._edge_outcome(
                 value,
                 edge.metadata.success,
                 edge.metadata.failure_domain,
+                bool(edge.metadata.evidence_refs),
             )
             if outcome is None:
                 continue
@@ -278,6 +286,7 @@ class GraphObservationService:
                     **identity.to_dict(),
                     "edge_identity": identity.identity_hash,
                     "outcome": outcome,
+                    "evidence_refs": sorted(set(edge.metadata.evidence_refs)),
                     "observed_as_static": identity.identity_hash in static_index.edges_by_identity,
                 }
             )
@@ -301,6 +310,7 @@ class GraphObservationService:
                 "failure_domain": (
                     value.task.outcome.failure_domain.value if value.task.outcome.failure_domain is not None else None
                 ),
+                "evidence_refs": sorted(set(value.task.outcome.evidence_refs)),
             },
             "task_cluster_id": value.task.task_cluster_id,
             "edges": normalized_edges,
@@ -331,12 +341,13 @@ class GraphObservationService:
         value: GraphEvolutionInput,
         edge_success: bool | None,
         edge_failure_domain: FailureDomain | None,
+        has_edge_evidence: bool,
     ) -> str | None:
         if value.task.outcome.label == TaskOutcomeLabel.VERIFIED_SUCCESS:
-            return "success" if edge_success is True else None
+            return "success" if edge_success is True and has_edge_evidence else None
         if value.task.outcome.label != TaskOutcomeLabel.VERIFIED_FAILURE:
             return None
-        is_explicit_failure = edge_success is False
+        is_explicit_failure = edge_success is False and has_edge_evidence
         if not is_explicit_failure:
             return None
         is_orchestration_failure = (
@@ -351,8 +362,6 @@ class GraphObservationService:
         payload: Mapping[str, Any],
         static_index: StaticGraphIndex,
     ) -> None:
-        if payload.get("schema_version") != GRAPH_EVOLUTION_INPUT_SCHEMA:
-            return
         session_hash = str(payload.get("session_id_hash") or "")
         static_revision = str(payload.get("static_revision") or "")
         task_cluster_id = str(payload.get("task_cluster_id") or "").strip()
@@ -366,13 +375,14 @@ class GraphObservationService:
             stats = edges.setdefault(
                 edge_identity,
                 {
-                    "identity_schema": POINT_EDGE_IDENTITY_SCHEMA,
                     "edge_identity": edge_identity,
                     "source_id": item.get("source_id"),
                     "target_id": item.get("target_id"),
                     "relation_type": item.get("relation_type"),
                     "source_content_hash": item.get("source_content_hash"),
                     "target_content_hash": item.get("target_content_hash"),
+                    "port_mappings": list(item.get("port_mappings") or []),
+                    "port_mapping_hash": stable_hash(item.get("port_mappings") or []),
                     "success_count": 0,
                     "failure_count": 0,
                     "attempt_count": 0,
@@ -421,9 +431,7 @@ class GraphObservationService:
         source_id = str(stats.get("source_id") or "")
         target_id = str(stats.get("target_id") or "")
         edge_identity = str(stats.get("edge_identity") or "")
-        if stats.get("identity_schema") != POINT_EDGE_IDENTITY_SCHEMA:
-            stats["binding_status"] = "legacy_ignored"
-        elif source_id not in static_index.capability_ids or target_id not in static_index.capability_ids:
+        if source_id not in static_index.capability_ids or target_id not in static_index.capability_ids:
             stats["binding_status"] = "orphaned"
         elif static_index.content_hash_by_id.get(source_id) != stats.get(
             "source_content_hash"
@@ -434,6 +442,8 @@ class GraphObservationService:
             stats["ever_static"] = True
         elif bool(stats.get("ever_static")) and stats.get("last_evidence_static_revision") != static_index.revision:
             stats["binding_status"] = "quarantined"
+        elif not static_index.validates_mapping(_identity_from_stats(stats)):
+            stats["binding_status"] = "invalidated"
         elif (
             len((stats.get("success_sessions_by_revision") or {}).get(static_index.revision) or [])
             >= MIN_RUNTIME_ONLY_SUCCESS_SESSIONS
@@ -460,6 +470,17 @@ class GraphObservationService:
             index = build_static_graph_index(revision, payload)
             self._static_index_cache[revision] = index
             return index
+
+
+def _identity_from_stats(stats: Mapping[str, Any]) -> EdgeIdentity:
+    return EdgeIdentity(
+        source_id=str(stats.get("source_id") or ""),
+        target_id=str(stats.get("target_id") or ""),
+        relation_type=str(stats.get("relation_type") or "can_feed"),
+        source_content_hash=str(stats.get("source_content_hash") or ""),
+        target_content_hash=str(stats.get("target_content_hash") or ""),
+        port_mappings=tuple(dict(item) for item in stats.get("port_mappings") or [] if isinstance(item, Mapping)),
+    )
 
 
 def _append_unique(stats: dict[str, Any], key: str, value: str) -> None:

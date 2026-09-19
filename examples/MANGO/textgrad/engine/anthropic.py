@@ -63,11 +63,6 @@ class ChatAnthropic(EngineLM, CachedEngine):
         if cache_or_none is not None:
             return cache_or_none
 
-        extra_body = {}
-        if temperature is not None:
-            extra_body["temperature"] = temperature
-        if top_p is not None:
-            extra_body["top_p"] = top_p
         response = self.client.messages.create(
             messages=[
                 {
@@ -77,8 +72,9 @@ class ChatAnthropic(EngineLM, CachedEngine):
             ],
             model=self.model_string,
             system=sys_prompt_arg,
+            temperature=temperature,
             max_tokens=max_tokens,
-            extra_body=extra_body or None,
+            top_p=top_p,
         )
 
         response = response.content[0].text
@@ -121,19 +117,15 @@ class ChatAnthropic(EngineLM, CachedEngine):
         if cache_or_none is not None:
             return cache_or_none
 
-        extra_body = {}
-        if temperature is not None:
-            extra_body["temperature"] = temperature
-        if top_p is not None:
-            extra_body["top_p"] = top_p
         response = self.client.messages.create(
             model=self.model_string,
             messages=[
                 {"role": "user", "content": formatted_content},
             ],
+            temperature=temperature,
             max_tokens=max_tokens,
-            system=sys_prompt_arg,
-            extra_body=extra_body or None,
+            top_p=top_p,
+            system=sys_prompt_arg
         )
 
         response_text = response.content[0].text

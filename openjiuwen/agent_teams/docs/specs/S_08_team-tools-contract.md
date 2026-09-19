@@ -19,7 +19,7 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/agent_teams/tools/` |
-| 最近一次修订日期 | 2026-09-16 |
+| 最近一次修订日期 | 2026-09-01 |
 | 关联 feature | F_10_temporary-leader-clean-team-stream-end.md、F_13_human-agent-send-message.md、F_24_agent-time-awareness.md、F_38_team-teammate-worktree-isolation-agenttool.md、F_55_create-task-atomic-graph-and-depended-by-contract.md、F_57_tool-variants-and-templated-descriptions.md、F_59_condition-named-task-state-machine-with-verify-gate.md、F_62_scheduled-dispatch-runtime-and-review-voting.md、F_64_message-channel-policy-and-content-size-guard.md、F_75_fork-context-inheritance.md、F_76_leader-progressive-policy-disclosure.md、F_82_reassign-before-a-task-starts.md、F_109_send-message-recipient-parameter-split.md |
 
 ## 范围 / 边界
@@ -139,16 +139,14 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
     `try / except` 捕获后端异常，落 `team_logger.error`，转成
     `ToolOutput(success=False, error=...)` 返回；不允许把 `Exception`
     透出到 ability 层。
-14. **`render_for_llm` 是 LLM 看到的唯一文本**：它是 core `Tool` 上的渲染方法
-    （harness `S_05` 不变量 11），ability 层构造工具结果 `ToolMessage` 时直接调用
-    `tool.render_for_llm(output)`；外部出口（team MCP server、Claude SDK MCP、skill
-    CLI、被动成员执行器）也调用它，文本与进程内一致。`invoke` 返回的 `ToolOutput`
-    原样保留给事件 / 日志等程序消费者用。新工具如果不显式覆盖 `render_for_llm`，
-    就只会得到 core 默认渲染（有 `data["content"]` 取它，否则 JSON 兜底）——意味着
-    token 浪费，应当显式覆盖。
+14. **`map_result` 是 LLM 看到的唯一文本**：工厂的 `_wrap_invoke_with_logging`
+    会在 `invoke` 返回后调用 `tool.map_result(output)`，把结果包成
+    `MappedToolOutput`，其 `__str__` 返回该文本。`ToolOutput.data` 仍保留
+    给事件 / 日志等程序消费者用。新工具如果不显式覆盖 `map_result`，
+    就只会得到 `json.dumps(data)` 的兜底——意味着 token 浪费，应当显式覆盖。
     `view_task` 的 list / detail 两级输出都把 `updated_at` 经
     `timefmt.format_time_context` 渲染为「绝对本地时间 + 相对差」，给 LLM
-    任务停留时长的时间感（`render_for_llm` 签名不可加参，内部取 `get_current_time()`，
+    任务停留时长的时间感（`map_result` 签名不可加参，内部取 `get_current_time()`，
     用 `updated_at is not None` 守卫 `exclude_none` 剔除的情况）。
 15. **Card / Config 分层**：`ToolCard` 只承载可序列化的 `id` / `name` /
     `description` / `input_params`；`teammate_mode` / `model_config_allocator` /
@@ -192,7 +190,7 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
     查表——形态是闭集，缺失组合抛 `KeyError`，不做注册表、不静默回退。
     形态间怎么共享代码**取决于共享的是数据还是行为**，用最轻的手段：`create_task`
     的两个形态各自独立，只共享模块级纯函数（`_task_node_schema` / `_validate_task_batch`），
-    `invoke` / `render_for_llm` 各写一遍；`send_message` 的两个形态共享 `_SendMessageBase`，
+    `invoke` / `map_result` 各写一遍；`send_message` 的两个形态共享 `_SendMessageBase`，
     因为共享的是真实投递行为（`_send` / `_multicast` / `_broadcast`），子类只有自己的
     收件参数 schema 与一条直线 `_dispatch`。**不为「形态就该有基类」的对称感去造 `_XxxBase`**。
     无论哪种，形态子类里都**零形态分支**，因此不变量 12（schema 扁平、invoke 直线、
@@ -256,7 +254,7 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
 
 21a. **`build_team` 的返回值承载 leader 的全部协同准则**（[[F_76]]）。leader 的系统提示词只留
     一段 bootstrap（身份 + build_team/swarmflow 分流 + "先建队"），role / workflow / dispatch /
-    lifecycle / HITT / inbound-tags 全部由 `render_for_llm` 附在建队结果之后下发，内容经
+    lifecycle / HITT / inbound-tags 全部由 `map_result` 附在建队结果之后下发，内容经
     `prompts.build_leader_policy_disclosure(...)` 按本次调用选定的模式裁剪。三条约束：
     **只在成功路径附加**；**HITT 段按 `output.data["enable_hitt"]` 即实际生效值 gate，不是 spec
     天花板**；`BuildTeamTool` 因此需要构造期拿到 `language` / `lifecycle` / `teammate_mode` /
@@ -297,7 +295,7 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
     `update_task` 剥 reviewer、`TeamScheduler._reconcile_reviews` 短路——没有一个在 autonomous 下
     可达）。所以 autonomous 时它既不进 schema，`{{build_team_verify_gate}}` 那节散文也一起消失，
     `invoke` 对偷传同样报错拒掉。**scheduled 时返回结果必须回带实际生效值**
-    （`data["enable_task_verification"]` + `render_for_llm` 的 `task_verification=`）：spec 天花板会把
+    （`data["enable_task_verification"]` + `map_result` 的 `task_verification=`）：spec 天花板会把
     leader 要的 `True` 收窄成 `False`（`effective = spec and (arg if arg is not None else True)`），
     而这个开关**不像 `enable_hitt` / `enable_bridge` 那样撞天花板就 `raise_error`，是静默收窄**——
     回带生效值是 leader 唯一能发现自己没拿到验证闸的通道，否则它会围绕一个不存在的闸去配 reviewer。
@@ -324,10 +322,6 @@ mutate the session directly; checkpoint lifecycle writes stay behind the
     成功**之后**拉起——任务已经在板上，才谈得上有人来领）。该方法持有构造期注入的
     `on_member_started` 回调并自带 leader 门与回调门，**调用方不再各自捎带 spawn 回调**；
     幂等由下层 `startup_member` 的 CAS 保证。
-    单播/多播的具体收件人若是 `ERROR`，这次定向投递本身构成显式恢复请求：写库前经
-    `recover_member` 的 `ERROR→RESTARTING` CAS 重建 runtime；广播不批量恢复 ERROR，避免
-    一条泛化消息触发全队 restart storm。ERROR runtime 已经退出时，`shutdown_member` 则直接
-    CAS 到 `SHUTDOWN` 并清理 stale handle，不发送一个永远不会被消费的 shutdown event。
     两点边界：**scheduled 的 `create_task` 不拉人**（交接归 `TeamScheduler`，工具再插一手
     就是双投递，所以差异由 `ScheduledTaskCreateTool` 这个独立类吸收，不是 `invoke` 里的
     模式分支）；**拉起失败不改变工具的成败**——任务/消息已落库，报失败只会诱使模型重建一遍，
@@ -364,7 +358,7 @@ def create_team_tools(
 
 | 参数 | 取值 | 行为 |
 |---|---|---|
-| `role` | `"leader"` / `"teammate"` / `"human_agent"` | 决定基础工具集——分别为 `LEADER_TOOLS` / `MEMBER_TOOLS_BY_DISPATCH[dispatch_mode]` / `HUMAN_AGENT_TOOLS`。其它字符串当作 teammate 走（落入 else 分支）。新增角色必须显式补一个集合常量，不要靠 fall-through。**`passive_human` 故意不在这里**：被动人类成员没有 harness、没有 LLM 工具表，其许可面 `PASSIVE_HUMAN_TOOLS`（`HUMAN_AGENT_TOOLS \| {"claim_task"}`，scheduled 下减 claim_task）由 `interaction/passive_tool_executor.py` 直接消费——透传执行器按 sender 名构造绑定身份的 manager 与工具实例（先例：scheduler 的 `reviewer_tm`、F_26 external client）。见 F_111。 |
+| `role` | `"leader"` / `"teammate"` / `"human_agent"` | 决定基础工具集——分别为 `LEADER_TOOLS` / `MEMBER_TOOLS_BY_DISPATCH[dispatch_mode]` / `HUMAN_AGENT_TOOLS`。其它字符串当作 teammate 走（落入 else 分支）。新增角色必须显式补一个集合常量，不要靠 fall-through。 |
 | `dispatch_mode` | `"autonomous"` / `"scheduled"` | 任务如何到达成员。选择 `create_task` / `send_message` 的形态、`member_complete_task` 的 desc_key，以及成员工具集。未知值抛 `KeyError`。见不变量 18。 |
 | `agent_team` | `TeamBackend` | 后端句柄，所有写操作（`build_team` / `spawn_*` / 任务 / 消息）通过它走，不绕过去直接打数据库或 messager。 |
 | `teammate_mode` | `"build_mode"` / `"plan_mode"` | plan_mode 门禁。非 plan_mode 时从 allowed 集合里减掉 `approve_plan` / `submit_plan`，且未启用 team permissions 时也减掉 `approve_tool`。 |
@@ -375,8 +369,9 @@ def create_team_tools(
 返回值：
 
 - 顺序按工厂内 `all_tools` 字典声明序遍历后过滤；调用方不应该依赖具体顺序。
-- 每个返回 `Tool` 的 `invoke` 已被 `_wrap_invoke_with_logging` 包过，只加 debug
-  日志，返回值是原 `invoke` 的 `ToolOutput`，不做文本映射。
+- 每个返回 `Tool` 的 `invoke` 已被 `_wrap_invoke_with_logging` 包过，
+  调用一次会经历：debug 日志 → 原 `invoke` → `map_result` → 包成
+  `MappedToolOutput`。
 
 错误语义：
 
@@ -505,13 +500,29 @@ if teammate_mode != "plan_mode":
 
 ```python
 class TeamTool(Tool, ABC):
+    def map_result(self, output: ToolOutput) -> str: ...
     async def stream(self, inputs, **kwargs): raise NotImplementedError
-    # 子类覆写 core Tool.render_for_llm(self, output: ToolOutput) -> str
 ```
 
-- 抽象基类。所有团队工具继承它，`invoke` 与 `render_for_llm` 由各子类自己实现；
-  基类不提供自己的默认渲染，未覆写时走 core 默认实现。
+- 抽象基类。所有团队工具继承它，`invoke` 由各子类自己实现。
 - 不支持 streaming——`stream` 显式抛，避免被通用调用路径误调用。
+
+### `MappedToolOutput`
+
+```python
+class MappedToolOutput(ToolOutput):
+    _mapped_content: str = PrivateAttr(default="")
+
+    @classmethod
+    def from_output(cls, output: ToolOutput, mapped_content: str) -> "MappedToolOutput": ...
+
+    def __str__(self) -> str: return self._mapped_content
+```
+
+- `_wrap_invoke_with_logging` 构造它包住 `invoke` 的返回值。
+- ability 层最终把工具结果转成 `ToolMessage.content` 是通过 `str(result)`，
+  这里覆盖 `__str__` 是该约定的入口。`data` / `success` / `error`
+  从原 `ToolOutput` 拷过来，程序消费路径无变化。
 
 ### `ToolCard`（每个团队工具构造时填）
 

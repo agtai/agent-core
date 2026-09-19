@@ -233,10 +233,6 @@ class SessionsCancelTool(Tool):
             },
         )
 
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Render the localized outcome message; a failed cancel carries no ``error``."""
-        return output.data["message"]
-
     async def stream(self, inputs: Input, **kwargs) -> AsyncIterator[Output]:
         pass
 
@@ -369,10 +365,6 @@ class SessionsSpawnTool(Tool):
                 ),
             },
         )
-
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Render the localized submission message."""
-        return output.data["message"]
 
     async def stream(self, inputs: Input, **kwargs) -> AsyncIterator[Output]:
         pass

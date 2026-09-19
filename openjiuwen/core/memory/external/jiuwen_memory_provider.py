@@ -490,7 +490,6 @@ class _SDKBackend:
         self._modality_cls: Any = None
         self._context_cls: Any = None
         self._disclosure_level_cls: Any = None
-        self._security_ctx_factory: Any = None
 
     @property
     def is_initialized(self) -> bool:
@@ -529,7 +528,6 @@ class _SDKBackend:
 
         try:
             from jiuwen_memory.api import assemble
-            from jiuwen_memory.api import legacy_request_context
             from jiuwen_memory.common.type_def import Scope, Modality, Context
             from jiuwen_memory.retrieval.types import DisclosureLevel
         except ImportError as exc:
@@ -559,7 +557,6 @@ class _SDKBackend:
         self._modality_cls = Modality
         self._context_cls = Context
         self._disclosure_level_cls = DisclosureLevel
-        self._security_ctx_factory = legacy_request_context
         self._is_initialized = True
         logger.info(
             "[JiuwenMemoryProvider/sdk] kernel assembled in-process (tenant=%s user=%s)",
@@ -585,9 +582,8 @@ class _SDKBackend:
         disclosure = self._disclosure_level_cls.L2  # full content, parity with server mode
         k = min(int(top_k or _DEFAULT_TOP_K), _MAX_TOP_K)
         try:
-            security = self._security_ctx_factory(scope)
             res = await asyncio.to_thread(
-                self._api.search, query, ctx, security=security, top_k=k, disclosure=disclosure
+                self._api.search, query, ctx, identity=scope, top_k=k, disclosure=disclosure
             )
             return [
                 {
@@ -635,15 +631,14 @@ class _SDKBackend:
         # See search(): the sync LocalMemoryAPI.add asyncio.run()s internally,
         # so dispatch it to a worker thread from our running loop.
         try:
-            security = self._security_ctx_factory(scope)
             units = await asyncio.to_thread(
                 self._api.add,
                 content,
                 scope,
                 modality,
-                security=security,
+                identity=scope,
                 tags=tags,
-                system_metadata=metadata or None,
+                metadata=metadata or None,
             )
             if not units:
                 return {"item_id": None}     # all deduped (infer path)

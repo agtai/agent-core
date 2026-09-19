@@ -8,7 +8,6 @@ from typing import Literal, get_type_hints
 
 import pytest
 
-from openjiuwen.core.foundation.llm import Model, ModelClientConfig, ModelRequestConfig
 from openjiuwen.rsi.artifact_rsi import (
     ArtifactProvider,
     PaperArtifactProvider,
@@ -17,16 +16,7 @@ from openjiuwen.rsi.artifact_rsi import (
     validate_artifact_task_request,
 )
 from openjiuwen.rsi.artifact_rsi.request import ArtifactEngineRequest
-from openjiuwen.rsi.events import (
-    EngineEvent,
-    EngineEventSink,
-    EventNode,
-    EventNodeStage,
-    EventProgress,
-    EventStatus,
-    NodeStageEvent,
-    emit,
-)
+from openjiuwen.rsi.events import EngineEventSink, EventNode, EventProgress, EventStatus, emit
 from openjiuwen.rsi.schema import (
     ArtifactRef,
     ArtifactValidationResult,
@@ -65,17 +55,6 @@ def _envelope(request: RsiTaskCreateRequest | None = None) -> RsiTaskEnvelope:
         run_dir="/tmp/rsi/task-001",
         artifact_type="program",
         config=config,
-    )
-
-
-def _model() -> Model:
-    return Model(
-        model_client_config=ModelClientConfig(
-            client_provider="OpenAI",
-            api_key="mock-api-key",
-            api_base="http://mock.local/v1",
-        ),
-        model_config=ModelRequestConfig(model="mock-model"),
     )
 
 
@@ -153,14 +132,13 @@ def test_artifact_request_validates_model_and_iteration() -> None:
 def test_build_request_maps_program_fields_without_artifact_type() -> None:
     task = _envelope()
 
-    model = _model()
-    request = build_request(task, ArtifactValidationResult(valid=True, errors=[]), model=model)
+    request = build_request(task, ArtifactValidationResult(valid=True, errors=[]))
 
     assert request == ArtifactEngineRequest(
         task_id="task-001",
         run_dir="/tmp/rsi/task-001",
         artifact_path="/tmp/program",
-        model=model,
+        model_config="optimizer-model",
         max_iterations=3,
         optimization_instruction=None,
     )
@@ -180,20 +158,11 @@ def test_build_request_maps_paper_instruction() -> None:
         config=config,
     )
 
-    request = build_request(task, ArtifactValidationResult(valid=True, errors=[]), model=_model())
+    request = build_request(task, ArtifactValidationResult(valid=True, errors=[]))
 
     assert request.artifact_path is None
     assert request.optimization_instruction == "Improve clarity"
     assert request.task_id == "paper-001"
-
-
-def test_build_request_requires_resolved_model() -> None:
-    with pytest.raises(ValueError, match="OPTIMIZER_MODEL_INSTANCE_REQUIRED"):
-        build_request(
-            _envelope(),
-            ArtifactValidationResult(valid=True, errors=[]),
-            model=None,  # type: ignore[arg-type]
-        )
 
 
 def test_build_request_rejects_failed_validation() -> None:
@@ -203,7 +172,7 @@ def test_build_request_rejects_failed_validation() -> None:
     )
 
     with pytest.raises(ValueError) as exc_info:
-        build_request(_envelope(), validation, model=_model())
+        build_request(_envelope(), validation)
 
     assert exc_info.value.args[0] == validation.errors
 
@@ -222,7 +191,7 @@ def test_build_request_rejects_envelope_config_type_mismatch() -> None:
     )
 
     with pytest.raises(ValueError, match="ARTIFACT_TYPE_MISMATCH"):
-        build_request(task, ArtifactValidationResult(valid=True, errors=[]), model=_model())
+        build_request(task, ArtifactValidationResult(valid=True, errors=[]))
 
 
 def test_event_types_are_fixed_and_nodes_use_common_shape() -> None:
@@ -255,38 +224,26 @@ def test_event_types_are_fixed_and_nodes_use_common_shape() -> None:
         usage=usage,
     )
     node_event = EventNode(node=node)
-    stage_event = NodeStageEvent(
-        node_ref="node-1",
-        stage={"id": "verify", "name": "验证优化是否有效"},
-        note="正在评测候选改动的用例通过率",
-    )
 
     assert status.event_type == "status"
     assert progress.event_type == "progress"
     assert node_event.event_type == "node"
-    assert stage_event.event_type == "node.stage"
-    assert EventNodeStage is NodeStageEvent
     with pytest.raises(TypeError):
         EventStatus(status="running", event_type="progress")  # type: ignore[call-arg]
 
 
 @pytest.mark.asyncio
 async def test_emit_awaits_callback_and_skips_none() -> None:
-    events: list[EngineEvent] = []
+    events: list[EventStatus] = []
     event = EventStatus(status="completed")
 
-    async def on_event(received: EngineEvent) -> None:
+    async def on_event(received: EventStatus) -> None:
         events.append(received)
 
     await emit(on_event, event)
-    stage_event = NodeStageEvent(
-        node_ref="node-1",
-        stage={"id": "verify", "name": "验证优化是否有效"},
-    )
-    await emit(on_event, stage_event)
     await emit(None, event)
 
-    assert events == [event, stage_event]
+    assert events == [event]
 
 
 class _ProgramProvider:
@@ -334,10 +291,6 @@ def test_public_dataclasses_are_frozen() -> None:
 
     with pytest.raises(FrozenInstanceError):
         result.valid = False  # type: ignore[misc]
-
-
-def test_engine_state_tracks_best_node_id() -> None:
-    assert get_type_hints(EngineState)["best_node_id"] == str | None
 
 
 def test_shared_contracts_are_defined_at_rsi_root() -> None:

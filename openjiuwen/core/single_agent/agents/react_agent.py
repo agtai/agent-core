@@ -2699,12 +2699,6 @@ class ReActAgent(BaseAgent):
 
                 start_iteration = 0
                 if interruption_state is not None:
-                    # A resume finishes the step the interrupt paused before the
-                    # loop below opens the next one, so its tool work belongs to
-                    # that step's number. The loop has not run yet in this
-                    # invocation, so nothing else has stamped the iteration and
-                    # the replayed tools would otherwise report iteration 0.
-                    ctx.extra["_react_iteration"] = interruption_state.iteration + 1
                     is_tool_interruption = isinstance(interruption_state, ToolInterruptionState)
 
                     if is_tool_interruption:
@@ -2932,7 +2926,7 @@ class ReActAgent(BaseAgent):
             await session.write_stream(OutputSchema(
                 type="answer",
                 index=0,
-                payload={**result, "output": result.get("output", ""), "result_type": result_type},
+                payload={"output": result.get("output", ""), "result_type": result_type},
             ))
 
     async def stream(

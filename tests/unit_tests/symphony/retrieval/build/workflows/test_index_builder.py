@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import openjiuwen.symphony.retrieval.build.workflows.index_builder as workflows_module
 from openjiuwen.symphony.retrieval.build.io import load_catalog_records, load_manifest, load_tree_preset
@@ -85,20 +83,6 @@ def _fake_build_tree(**kwargs):
     return {"nodes": nodes}
 
 
-def _fake_tree_client() -> Mock:
-    def create(**kwargs):
-        names = re.findall(r"^### (.+)$", kwargs["messages"][1]["content"], re.MULTILINE)
-        content = json.dumps({"skills/workflows": names})
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
-            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120),
-        )
-
-    client = Mock()
-    client.chat.completions.create.side_effect = create
-    return client
-
-
 class IndexBuilderWorkflowTests(unittest.TestCase):
     def test_build_writes_tree_catalog_and_manifest_with_llm_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -108,7 +92,7 @@ class IndexBuilderWorkflowTests(unittest.TestCase):
             output_dir = root / "index"
             config = BuildConfig(
                 method=BuildMethod.TREE,
-                llm_openai_client=_fake_tree_client(),
+                llm_openai_client=cast(Any, object()),
                 llm_model="fake-tree-model",
             )
 
@@ -166,18 +150,17 @@ class IndexBuilderWorkflowTests(unittest.TestCase):
             delete_dir = root / "delete-index"
             config = BuildConfig(
                 method=BuildMethod.TREE,
-                llm_openai_client=_fake_tree_client(),
+                llm_openai_client=cast(Any, object()),
                 llm_model="fake-tree-model",
                 incremental_max_change_ratio=1.0,
             )
 
             with patch.object(workflows_module, "build_tree", side_effect=_fake_build_tree) as build_tree_mock:
                 IndexBuilder.build([str(alpha), str(beta)], base_dir, config=config)
-                config.llm_openai_client.chat.completions.create.assert_called_once()
                 IndexBuilder.add([str(gamma)], base_dir, add_dir, config=config)
                 IndexBuilder.delete([str(beta)], add_dir, delete_dir, config=config)
 
-            build_tree_mock.assert_not_called()
+            self.assertEqual(build_tree_mock.call_count, 1)
             add_manifest = load_manifest(add_dir)
             delete_manifest = load_manifest(delete_dir)
             add_catalog = load_catalog_records(add_dir / "catalog.jsonl")
@@ -199,7 +182,7 @@ class IndexBuilderWorkflowTests(unittest.TestCase):
             uploaded: dict[str, bytes] = {}
             config = BuildConfig(
                 method=BuildMethod.TREE,
-                llm_openai_client=_fake_tree_client(),
+                llm_openai_client=cast(Any, object()),
                 llm_model="fake-tree-model",
             )
 
@@ -324,7 +307,7 @@ class IndexBuilderWorkflowTests(unittest.TestCase):
             delete_dir = root / "delete-index"
             config = BuildConfig(
                 method=BuildMethod.TREE,
-                llm_openai_client=_fake_tree_client(),
+                llm_openai_client=cast(Any, object()),
                 llm_model="fake-tree-model",
                 incremental_max_change_ratio=1.0,
                 incremental_min_add_confidence=0.0,
@@ -348,8 +331,7 @@ class IndexBuilderWorkflowTests(unittest.TestCase):
 
             add_catalog = load_catalog_records(add_dir / "catalog.jsonl")
             delete_catalog = load_catalog_records(delete_dir / "catalog.jsonl")
-            build_tree_mock.assert_not_called()
-            config.llm_openai_client.chat.completions.create.assert_called_once()
+            self.assertEqual(build_tree_mock.call_count, 1)
             self.assertEqual([record.worker_id for record in add_catalog], ["alpha", "beta", "gamma"])
             self.assertEqual([record.worker_id for record in delete_catalog], ["alpha", "gamma"])
             self.assertEqual(load_manifest(add_dir)["item_paths"], [

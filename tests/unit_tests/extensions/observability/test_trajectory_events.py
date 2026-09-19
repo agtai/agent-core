@@ -19,7 +19,6 @@ from openjiuwen.core.runner.callback.events import LLMCallEvents
 from openjiuwen.extensions.observability.config import ObservabilityConfig
 from openjiuwen.extensions.observability.runtime import ObservabilityRuntime
 from openjiuwen.extensions.observability.semconv import (
-    GEN_AI_OPERATION_NAME,
     OJ_EXECUTION_SUBJECT_ID,
     OJ_EXECUTION_SUBJECT_KIND,
     OJ_EXECUTION_SUBJECT_PARENT_ID,
@@ -28,20 +27,23 @@ from openjiuwen.extensions.observability.semconv import (
     GEN_AI_SYSTEM_INSTRUCTIONS,
     OJ_REQUEST_ID,
     OJ_RUN_ID,
-    GEN_AI_CONVERSATION_ID,
+    OJ_SESSION_ID,
     OJ_STEP_ID,
     OJ_STEP_NUMBER,
+    OJ_TRACE_SCHEMA_VERSION,
     OJ_TRAJECTORY_EVENT_ID,
     OJ_TRAJECTORY_EVENT_KIND,
     OJ_TRAJECTORY_PAYLOAD,
     OJ_TRAJECTORY_SCHEMA_VERSION,
     OJ_TRAJECTORY_SEQUENCE_EPOCH,
+    OJ_TRAJECTORY_SESSION_ID,
     OJ_TRAJECTORY_SUBJECT_ID,
     OJ_TRAJECTORY_SUBJECT_SEQUENCE,
     OJ_TURN_NUMBER,
 )
 from openjiuwen.extensions.observability.span_context import (
     clear_root_span,
+    queue_context_window_compaction,
     reset_state,
     set_root_span,
     set_current_agent_span,
@@ -49,7 +51,6 @@ from openjiuwen.extensions.observability.span_context import (
 from openjiuwen.harness.rails.interrupt.ask_user_rail import AskUserPayload, AskUserRail
 from openjiuwen.harness.tools.ask_user import AskUserTool
 from openjiuwen.extensions.observability.trajectory_events import (
-    emit_compaction_window_commit,
     emit_context_window_commit,
     emit_native_trajectory_event,
 )
@@ -83,7 +84,7 @@ async def test_ask_user_records_requested_and_resolved_events_across_closed_span
         index=0,
     )
     attributes = {
-        GEN_AI_CONVERSATION_ID: "ask-session",
+        OJ_SESSION_ID: "ask-session",
         OJ_EXECUTION_SUBJECT_ID: "ask-subject",
         OJ_EXECUTION_SUBJECT_KIND: "team_leader",
         OJ_TURN_NUMBER: 2,
@@ -138,7 +139,7 @@ async def test_canonical_request_and_v2_event_survive_legacy_attribute_pressure(
         ObservabilityConfig(
             enabled=True,
             service_name="trajectory-pressure-test",
-            exporter="otlp_grpc",
+            backend="otlp",
             max_attributes=40,
         ),
         span_exporter_override=exporter,
@@ -147,7 +148,7 @@ async def test_canonical_request_and_v2_event_survive_legacy_attribute_pressure(
     root = runtime.get_tracer("trajectory-pressure-test").start_span(
         "agent.root",
         attributes={
-            GEN_AI_CONVERSATION_ID: "pressure-session",
+            OJ_SESSION_ID: "pressure-session",
             OJ_REQUEST_ID: "request-1",
             OJ_RUN_ID: "run-1",
             OJ_TURN_NUMBER: 3,
@@ -190,11 +191,7 @@ async def test_canonical_request_and_v2_event_survive_legacy_attribute_pressure(
         runtime.shutdown()
         reset_state()
 
-    llm_span = next(
-        span
-        for span in exporter.get_finished_spans()
-        if _attrs(span).get(GEN_AI_OPERATION_NAME) == "chat"
-    )
+    llm_span = next(span for span in exporter.get_finished_spans() if span.name == "llm.call")
     instructions = json.loads(_attrs(llm_span)[GEN_AI_SYSTEM_INSTRUCTIONS])
     history = json.loads(_attrs(llm_span)[GEN_AI_INPUT_MESSAGES])
     assert len(instructions) + len(history) == 111
@@ -206,11 +203,12 @@ async def test_canonical_request_and_v2_event_survive_legacy_attribute_pressure(
     )
     attrs = _attrs(event_span)
     payload = _payload(event_span)
+    assert attrs[OJ_TRACE_SCHEMA_VERSION] == "2"
     assert attrs[OJ_TRAJECTORY_SCHEMA_VERSION] == "2"
     assert attrs[OJ_TRAJECTORY_EVENT_KIND] == "context.window.commit"
     assert len(attrs[OJ_TRAJECTORY_SEQUENCE_EPOCH]) == 32
-    assert attrs[GEN_AI_CONVERSATION_ID] == "pressure-session"
-    assert attrs[GEN_AI_CONVERSATION_ID] == "pressure-session"
+    assert attrs[OJ_TRAJECTORY_SESSION_ID] == "pressure-session"
+    assert attrs[OJ_SESSION_ID] == "pressure-session"
     assert attrs[OJ_REQUEST_ID] == "request-1"
     assert attrs[OJ_RUN_ID] == "run-1"
     assert attrs[OJ_TURN_NUMBER] == 3
@@ -230,14 +228,14 @@ async def test_core_occurrence_ids_and_request_system_slot_survive_provider_norm
     exporter = InMemorySpanExporter()
     runtime = ObservabilityRuntime()
     runtime.initialize(
-        ObservabilityConfig(enabled=True, service_name="trajectory-identity-test", exporter="otlp_grpc"),
+        ObservabilityConfig(enabled=True, service_name="trajectory-identity-test", backend="otlp"),
         span_exporter_override=exporter,
     )
     framework = Runner.callback_framework
     root = runtime.get_tracer("trajectory-identity-test").start_span(
         "agent.root",
         attributes={
-            GEN_AI_CONVERSATION_ID: "identity-session",
+            OJ_SESSION_ID: "identity-session",
             OJ_EXECUTION_SUBJECT_ID: "identity-subject",
         },
     )
@@ -282,9 +280,11 @@ async def test_core_occurrence_ids_and_request_system_slot_survive_provider_norm
         "context-a",
         "context-b",
     ]
-    # Only the baseline carries a complete window; a later commit states the
-    # change against it and the reader applies that onto the chain it holds.
-    assert "messages" not in second
+    assert [message["message_id"] for message in second["messages"]] == [
+        "openjiuwen:request-system-slot:0",
+        "context-a",
+        "context-b",
+    ]
     system_ops = [
         item for item in second["delta"]
         if item["message_id"] == "openjiuwen:request-system-slot:0"
@@ -300,7 +300,7 @@ def test_context_window_delta_uses_occurrence_identity_and_preserves_history() -
     parent = tracer.start_span(
         "llm.call",
         attributes={
-            GEN_AI_CONVERSATION_ID: "delta-session",
+            OJ_SESSION_ID: "delta-session",
             OJ_EXECUTION_SUBJECT_ID: "subject-delta",
         },
     )
@@ -352,74 +352,6 @@ def test_context_window_delta_uses_occurrence_identity_and_preserves_history() -
     assert [message["message_id"] for message in payloads[0]["messages"]] == ["a", "b", "c"]
 
 
-def test_compaction_request_does_not_enter_the_conversation_chain() -> None:
-    """A compaction summarizes the conversation; its prompt is not part of it.
-
-    Committing one spliced a foreign window into the chain, so the next real
-    turn's delta had to remove the whole summary prompt and restore the whole
-    conversation -- a near-full window every time compaction ran.
-    """
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = provider.get_tracer("trajectory-compaction-chain-test")
-    parent = tracer.start_span(
-        "llm.call",
-        attributes={
-            GEN_AI_CONVERSATION_ID: "compaction-session",
-            OJ_EXECUTION_SUBJECT_ID: "subject-compaction",
-        },
-    )
-    try:
-        turn_one = [
-            {"message_id": "a", "role": "user", "content": "question"},
-            {"message_id": "b", "role": "assistant", "content": "answer"},
-        ]
-        # What the model is asked during a compaction: a different prompt
-        # about the conversation, sharing none of its message identities.
-        summary_prompt = [
-            {"message_id": "s1", "role": "system", "content": "Return plain text only."},
-            {"message_id": "s2", "role": "user", "content": "Summarize the conversation."},
-        ]
-        turn_two = [
-            {"message_id": "a", "role": "user", "content": "question"},
-            {"message_id": "b", "role": "assistant", "content": "answer"},
-            {"message_id": "c", "role": "user", "content": "follow up"},
-        ]
-        emit_context_window_commit(
-            tracer=tracer, llm_span=parent, messages=turn_one, request_purpose="assistant"
-        )
-        skipped = emit_context_window_commit(
-            tracer=tracer, llm_span=parent, messages=summary_prompt, request_purpose="compaction"
-        )
-        emit_context_window_commit(
-            tracer=tracer, llm_span=parent, messages=turn_two, request_purpose="assistant"
-        )
-    finally:
-        parent.end()
-        provider.shutdown()
-        reset_state()
-
-    assert skipped is None
-    events = [span for span in exporter.get_finished_spans() if span.name == "context.window.commit"]
-    # Two conversation turns committed; the compaction between them did not.
-    assert [_attrs(span)[OJ_TRAJECTORY_SUBJECT_SEQUENCE] for span in events] == [1, 2]
-    payloads = [_payload(span) for span in events]
-    assert [message["message_id"] for message in payloads[0]["messages"]] == ["a", "b"]
-    # The chain stayed on the conversation: turn two bases on turn one, and
-    # its delta is the one message that was added, not a rebuilt window.
-    assert payloads[1]["base_window_id"] == payloads[0]["window_id"]
-    assert [(item["op"], item["message_id"]) for item in payloads[1]["delta"]] == [
-        ("insert", "c"),
-    ]
-    committed = {
-        message["message_id"]
-        for payload in payloads
-        for message in payload.get("messages", [])
-    }
-    assert committed.isdisjoint({"s1", "s2"})
-
-
 def test_context_window_first_commit_after_epoch_rotation_is_a_full_baseline() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -428,7 +360,7 @@ def test_context_window_first_commit_after_epoch_rotation_is_a_full_baseline() -
     parent = tracer.start_span(
         "llm.call",
         attributes={
-            GEN_AI_CONVERSATION_ID: "baseline-session",
+            OJ_SESSION_ID: "baseline-session",
             OJ_EXECUTION_SUBJECT_ID: "baseline-subject",
         },
     )
@@ -469,25 +401,34 @@ def test_context_window_first_commit_after_epoch_rotation_is_a_full_baseline() -
         assert payload["delta"] == []
 
 
-def test_compaction_before_any_request_commits_a_baseline_with_its_correlation() -> None:
+def test_epoch_baseline_preserves_compaction_correlation_independently() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("trajectory-baseline-compaction-test")
     parent = tracer.start_span(
-        "agent.run",
+        "llm.call",
         attributes={
-            GEN_AI_CONVERSATION_ID: "baseline-compaction-session",
+            OJ_SESSION_ID: "baseline-compaction-session",
             OJ_EXECUTION_SUBJECT_ID: "baseline-compaction-subject",
+            OJ_REQUEST_ID: "request-1",
+            OJ_STEP_ID: "step-1",
         },
     )
     try:
-        emit_compaction_window_commit(
-            tracer=tracer,
-            parent_span=parent,
-            messages=[{"message_id": "summary", "role": "user", "content": "compacted"}],
+        queued = queue_context_window_compaction(
+            session_id="baseline-compaction-session",
+            subject_id="baseline-compaction-subject",
+            request_id="request-1",
+            step_id="step-1",
             operation_id="operation-1",
-            model_requests=[],
+        )
+        assert queued is True
+        emit_context_window_commit(
+            tracer=tracer,
+            llm_span=parent,
+            messages=[{"message_id": "summary", "role": "user", "content": "compacted"}],
+            request_purpose="assistant",
         )
     finally:
         parent.end()
@@ -502,107 +443,7 @@ def test_compaction_before_any_request_commits_a_baseline_with_its_correlation()
     assert payload["caused_by_operation_id"] == "operation-1"
     assert payload["input_window_id"] is None
     assert payload["output_window_id"] == payload["window_id"]
-    assert payload["model_requests"] == []
-    assert payload["request_purpose"] == "compaction"
     assert payload["delta"] == []
-
-
-def test_compaction_commits_its_output_window_and_the_next_request_continues_from_it() -> None:
-    """A compaction is a turn of its own; the window changes when it completes.
-
-    The commit hangs off the live run span (the compaction's own model call
-    has ended by then) and names that call through ``model_requests``. It
-    keeps the previous window's request system slot, removes what the
-    compaction dropped, inserts the summary, and the next real request is a
-    plain delta on top of it -- not a rebuilt window and not a guess about
-    which compaction it followed.
-    """
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = provider.get_tracer("trajectory-compaction-turn-test")
-    attributes = {
-        GEN_AI_CONVERSATION_ID: "compaction-turn-session",
-        OJ_EXECUTION_SUBJECT_ID: "main",
-    }
-    system_slot = {
-        "message_id": "openjiuwen:request-system-slot:0",
-        "role": "system",
-        "content": "rules",
-    }
-    try:
-        before = tracer.start_span(
-            "llm.call",
-            attributes={**attributes, OJ_REQUEST_ID: "request-1", OJ_STEP_ID: "step-1"},
-        )
-        emit_context_window_commit(
-            tracer=tracer,
-            llm_span=before,
-            messages=[
-                system_slot,
-                {"message_id": "m1", "role": "user", "content": "hello"},
-                {"message_id": "m2", "role": "assistant", "content": "hi"},
-                {"message_id": "m3", "role": "user", "content": "more"},
-            ],
-            request_purpose="assistant",
-        )
-        before.end()
-        run = tracer.start_span("agent.run", attributes=attributes)
-        emit_compaction_window_commit(
-            tracer=tracer,
-            parent_span=run,
-            messages=[
-                {"message_id": "summary", "role": "user", "content": "compacted"},
-                {"message_id": "m3", "role": "user", "content": "more"},
-            ],
-            operation_id="manual-operation",
-            model_requests=[{"request_id": "request-c", "inference_id": "inference-c"}],
-        )
-        run.end()
-        after = tracer.start_span(
-            "llm.call",
-            attributes={**attributes, OJ_REQUEST_ID: "request-2", OJ_STEP_ID: "step-7"},
-        )
-        emit_context_window_commit(
-            tracer=tracer,
-            llm_span=after,
-            messages=[
-                system_slot,
-                {"message_id": "summary", "role": "user", "content": "compacted"},
-                {"message_id": "m3", "role": "user", "content": "more"},
-                {"message_id": "m4", "role": "user", "content": "next"},
-            ],
-            request_purpose="assistant",
-        )
-        after.end()
-    finally:
-        provider.shutdown()
-        reset_state()
-
-    commits = [span for span in exporter.get_finished_spans() if span.name == "context.window.commit"]
-    assert [_attrs(span)[OJ_TRAJECTORY_SUBJECT_SEQUENCE] for span in commits] == [1, 2, 3]
-    first, compaction, following = (_payload(span) for span in commits)
-
-    assert commits[1].parent.span_id == run.get_span_context().span_id
-    assert compaction["transition_kind"] == "compaction"
-    assert compaction["request_purpose"] == "compaction"
-    assert compaction["caused_by_operation_id"] == "manual-operation"
-    assert compaction["base_window_id"] == first["window_id"]
-    assert compaction["input_window_id"] == first["window_id"]
-    assert compaction["output_window_id"] == compaction["window_id"]
-    assert compaction["model_requests"] == [{"request_id": "request-c", "inference_id": "inference-c"}]
-    assert [(item["op"], item["message_id"]) for item in compaction["delta"]] == [
-        ("remove", "m1"),
-        ("remove", "m2"),
-        ("insert", "summary"),
-        ("move", "m3"),
-    ]
-
-    assert following["base_window_id"] == compaction["window_id"]
-    assert "transition_kind" not in following
-    assert [(item["op"], item["message_id"]) for item in following["delta"]] == [
-        ("insert", "m4"),
-    ]
 
 
 def test_native_events_share_one_epoch_and_keep_subject_sequences_dense_across_traces() -> None:
@@ -614,7 +455,7 @@ def test_native_events_share_one_epoch_and_keep_subject_sequences_dense_across_t
         tracer.start_span(
             "agent.root",
             attributes={
-                GEN_AI_CONVERSATION_ID: session_id,
+                OJ_SESSION_ID: session_id,
                 OJ_EXECUTION_SUBJECT_ID: subject_id,
             },
         )
@@ -628,19 +469,19 @@ def test_native_events_share_one_epoch_and_keep_subject_sequences_dense_across_t
         emit_native_trajectory_event(
             tracer=tracer,
             parent_span=parents[0],
-            event_kind="ask_user.requested",
+            event_kind="test.first",
             payload={"index": 1},
         )
         emit_native_trajectory_event(
             tracer=tracer,
             parent_span=parents[1],
-            event_kind="ask_user.requested",
+            event_kind="test.second",
             payload={"index": 2},
         )
         emit_native_trajectory_event(
             tracer=tracer,
             parent_span=parents[2],
-            event_kind="ask_user.requested",
+            event_kind="test.other-subject",
             payload={"index": 3},
         )
     finally:
@@ -649,7 +490,7 @@ def test_native_events_share_one_epoch_and_keep_subject_sequences_dense_across_t
         provider.shutdown()
         reset_state()
 
-    events = [span for span in exporter.get_finished_spans() if span.name == "ask_user.requested"]
+    events = [span for span in exporter.get_finished_spans() if span.name.startswith("test.")]
     assert len({_attrs(span)[OJ_TRAJECTORY_SEQUENCE_EPOCH] for span in events}) == 1
     assert [_attrs(span)[OJ_TRAJECTORY_SUBJECT_SEQUENCE] for span in events] == [1, 2, 1]
 
@@ -662,7 +503,7 @@ def test_reset_state_rotates_epoch_and_restarts_subject_sequence() -> None:
     parent = tracer.start_span(
         "agent.root",
         attributes={
-            GEN_AI_CONVERSATION_ID: "reset-session",
+            OJ_SESSION_ID: "reset-session",
             OJ_EXECUTION_SUBJECT_ID: "reset-subject",
         },
     )
@@ -670,14 +511,14 @@ def test_reset_state_rotates_epoch_and_restarts_subject_sequence() -> None:
         emit_native_trajectory_event(
             tracer=tracer,
             parent_span=parent,
-            event_kind="ask_user.requested",
+            event_kind="test.before-reset",
             payload={},
         )
         reset_state()
         emit_native_trajectory_event(
             tracer=tracer,
             parent_span=parent,
-            event_kind="ask_user.requested",
+            event_kind="test.after-reset",
             payload={},
         )
     finally:
@@ -686,7 +527,7 @@ def test_reset_state_rotates_epoch_and_restarts_subject_sequence() -> None:
         reset_state()
 
     before, after = [
-        span for span in exporter.get_finished_spans() if span.name == "ask_user.requested"
+        span for span in exporter.get_finished_spans() if span.name.startswith("test.")
     ]
     before_attrs = _attrs(before)
     after_attrs = _attrs(after)
@@ -705,7 +546,7 @@ async def test_concurrent_subjects_have_independent_sequence_and_window_state() 
         subject: tracer.start_span(
             "llm.call",
             attributes={
-                GEN_AI_CONVERSATION_ID: "shared-session",
+                OJ_SESSION_ID: "shared-session",
                 OJ_EXECUTION_SUBJECT_ID: subject,
             },
         )
@@ -745,32 +586,7 @@ async def test_concurrent_subjects_have_independent_sequence_and_window_state() 
         first, second = map(_payload, events)
         assert first["base_window_id"] is None
         assert second["base_window_id"] == first["window_id"]
-        # The baseline states the window; the follow-up states the change, and
-        # both stay scoped to their own subject.
-        assert all(message["content"] == subject for message in first["messages"])
-        assert "messages" not in second
-        assert all(
-            operation["message"]["content"] == subject
-            for operation in second["delta"]
-            if "message" in operation
-        )
-
-
-def test_unknown_event_kind_is_refused_at_emit() -> None:
-    provider = TracerProvider()
-    tracer = provider.get_tracer("trajectory-unknown-kind-test")
-    parent = tracer.start_span("agent.root")
-    try:
-        with pytest.raises(ValueError, match="unknown trajectory event kind"):
-            emit_native_trajectory_event(
-                tracer=tracer,
-                parent_span=parent,
-                event_kind="context.window.snapshot",
-                payload={},
-            )
-    finally:
-        parent.end()
-        provider.shutdown()
+        assert all(message["content"] == subject for event in events for message in _payload(event)["messages"])
 
 
 def test_langfuse_only_span_is_not_a_native_v2_event() -> None:

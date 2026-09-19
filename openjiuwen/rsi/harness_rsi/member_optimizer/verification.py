@@ -337,11 +337,7 @@ def _check_skills_manifest(role: str, integration_path: Path) -> list[Verificati
             skills = [skills]
         for index, skill_ref in enumerate(skills):
             try:
-                # Native Plugin entries carry mount options alongside the directory.
-                directory = skill_ref.get("dir") if isinstance(skill_ref, dict) else skill_ref
-                if not isinstance(directory, str) or not directory.strip():
-                    raise ValueError("skill entry must be a path string or a mapping with a non-empty 'dir'")
-                mount_dir = _resolve_package_dir(integration_path, directory)
+                mount_dir = _resolve_package_dir(integration_path, str(skill_ref))
                 if not mount_dir.is_dir():
                     raise FileNotFoundError(mount_dir)
                 skill_dirs = _discover_mounted_skill_dirs(mount_dir)
@@ -536,10 +532,7 @@ def _resolve_harness_parts(harness: Any) -> Any:
 
 
 def _load_harness_plugin(integration_path: Path) -> Any:
-    """Finalize edited registries, then use the runtime's exact Plugin loader."""
-    from openjiuwen.rsi.harness_rsi.member_optimizer.plugin_manifest import synchronize_plugin_manifest
-
-    synchronize_plugin_manifest(integration_path)
+    """Load a legacy RSI harness directory through the Agent Core plugin API."""
     return load_plugin_package(find_plugin_manifest(integration_path))
 
 

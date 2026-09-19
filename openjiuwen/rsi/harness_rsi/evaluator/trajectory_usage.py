@@ -57,34 +57,26 @@ def collect_pre_edit_successful_usage(
     *,
     tool_names: set[str] | None = None,
     skill_names: set[str] | None = None,
-    allow_later_edit: bool = False,
 ) -> int | None:
-    """Collect usage before the first edit, or before a later corrective edit.
+    """Collect successful usage that happened before the first workspace edit.
 
-    Always return the first edit index for diagnostics. Late-phase interventions
-    require a subsequent successful edit in this trajectory; merely opening a
-    Skill after completing the work does not qualify. This establishes temporal
-    eligibility, not proof that the capability caused the final outcome.
+    The returned index is the first successful persistent-edit step. A capability
+    used after that point may validate an existing patch, but cannot be credited
+    with influencing the patch decision.
     """
     first_edit_step: int | None = None
-    pending_tools: set[str] = set()
-    pending_skills: set[str] = set()
     for step_index, step in enumerate(_ordered_steps(value)):
         if not _tool_step_succeeded(step):
             continue
-        if first_edit_step is None or allow_later_edit:
+        if first_edit_step is None:
             detail = step["detail"]
-            tool_name = str(detail.get("tool_name", "") or "").strip()
-            if tool_name:
-                pending_tools.add(tool_name)
-            _collect_skill_names_from_detail(detail, pending_skills)
-        is_edit = _is_persistent_edit_step(step)
-        if not allow_later_edit or is_edit:
             if tool_names is not None:
-                tool_names.update(pending_tools)
+                tool_name = str(detail.get("tool_name", "") or "").strip()
+                if tool_name:
+                    tool_names.add(tool_name)
             if skill_names is not None:
-                skill_names.update(pending_skills)
-        if first_edit_step is None and is_edit:
+                _collect_skill_names_from_detail(detail, skill_names)
+        if first_edit_step is None and _is_persistent_edit_step(step):
             first_edit_step = step_index
     return first_edit_step
 
@@ -94,7 +86,6 @@ def collect_jsonl_pre_edit_successful_usage(
     *,
     tool_names: set[str] | None = None,
     skill_names: set[str] | None = None,
-    allow_later_edit: bool = False,
 ) -> int | None:
     """Collect pre-edit usage from a native trajectory JSONL stream."""
     payloads: list[Any] = []
@@ -113,7 +104,6 @@ def collect_jsonl_pre_edit_successful_usage(
         {"steps": [step for payload in payloads for step in _ordered_steps(payload)]},
         tool_names=tool_names,
         skill_names=skill_names,
-        allow_later_edit=allow_later_edit,
     )
 
 

@@ -1,5 +1,3 @@
-# coding: utf-8
-# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Stream renderer — maps OutputSchema chunks to terminal output.
 
 Supports eight chunk types:
@@ -228,18 +226,15 @@ def _render_tool_result(
             console.print()
             return todo_items
 
-    # Display the text the model read; ``tool_result`` is only the legacy
-    # string form, kept for producers that do not emit ``rendered_result``.
-    display_text = payload.get("rendered_result") or tool_result
     summary = format_tool_result(
-        tool_name, display_text, tool_args, payload
+        tool_name, tool_result, tool_args, payload
     )
     if summary:
         console.print(f"[dim]  ⎿  {summary}[/dim]")
 
     # Write/edit content preview
-    if tool_name in ("write_file",) and display_text:
-        preview = format_write_preview(display_text)
+    if tool_name in ("write_file",) and tool_result:
+        preview = format_write_preview(tool_result)
         if preview:
             console.print(f"[dim]{preview}[/dim]")
 

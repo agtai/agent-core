@@ -294,5 +294,5 @@ def build_todo_section(language: str = "cn", model_selection: Optional[Dict] = N
     return PromptSection(
         name=SectionName.TODO,
         content={language: content},
-        priority=92,
+        priority=90,
     )

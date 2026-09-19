@@ -13,7 +13,6 @@ from openjiuwen.rsi.harness_rsi.evaluator.judger import (
     EvaluationJudger,
     ExactMatchJudger,
     JudgeResult,
-    LlmAsJudgeJudger,
     ScriptBasedJudger,
     build_judger,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "EvaluationJudger",
     "ExactMatchJudger",
     "JudgeResult",
-    "LlmAsJudgeJudger",
     "MetricsCollector",
     "evaluation_optimization_signals",
     "evaluation_requirement_results",

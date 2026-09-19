@@ -10,7 +10,6 @@ from openjiuwen.rsi.harness_rsi.single_harness.iterative import (
     IterativeSingleHarnessRequest,
     IterativeSingleHarnessResult,
     SingleHarnessIterativeOptimizationOrchestrator,
-    load_cases,
 )
 
 __all__ = [
@@ -18,6 +17,5 @@ __all__ = [
     "IterativeSingleHarnessResult",
     "SingleHarnessIterativeOptimizationOrchestrator",
     "compile_optimization_hypotheses",
-    "load_cases",
     "load_optimization_hypotheses",
 ]

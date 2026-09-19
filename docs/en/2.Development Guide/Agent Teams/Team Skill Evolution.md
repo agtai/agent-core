@@ -4,15 +4,14 @@ Team Skill Evolution is a multi-agent collaboration skill auto-creation and onli
 
 ## Core Concepts
 
-### Swarm Skill
+### Team Skill
 
-A Swarm Skill is the current agent-facing type for reusable multi-agent collaboration. It uses the following file
-structure:
+A Team Skill is a special type of Skill with the following file structure:
 
 ```
 skills/<skill-name>/
 ├── SKILL.md          # Entry file (YAML frontmatter + Markdown body)
-│                      # frontmatter must include kind: swarm-skill
+│                      # frontmatter must include kind: team-skill
 ├── roles/
 │   ├── <role-id>.md  # Detailed definition for each role
 │   └── ...
@@ -21,10 +20,9 @@ skills/<skill-name>/
 └── evolutions.json   # Evolution records
 ```
 
-Unlike regular Skills, Swarm Skills:
+Unlike regular Skills, Team Skills:
 
-- `kind: swarm-skill` identifies the current type. Legacy `kind: team-skill` definitions are still detected and
-  normalized to `swarm-skill` by agent-facing evolution schemas.
+- `kind: team-skill` identifies the type
 - `roles` list defines roles and their skills/tools configuration
 - Suitable for multi-agent collaboration scenarios
 
@@ -33,7 +31,7 @@ Unlike regular Skills, Swarm Skills:
 | Module | Function |
 |--------|----------|
 | `TeamSkillCreateRail` | Auto-detect collaboration patterns, suggest team skill creation |
-| `TeamSkillEvolutionRail` | Public rail for online evolution. |
+| `TeamSkillRail` | Public rail for online evolution. It is the compatibility public alias for `TeamSkillEvolutionRail`. |
 | `SkillExperienceOptimizer` | Shared optimizer used by the optional passive signal path with `profile="team"`. |
 | `evolution_reviewer` | Dedicated subagent used by Agent-decided active review through the rail-owned `evolve_review_task`. |
 | `ExperienceScorer` | Experience scoring and simplify maintenance |
@@ -52,15 +50,6 @@ Unlike regular Skills, Swarm Skills:
 ```python
 from openjiuwen.harness.rails import TeamSkillCreateRail
 from openjiuwen.harness import create_deep_agent
-from openjiuwen.agent_teams.observability import (
-    ObservabilityConfig,
-    acquire_observability,
-    maybe_observability_rails,
-)
-from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
-
-acquire_observability(ObservabilityConfig(exporter="console"))
-runtime_processor = get_trajectory_span_processor()
 
 create_rail = TeamSkillCreateRail(
     skills_dir="/path/to/skills",
@@ -73,7 +62,7 @@ agent = create_deep_agent(
     model=model_client,
     system_prompt="You are a team leader...",
     tools=team_tools,
-    rails=[create_rail, *maybe_observability_rails()],
+    rails=[create_rail],
     enable_task_loop=True,
     workspace="/path/to/workspace",
 )
@@ -94,23 +83,19 @@ agent = create_deep_agent(
 
 ## Online Evolution
 
-`TeamSkillRail` remains available as a compatibility alias for `TeamSkillEvolutionRail`; new code should use
-`TeamSkillEvolutionRail`.
-
-### TeamSkillEvolutionRail Configuration
+### TeamSkillRail Configuration
 
 ```python
 from openjiuwen.harness import create_deep_agent
 from openjiuwen.harness.rails import (
     EvolutionInterruptRail,
-    TeamSkillEvolutionRail,
+    EvolutionReviewRuntime,
+    TeamSkillRail,
 )
-from openjiuwen.harness.rails.evolution import EvolutionReviewRuntime, build_evolve_review_command_prompt
-from openjiuwen.agent_teams.observability import maybe_observability_rails
 
 review_runtime = EvolutionReviewRuntime()
 
-team_rail = TeamSkillEvolutionRail(
+team_rail = TeamSkillRail(
     skills_dir="/path/to/skills",
     llm=model_client,
     model="gpt-4",
@@ -126,25 +111,20 @@ team_rail = TeamSkillEvolutionRail(
 )
 interrupt_rail = EvolutionInterruptRail(
     review_runtime=review_runtime,
-    submission_service=team_rail.approval_submission_service,
+    submission_service=team_rail.experience_manager.experience_submission_service,
 )
 
 agent = create_deep_agent(
     model=model_client,
     tools=team_tools,
-    rails=[interrupt_rail, team_rail, *maybe_observability_rails()],
+    rails=[interrupt_rail, team_rail],
     skills=["research-team"],  # Load existing team skill
 )
 ```
 
-`runtime_processor` is the process-wide `TrajectorySpanProcessor` returned by
-`get_trajectory_span_processor()` after Team observability is acquired. The demand coordinator registers this object
-with the active OpenTelemetry provider. `TeamSkillEvolutionRail` uses Team root-trace routing to build its canonical
-clean window directly from completed observability spans; all evolution/create Rails in the same runtime must reuse
-that processor. Team agents mount the Agent/Team observability Rail pair returned by
-`maybe_observability_rails()` and release the Team observability demand only after their roots are finalized.
-The active Team root span supplies the authoritative team identity and must remain recording across the execution
-invoke and the subsequent `/evolve` review invoke when they share one Agent Session.
+`runtime_processor` is the application-owned `TrajectorySpanProcessor` already registered with the active OpenTelemetry
+provider. `TeamSkillRail` uses Team root-trace routing to build its canonical clean window directly from completed
+observability spans; all evolution/create Rails in the same runtime should share the processor object.
 
 This clean window is online evolution evidence, not a full Team runtime archive. The current API does not use a
 member snapshot source/sink registry.
@@ -155,7 +135,7 @@ member snapshot source/sink registry.
 |----------------|-------------------|
 | Passive signal trigger | `signal_trigger=True` and team completion is observed |
 | Completion review trigger | `review_trigger=True` and team completion is observed |
-| User-requested review | Host resolves the subject, builds a command prompt, and runs it as the next query in the same Agent Session |
+| User-requested review | Host calls `request_user_evolution()` and delivers its `followup_prompt` to the main Agent |
 
 Both switches default to `False`. If both are enabled, completion review takes precedence and passive signal generation is skipped for that completion.
 
@@ -180,24 +160,16 @@ The active path does not need a global `SubagentRail` or general-purpose `task_t
 
 #### 3. User Request Evolution
 
-When a user issues `/evolve`, the host follows the command-dispatch path used by JiuwenClaw: it resolves the actual
-Skill kind, builds the restricted review prompt, and replaces the command input with that prompt for the next Agent
-run in the same Session.
+User actively provides improvement suggestions:
 
 ```python
-from openjiuwen.harness.rails.evolution import build_evolve_review_command_prompt
-
-subject = team_rail.store.resolve_subject_payload("research-team")
-followup_prompt = build_evolve_review_command_prompt(
-    subject=subject,
+result = await team_rail.request_user_evolution(
+    skill_name="research-team",
     user_intent="Add reviewer role, limit research time to 10 minutes",
 )
-result = await Runner.run_agent(agent, {"query": followup_prompt}, session=session)
 ```
 
-The prompt requires `prepare_skill_evolution` → `evolve_review_task` → `evolve_skill_experiences`. Current Rail or
-aggregated Team trajectory is the default evidence window, while `user_intent` supplies review direction.
-`request_user_evolution()` remains available only as a compatibility wrapper for older hosts.
+`request_user_evolution()` returns an `EvolutionRequestResult` in `agent_prompt` mode. The host delivers `result.followup_prompt` to the main Agent; the prompt requires the same `prepare_skill_evolution` → `evolve_review_task` active-review sequence. Current rail trajectory or aggregated team trajectory becomes the default evidence window, while `user_intent` supplies additional direction.
 
 ### Passive Record Approval Flow
 
@@ -298,6 +270,6 @@ Rebuild process:
 
 ### Notes
 
-- `TeamSkillCreateRail` and `TeamSkillEvolutionRail` can be used together
+- `TeamSkillCreateRail` and `TeamSkillRail` can be used together
 - Rails depend on DeepAgent with `enable_task_loop=True`
 - Evolution-generated content requires user approval to take effect

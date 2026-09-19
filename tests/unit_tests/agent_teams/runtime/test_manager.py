@@ -211,16 +211,16 @@ class TestFinalizeMember:
 
     @pytest.mark.asyncio
     @pytest.mark.level1
-    async def test_error_status_stops_and_preserves_error(self):
-        """ERROR is owned by the failure path and must survive finalization."""
+    async def test_error_status_pauses_and_marks_ready(self):
+        """ERROR status should pause and reset to READY for recovery."""
         fake_member = FakeTeamMember(MemberStatus.ERROR)
         agent = FakeTeamAgent(team_member=fake_member)
 
         await TeamRuntimeManager.finalize_member(agent)
 
-        assert agent.stop_coordination_calls == 1
-        assert agent.pause_coordination_calls == 0
-        assert fake_member.update_status_calls == []
+        assert agent.stop_coordination_calls == 0
+        assert agent.pause_coordination_calls == 1
+        assert fake_member.update_status_calls == [MemberStatus.READY]
 
     @pytest.mark.asyncio
     @pytest.mark.level1
@@ -357,11 +357,3 @@ class TestDeleteTeamFilesystemCleanup:
             assert not apaths.team_home("teamA").is_dir(), "team home must be removed"
         finally:
             apaths.reset_openjiuwen_home()
-
-
-@pytest.fixture(autouse=True)
-def mock_group_history_cleanup(monkeypatch):
-    # Archive cleanup has its own scope tests; lifecycle tests use fake storage.
-    monkeypatch.setattr(
-        "openjiuwen.agent_teams.tools.group_conversation.GroupConversationLog.delete_registered", lambda *a: None,
-    )

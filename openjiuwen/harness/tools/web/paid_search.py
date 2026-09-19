@@ -46,18 +46,11 @@ class WebPaidSearchTool(Tool):
         language: str = "cn",
         agent_id: str | None = None,
         card: ToolCard | None = None,
-        proxy_url: str | None = None,
     ):
         super().__init__(card or build_tool_card("paid_search", "WebPaidSearchTool", language, agent_id=agent_id))
-        self._proxy_url = str(proxy_url or "").strip() or None
 
     @staticmethod
-    async def _jina_search(
-        session: aiohttp.ClientSession,
-        query: str,
-        timeout_seconds: int,
-        proxy_url: str | None = None,
-    ) -> dict[str, Any]:
+    async def _jina_search(session: aiohttp.ClientSession, query: str, timeout_seconds: int) -> dict[str, Any]:
         """Search using Jina AI DeepSearch API."""
         jina_key = os.environ.get("JINA_API_KEY", "")
         if not jina_key:
@@ -76,7 +69,6 @@ class WebPaidSearchTool(Tool):
             headers={"Authorization": f"Bearer {jina_key}", "Content-Type": "application/json"},
             json_body=payload,
             timeout_seconds=timeout_seconds,
-            proxy_url=proxy_url,
         )
         _http.raise_for_status_with_body(status, body, engine="jina")
         data = json.loads(body)
@@ -148,7 +140,6 @@ class WebPaidSearchTool(Tool):
         query: str,
         max_results: int,
         timeout_seconds: int,
-        proxy_url: str | None = None,
     ) -> dict[str, Any]:
         """Search using Bocha Web Search API."""
         bocha_key = os.environ.get("BOCHA_API_KEY", "")
@@ -162,7 +153,6 @@ class WebPaidSearchTool(Tool):
             headers={"Authorization": f"Bearer {bocha_key}", "Content-Type": "application/json"},
             json_body={"query": query, "summary": True, "count": max_results},
             timeout_seconds=timeout_seconds,
-            proxy_url=proxy_url,
         )
         _http.raise_for_status_with_body(status, body, engine="bocha")
         data = json.loads(body)
@@ -178,7 +168,6 @@ class WebPaidSearchTool(Tool):
         query: str,
         max_results: int,
         timeout_seconds: int,
-        proxy_url: str | None = None,
     ) -> dict[str, Any]:
         """Search using Serper (Google Search API)."""
         serper_key = os.environ.get("SERPER_API_KEY", "")
@@ -195,7 +184,6 @@ class WebPaidSearchTool(Tool):
             headers=headers,
             json_body={"q": query, "num": max_results},
             timeout_seconds=timeout_seconds,
-            proxy_url=proxy_url,
         )
         if status == 400:
             status, _headers, body, _final_url, _truncated = await _http.request(
@@ -205,7 +193,6 @@ class WebPaidSearchTool(Tool):
                 headers=headers,
                 json_body={"q": query},
                 timeout_seconds=timeout_seconds,
-                proxy_url=proxy_url,
             )
         _http.raise_for_status_with_body(status, body, engine="serper")
         data = json.loads(body)
@@ -242,7 +229,6 @@ class WebPaidSearchTool(Tool):
         query: str,
         max_results: int,
         timeout_seconds: int,
-        proxy_url: str | None = None,
     ) -> dict[str, Any]:
         """Search using Perplexity AI."""
         perplexity_key = os.environ.get("PERPLEXITY_API_KEY", "")
@@ -266,7 +252,6 @@ class WebPaidSearchTool(Tool):
             headers={"Authorization": f"Bearer {perplexity_key}", "Content-Type": "application/json"},
             json_body=payload,
             timeout_seconds=timeout_seconds,
-            proxy_url=proxy_url,
         )
         _http.raise_for_status_with_body(status, body, engine="perplexity")
         data = json.loads(body)
@@ -291,6 +276,8 @@ class WebPaidSearchTool(Tool):
             or os.environ.get(_PAID_SEARCH_PROVIDER_ALT_ENV)
             or ""
         ).strip().lower()
+        if provider == "auto" and env_provider:
+            provider = env_provider
         max_results = _safe_int(inputs.get("max_results", 8) or 8, 8)
         timeout_seconds = _safe_int(
             inputs.get("timeout_seconds", _PAID_SEARCH_DEFAULT_TIMEOUT_SECONDS)
@@ -302,7 +289,7 @@ class WebPaidSearchTool(Tool):
             return "[ERROR]: query cannot be empty."
 
         if provider not in {"auto", "bocha", "jina", "serper", "perplexity"}:
-            return "[ERROR]: provider must be auto or a configured search provider."
+            return "[ERROR]: provider must be one of auto|bocha|jina|serper|perplexity."
 
         timeout_seconds = max(
             _PAID_SEARCH_MIN_TIMEOUT_SECONDS,
@@ -310,32 +297,27 @@ class WebPaidSearchTool(Tool):
         )
         max_results = max(1, min(max_results, 20))
 
-        configured = _configured_paid_search_providers()
-        if not configured:
-            return "[ERROR]: no paid search provider API key configured."
-        if provider == "auto" and env_provider in configured:
-            provider = env_provider
-        # A queued call may name a provider removed since the card was built.
-        # Reuse the current fallback list instead of spending a turn on a missing key.
-        order = [provider] if provider in configured else configured
+        if provider == "auto":
+            order = _configured_paid_search_providers()
+            if not order:
+                return (
+                    "[ERROR]: no paid search provider API key configured. "
+                    "Set one of BOCHA_API_KEY, PERPLEXITY_API_KEY, SERPER_API_KEY, JINA_API_KEY."
+                )
+        else:
+            order = [provider]
 
         errors: list[str] = []
         async with _http.new_session() as session:
             runners = {
-                "bocha": lambda: WebPaidSearchTool._bocha_search(
-                    session, query, max_results, timeout_seconds, self._proxy_url
-                ),
-                "jina": lambda: WebPaidSearchTool._jina_search(session, query, timeout_seconds, self._proxy_url),
-                "serper": lambda: WebPaidSearchTool._serper_search(
-                    session, query, max_results, timeout_seconds, self._proxy_url
-                ),
+                "bocha": lambda: WebPaidSearchTool._bocha_search(session, query, max_results, timeout_seconds),
+                "jina": lambda: WebPaidSearchTool._jina_search(session, query, timeout_seconds),
+                "serper": lambda: WebPaidSearchTool._serper_search(session, query, max_results, timeout_seconds),
                 "perplexity": lambda: WebPaidSearchTool._perplexity_search(
-                    session, query, max_results, timeout_seconds, self._proxy_url
+                    session, query, max_results, timeout_seconds
                 ),
             }
             for name in order:
-                if name not in _configured_paid_search_providers():
-                    continue
                 try:
                     runner_process = runners.get(name)
                     if runner_process is None:

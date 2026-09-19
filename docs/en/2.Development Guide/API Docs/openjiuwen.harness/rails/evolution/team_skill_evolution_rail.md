@@ -2,8 +2,6 @@
 
 Team-skill creation and online evolution documentation.
 
-Install the runtime dependency first: `uv sync --extra observability`.
-
 ---
 
 ## class TeamSkillCreateRail
@@ -53,7 +51,7 @@ class TeamSkillCreateRail(
 **Parameters**:
 
 * **skills_dir** (str): Skill directory path.
-* **trajectory_span_processor** (TrajectorySpanProcessor): Process-wide processor returned by `get_trajectory_span_processor()` and registered by the observability demand coordinator.
+* **trajectory_span_processor** (TrajectorySpanProcessor): Shared processor already registered with the runtime's OpenTelemetry provider.
 * **language** (str): Language setting, supports `"cn"` or `"en"`.
 * **auto_trigger** (bool): Whether to auto-trigger, defaults to `True`.
 * **min_team_members_for_create** (int): Trigger threshold, `spawn_member` call count reaching this value triggers, defaults to 2.
@@ -64,24 +62,21 @@ class TeamSkillCreateRail(
 
 ---
 
-## class TeamSkillEvolutionRail
+## class TeamSkillRail
 
 Public team skill evolution Rail, similar to `SkillEvolutionRail` but specialized for team skills.
-`TeamSkillRail` remains available as a compatibility alias; new code should use `TeamSkillEvolutionRail`.
-New Swarm Skill creation remains owned by `TeamSkillCreateRail`. Automatic Team evolution recognizes legacy
-`kind: team-skill` and current `kind: swarm-skill`; agent-facing evolution subjects normalize the legacy kind to
-`swarm-skill`. Explicit `/evolve` review uses the canonical subject kind resolved from disk rather than forcing the
-Rail mode.
+`TeamSkillRail` is the compatibility public alias for `TeamSkillEvolutionRail`.
+New team skill creation remains owned by `TeamSkillCreateRail`; this rail only evolves existing `kind: team-skill` skills.
 
 ### Import
 
 ```python
 from openjiuwen.harness.rails import (
     EvolutionInterruptRail,
-    TeamSkillEvolutionRail,
+    EvolutionReviewRuntime,
+    TeamSkillRail,
     configure_skill_evolution,
 )
-from openjiuwen.harness.rails.evolution import EvolutionReviewRuntime, build_evolve_review_command_prompt
 ```
 
 `TeamSkillEvolutionRail` registers the stable `evolution_reviewer` and exposes it through the rail-owned `evolve_review_task`. The active review path does not require a global `task_tool` or `SubagentRail`; its tools share `EvolutionReviewRuntime`.
@@ -107,16 +102,13 @@ configure_skill_evolution(
 )
 ```
 
-The configuration API wires `EvolutionInterruptRail` with `TeamSkillEvolutionRail`.
-
-For an already initialized Agent, use `configure_skill_evolution_runtime(..., team=True)` so newly added Rails are
-registered immediately. Use `unconfigure_skill_evolution(agent, team=True)` to remove the Team evolution stack.
+The configuration API wires `EvolutionInterruptRail` with `TeamSkillRail`.
 
 Manual assembly requires explicit shared dependencies:
 
 ```python
 runtime = EvolutionReviewRuntime()
-team_rail = TeamSkillEvolutionRail(
+team_rail = TeamSkillRail(
     skills_dir="/path/to/skills",
     llm=model_client,
     model="gpt-4",
@@ -127,7 +119,7 @@ team_rail = TeamSkillEvolutionRail(
 )
 interrupt_rail = EvolutionInterruptRail(
     review_runtime=runtime,
-    submission_service=team_rail.approval_submission_service,
+    submission_service=team_rail.experience_manager.experience_submission_service,
 )
 agent = create_deep_agent(
     model=model_client,
@@ -154,12 +146,9 @@ agent = create_deep_agent(
 - When `review_trigger=True`, active review takes precedence over passive signal generation after team completion. The main Agent decides whether evolution is needed and calls the rail-owned `evolve_review_task`, which runs `evolution_reviewer`.
 - `signal_trigger=False` disables passive completion scanning and `notify_team_completed()` passive triggering. `notify_team_completed()` may still schedule active review when `review_trigger=True`.
 - The passive path aggregates collaborative trajectory evidence and uses `SkillExperienceOptimizer(profile="team")`. Team completion, team skill attribution, and runtime role attribution are heuristic host-bridge signals, not strong contracts.
-- A user `/evolve` command is an explicit host path, independent of both switches. Resolve the Team/Swarm Skill
-  subject, build a prompt with `build_evolve_review_command_prompt()`, and run it as the next query in the same Agent
-  Session and Team root trace.
 
 ```text
-class TeamSkillEvolutionRail(
+class TeamSkillRail(
     skills_dir: Union[str, list[str]],
     *,
     llm: Model,
@@ -191,14 +180,14 @@ class TeamSkillEvolutionRail(
 * **llm** (Model): LLM client instance.
 * **model** (str): Model name.
 * **language** (str): Language setting.
-* **trajectory_span_processor** (TrajectorySpanProcessor): Process-wide processor returned by `get_trajectory_span_processor()` and registered by the observability demand coordinator.
+* **trajectory_span_processor** (TrajectorySpanProcessor): Shared processor already registered with the runtime's OpenTelemetry provider.
 * **member_role** (str, optional): Role copied into projected trajectory resource metadata. Defaults to `"leader"` for team skill evolution.
 * **signal_trigger** (bool, optional): Whether to detect passive team completion and trigger passive evolution, defaults to `False`.
 * **auto_save** (bool): Whether to auto-save generated experience records, defaults to `False` (requires user approval).
 * **review_runtime** (EvolutionReviewRuntime): Shared active-review runtime required for review subagent + active approval tools.
 * **async_evolution** (bool): Whether to execute evolution asynchronously, defaults to `True`.
 * **max_concurrent_evolution** (int): Max concurrent background evolution tasks, defaults to 1.
-* **team_id** (str, optional): Compatibility configuration value. Runtime capture and active review use the team name from the active Team root span as the authoritative Team identity.
+* **team_id** (str, optional): Team ID.
 * **record_llm_policy** (LLMInvokePolicy): Experience record generation LLM invocation policy.
 * **evaluate_llm_policy** (LLMInvokePolicy): Experience evaluation LLM invocation policy.
 * **simplify_llm_policy** (LLMInvokePolicy): Experience simplify LLM invocation policy.
@@ -211,13 +200,9 @@ class TeamSkillEvolutionRail(
 
 ### Runtime trajectory capture
 
-`TeamSkillEvolutionRail` consumes the canonical clean window maintained by `EvolutionRail`. Its subscription uses the current
+`TeamSkillRail` consumes the canonical clean window maintained by `EvolutionRail`. Its subscription uses the current
 Team root trace ID, so the leader Rail can select same-process collaboration spans without a runtime source/sink
-registry. The host must inject the process-wide `TrajectorySpanProcessor` returned by
-`get_trajectory_span_processor()` and used by the other Rails in that runtime. Team hosts should acquire/release the
-Team observability demand and mount the Agent/Team Rail pair returned by `maybe_observability_rails()`.
-The Team root span must remain recording across the execution invoke and the subsequent `/evolve` review invoke when
-they share one Agent Session, and it must be finalized afterward.
+registry. The host must inject the same registered `TrajectorySpanProcessor` used by the other Rails in that runtime.
 
 The Team clean window is online evolution evidence, not a full Team runtime archive. The current implementation does
 not provide `TeamTrajectoryRail`, `MemberTrajectorySnapshot`, or `InMemoryTrajectoryRegistry`.
@@ -326,7 +311,7 @@ Team evolution also uses the normalized subject contract:
 
 ## Methods
 
-### async notify_team_completed(ctx=None) -> bool
+### async notify_team_completed(ctx) -> bool
 
 Mark team completion for the enabled passive signal and/or active-review trigger.
 
@@ -340,16 +325,9 @@ Mark team completion for the enabled passive signal and/or active-review trigger
 
 ---
 
-### build_evolve_review_command_prompt(*, subject, user_intent=None, review_agent_name="evolution_reviewer", language="cn") -> str
+### async request_user_evolution(skill_name, user_intent="", *, auto_approve=None, max_index_records=None) -> EvolutionRequestResult
 
-Build the recommended active `/evolve` follow-up prompt. Import it from
-`openjiuwen.harness.rails.evolution`. Resolve the actual subject kind with
-`EvolutionStore.resolve_subject_payload(skill_name)` before calling it.
-
-### Compatibility: async request_user_evolution(skill_name, user_intent="", *, auto_approve=None, max_index_records=None) -> EvolutionRequestResult
-
-Compatibility wrapper that builds a host-delivered active-review prompt for a named existing Skill subject. New host command handlers
-should use `build_evolve_review_command_prompt()` directly.
+Build a host-delivered active-review prompt for a team skill. Current rail trajectory or aggregated team trajectory becomes the default review evidence; `user_intent` only adds direction.
 
 **Parameters**:
 
@@ -360,11 +338,11 @@ should use `build_evolve_review_command_prompt()` directly.
 
 **Returns**:
 
-* `EvolutionRequestResult`: `mode="agent_prompt"` and a `followup_prompt` for the host to deliver to the main Agent. An unknown skill returns an empty result; the resolved on-disk kind determines the subject.
+* `EvolutionRequestResult`: `mode="agent_prompt"` and a `followup_prompt` for the host to deliver to the main Agent. An unknown or non-team skill returns an empty result.
 
 ---
 
-### async request_simplify(skill_name, user_intent=None, *, mode="agent_prompt") -> SimplifyRequestResult
+### async request_simplify(skill_name, user_intent=None) -> SimplifyRequestResult
 
 Stage scorer-driven Team Skill simplify governance and return an approval event.
 
@@ -372,7 +350,6 @@ Stage scorer-driven Team Skill simplify governance and return an approval event.
 
 * **skill_name** (str): Target skill name.
 * **user_intent** (str, optional): User simplification intent.
-* **mode** (str): Compatibility argument accepted by the Team Rail and currently ignored.
 
 **Returns**:
 
@@ -382,18 +359,15 @@ Use `on_approve_simplify(request_id)` to execute and `on_reject_simplify(request
 
 ---
 
-### async request_rebuild(skill_name, user_intent=None, min_score=0.5, *, max_context_records=40, max_context_chars=20000) -> Optional[str]
+### async request_rebuild(skill_name, user_intent=None, min_score=0.5) -> Optional[str]
 
-Archive the current Team Skill assets and return a bounded deterministic rebuild prompt. The host must deliver the
-prompt to the Agent; this method does not generate or write the rebuilt Skill body.
+Request skill rebuild (archive old version and generate new version).
 
 **Parameters**:
 
 * **skill_name** (str): Target skill name.
 * **user_intent** (str, optional): User rebuild intent.
 * **min_score** (float): Evolution record filter threshold, defaults to 0.5.
-* **max_context_records** (int): Maximum records embedded in rebuild context, defaults to 40.
-* **max_context_chars** (int): Maximum embedded rebuild-context characters, defaults to 20000.
 
 **Returns**:
 
@@ -401,14 +375,13 @@ prompt to the Agent; this method does not generate or write the rebuilt Skill bo
 
 ---
 
-### async approve_record(request_id, *, approved_record_ids=None) -> None
+### async approve_record(request_id) -> None
 
 Approve staged experience records and write them to `evolutions.json`.
 
 **Parameters**:
 
 * **request_id** (str): Request ID.
-* **approved_record_ids** (Sequence[str], optional): IDs of the staged records to approve. When omitted, all staged records are approved.
 
 ---
 
@@ -479,19 +452,13 @@ Trajectory issue dataclass:
 
 ## Example
 
-The runnable `examples.agent_evolving.swarmskill_evolution_example` module combines Swarm Skill creation and
-evolution. The implementation uses the current public `TeamSkillCreateRail` and `TeamSkillEvolutionRail` APIs.
-
 ```python
-from openjiuwen.harness.rails import TeamSkillCreateRail, TeamSkillEvolutionRail, configure_skill_evolution
-from openjiuwen.harness.rails.evolution import build_evolve_review_command_prompt
+from openjiuwen.harness.rails import EvolutionReviewRuntime, TeamSkillCreateRail, TeamSkillRail
 from openjiuwen.harness import create_deep_agent
-from openjiuwen.core.runner import Runner
-from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
-from openjiuwen.agent_teams.observability import maybe_observability_rails
 
-# Process-wide processor registered by the observability demand coordinator.
-processor = get_trajectory_span_processor()
+# Application-owned processor already registered with OpenTelemetry.
+processor = runtime_processor
+review_runtime = EvolutionReviewRuntime()
 
 # Create team skill creation rail
 create_rail = TeamSkillCreateRail(
@@ -500,36 +467,35 @@ create_rail = TeamSkillCreateRail(
     min_team_members_for_create=2,
 )
 
-# Configure the creation Rail on DeepAgent.
-agent = create_deep_agent(
-    model=model_client,
-    tools=team_tools,
-    rails=[create_rail, *maybe_observability_rails()],
-    enable_task_loop=True,
-)
-configure_skill_evolution(
-    agent,
+# Create team skill evolution rail
+team_rail = TeamSkillRail(
     skills_dir="/path/to/skills",
     llm=model_client,
     model="gpt-4",
     trajectory_span_processor=processor,
-    team=True,
+    review_runtime=review_runtime,
+    team_id="research-team",
     auto_save=False,
     async_evolution=True,
 )
-team_rail = next(
-    rail
-    for rail in agent.find_rails_by_type((TeamSkillEvolutionRail,))
-    if rail.__class__ is TeamSkillEvolutionRail
+
+# Configure on DeepAgent
+agent = create_deep_agent(
+    model=model_client,
+    tools=team_tools,
+    rails=[create_rail, team_rail],
+    enable_task_loop=True,
 )
 
-# Host handles /evolve and runs this prompt in the same Agent Session.
-subject = team_rail.store.resolve_subject_payload("research-team")
-followup_prompt = build_evolve_review_command_prompt(
-    subject=subject,
+# User requests evolution
+result = await team_rail.request_user_evolution(
+    skill_name="research-team",
     user_intent="Add reviewer role, limit research time to 10 minutes",
 )
-result = await Runner.run_agent(agent, {"query": followup_prompt}, session=session)
+
+# User approval
+if result.approval_event is not None:
+    await team_rail.approve_record(result.request_id)
 
 # Request simplify
 simplify_result = await team_rail.request_simplify("research-team")

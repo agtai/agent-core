@@ -39,15 +39,6 @@ class MemorySearchTool(Tool):
         disabled = bool(result.get("disabled", False))
         return ToolOutput(success=not disabled, data=result, error=result.get("error"))
 
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Render each hit as its citation and score followed by the snippet."""
-        if not output.success:
-            return super().render_for_llm(output)
-        results = output.data["results"]
-        if not results:
-            return "No matching memories found."
-        return "\n\n".join(f"{r['citation']} (score {r['score']:.2f})\n{r['snippet']}" for r in results)
-
     async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
         pass
 
@@ -69,12 +60,6 @@ class MemoryGetTool(Tool):
         )
         disabled = bool(result.get("disabled", False))
         return ToolOutput(success=not disabled, data=result, error=result.get("error"))
-
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Render the requested memory lines as plain text."""
-        if not output.success:
-            return super().render_for_llm(output)
-        return output.data.get("text") or "No memory content found."
 
     async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
         pass
@@ -123,13 +108,6 @@ class WriteMemoryTool(Tool):
         success = bool(result.get("success", False))
         return ToolOutput(success=success, data=result, error=result.get("error"))
 
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Confirm the write with the resolved memory file path."""
-        if not output.success:
-            return super().render_for_llm(output)
-        action = "Appended to" if output.data["appended"] else "Wrote"
-        return f"{action} memory file {output.data['path']}."
-
     async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
         pass
 
@@ -157,12 +135,6 @@ class EditMemoryTool(Tool):
         )
         success = bool(result.get("success", False))
         return ToolOutput(success=success, data=result, error=result.get("error"))
-
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Confirm the edit with the resolved memory file path."""
-        if not output.success:
-            return super().render_for_llm(output)
-        return f"Edited memory file {output.data['path']}."
 
     async def stream(self, inputs: Dict[str, Any], **kwargs) -> AsyncIterator[Any]:
         pass

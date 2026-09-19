@@ -160,8 +160,6 @@ class _SendMessageBase(TeamTool, ABC):
             if not await self._team.member_exists(to):
                 return ToolOutput(success=False, error=f"Member '{to}' not found")
         await self._auto_start_members()
-        if to != USER_PSEUDO_MEMBER_NAME:
-            await self._recover_members([to])
         msg_id = await self.message_manager.send_message(content=content, to_member_name=to)
         if not msg_id:
             return ToolOutput(success=False, error=f"Failed to send message to '{to}'")
@@ -237,8 +235,6 @@ class _SendMessageBase(TeamTool, ABC):
                     continue
             valid.append(name)
 
-        await self._recover_members(valid)
-
         delivered: list[str] = []
         if valid:
             ids = await self.message_manager.multicast_message(content=content, to_member_names=valid)
@@ -278,16 +274,7 @@ class _SendMessageBase(TeamTool, ABC):
         if started:
             team_logger.info(f"Auto-started members: {started}")
 
-    async def _recover_members(self, member_names: list[str]) -> None:
-        """Recover failed direct recipients before publishing their message."""
-        if self._team is None:
-            return
-        for member_name in member_names:
-            restarted = await self._team.recover_member(member_name)
-            if restarted:
-                team_logger.info("Recovered failed message recipient: {}", member_name)
-
-    def render_for_llm(self, output: ToolOutput) -> str:
+    def map_result(self, output: ToolOutput) -> str:
         d = output.data
         if not output.success:
             base = output.error or "Failed to send message"

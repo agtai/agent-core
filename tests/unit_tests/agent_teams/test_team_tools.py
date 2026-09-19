@@ -29,7 +29,7 @@ from openjiuwen.agent_teams.tools import locales as team_locales
 from openjiuwen.agent_teams.tools.locales import Translator, make_translator
 from openjiuwen.agent_teams.tools.member_options import get_member_fallback_model_ref
 from openjiuwen.agent_teams.tools.tool_member import ListCheckpointsTool
-from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec, ModelPoolEntry, TeamRole
+from openjiuwen.agent_teams.schema.team import ExternalCliAgentSpec, TeamRole
 from openjiuwen.agent_teams.tools.team import TeamBackend
 from openjiuwen.agent_teams.tools.team_tools import (
     ApprovePlanTool,
@@ -38,6 +38,7 @@ from openjiuwen.agent_teams.tools.team_tools import (
     ClaimTaskTool,
     CleanTeamTool,
     ListMembersTool,
+    MappedToolOutput,
     SendMessageTool,
     ShutdownMemberTool,
     SpawnExternalCliTool,
@@ -220,7 +221,7 @@ class TestBuildTeamTool:
             "leader_desc": "PM",
         }
         create_tool = BuildTeamTool(agent_team_without_team, t)
-        created = create_tool.render_for_llm(await create_tool.invoke(args))
+        created = create_tool.map_result(await create_tool.invoke(args))
 
         reattached = TeamBackend(
             team_name="test_team",
@@ -230,7 +231,7 @@ class TestBuildTeamTool:
             messager=message_bus,
         )
         take_over_tool = BuildTeamTool(reattached, t)
-        taken_over = take_over_tool.render_for_llm(await take_over_tool.invoke(args))
+        taken_over = take_over_tool.map_result(await take_over_tool.invoke(args))
 
         assert "# 团队角色" in taken_over
         # Same policy body; only the outcome lines differ.
@@ -608,8 +609,6 @@ def test_external_cli_schema_requires_fallback_and_restricts_model_override(agen
     """The tool requires fallback and forbids inferred model overrides."""
     tool = SpawnExternalCliTool(agent_team, t)
     assert "fallback_model_name" in tool.card.input_params["required"]
-    fallback_schema = tool.card.input_params["properties"]["fallback_model_name"]
-    assert fallback_schema["anyOf"] == [{"type": "string", "minLength": 1}, {"type": "null"}]
     assert "model_name" not in tool.card.input_params["required"]
     model_description = tool.card.input_params["properties"]["model_name"]["description"]
     assert "仅当用户明确指定" in model_description
@@ -620,179 +619,25 @@ def test_external_cli_schema_requires_fallback_and_restricts_model_override(agen
     assert "支持的模型调用协议选择兼容模型" in fallback_description
     assert "该第三方 Agent" in fallback_description
     assert "运行时明确报告的认证失败" in fallback_description
-    assert "没有兼容模型时允许为 null" in fallback_description
-    assert "当前模型在模型池中且协议兼容时，优先选择" in fallback_description
-    assert "当前模型不在模型池中或协议不兼容时，再选择其他兼容模型" in fallback_description
-    assert "当前模型在模型池中且协议兼容时优先选择当前模型" in tool.card.description
     for description in (model_description, fallback_description):
         assert "Claude" not in description
         assert "Codex" not in description
 
-    english_tool = SpawnExternalCliTool(agent_team, make_translator("en"))
-    english_fallback_description = english_tool.card.input_params["properties"]["fallback_model_name"]["description"]
-    assert "Prefer the current model when it is present in the pool" in english_fallback_description
-    assert "current model is absent from the pool" in english_fallback_description
-    assert "prefer the current model when it is present in the pool" in english_tool.card.description
-
-
-def test_external_cli_schema_exposes_safe_model_protocol_catalog(db, message_bus, t):
-    """The tool exposes model names and protocols without endpoint secrets."""
-    entries = [
-        ModelPoolEntry(
-            model_name="deepseek-v4-flash",
-            api_key="secret-openai",
-            api_base_url="https://openai.example/v1",
-            api_provider="DeepSeek",
-        ),
-        ModelPoolEntry(
-            model_name="claude-fallback",
-            api_key="secret-anthropic",
-            api_base_url="https://anthropic.example/v1",
-            api_provider="Anthropic",
-        ),
-    ]
-    team = TeamBackend(
-        team_name="ext_cli_catalog_team",
-        member_name="leader1",
-        is_leader=True,
-        db=db,
-        messager=message_bus,
-        model_pool_provider=lambda: entries,
-        current_model_name="deepseek-v4-flash",
-        current_model_provider="DeepSeek",
-        external_cli_agents=[
-            ExternalCliAgentSpec(cli_agent="claude"),
-            ExternalCliAgentSpec(cli_agent="codex"),
-        ],
-    )
-
-    tool = SpawnExternalCliTool(team, t)
-    description = tool.card.input_params["properties"]["fallback_model_name"]["description"]
-
-    assert '"model_name": "deepseek-v4-flash", "protocol": "OpenAI"' in description
-    assert '"model_name": "claude-fallback", "protocol": "Anthropic"' in description
-    assert "secret-openai" not in description
-    assert "secret-anthropic" not in description
-    assert "openai.example" not in description
-    assert "anthropic.example" not in description
-
 
 @pytest.mark.asyncio
-async def test_external_cli_requires_current_model_when_present_and_compatible(db, message_bus, t):
-    """A compatible current model in the pool has strict fallback priority."""
-    await db.team.create_team(
-        team_name="ext_cli_current_priority_team",
-        display_name="Ext Current Priority",
-        leader_member_name="leader1",
-    )
-    entries = [
-        ModelPoolEntry(
-            model_name="leader-model",
-            api_key="secret",
-            api_base_url="https://leader.example/v1",
-            api_provider="OpenAI",
-        ),
-        ModelPoolEntry(
-            model_name="other-model",
-            api_key="secret",
-            api_base_url="https://other.example/v1",
-            api_provider="OpenAI",
-        ),
-    ]
-    team = TeamBackend(
-        team_name="ext_cli_current_priority_team",
-        member_name="leader1",
-        is_leader=True,
-        db=db,
-        messager=message_bus,
-        model_pool_provider=lambda: entries,
-        current_model_name="leader-model",
-        current_model_provider="OpenAI",
-        external_cli_agents=[ExternalCliAgentSpec(cli_agent="codex")],
-    )
-    tool = SpawnExternalCliTool(team, t, model_config_allocator=lambda model_name, **kwargs: AsyncMock())
-
-    result = await tool.invoke(
-        {
-            "member_name": "codex-priority",
-            "display_name": "Codex Priority",
-            "prompt": "writer",
-            "cli_agent": "codex",
-            "fallback_model_name": "other-model",
-        }
-    )
-
-    assert result.success is False
-    assert "must use current model 'leader-model'" in (result.error or "")
-
-
-@pytest.mark.asyncio
-async def test_external_cli_allows_other_model_when_current_model_is_not_in_pool(db, message_bus, t):
-    """A per-agent current model outside the pool does not block fallback."""
-    await db.team.create_team(
-        team_name="ext_cli_current_outside_pool_team",
-        display_name="Ext Current Outside Pool",
-        leader_member_name="leader1",
-    )
-    fallback_entry = ModelPoolEntry(
-        model_name="pool-fallback",
-        api_key="secret",
-        api_base_url="https://fallback.example/v1",
-        api_provider="OpenAI",
-    )
-    fallback_allocation = AsyncMock()
-    fallback_allocation.to_db_ref = lambda: {"model_name": "pool-fallback", "model_index": 0}
-    team = TeamBackend(
-        team_name="ext_cli_current_outside_pool_team",
-        member_name="leader1",
-        is_leader=True,
-        db=db,
-        messager=message_bus,
-        model_pool_provider=lambda: [fallback_entry],
-        current_model_name="per-agent-model",
-        current_model_provider="OpenAI",
-        external_cli_agents=[ExternalCliAgentSpec(cli_agent="codex")],
-    )
-    tool = SpawnExternalCliTool(
-        team,
-        t,
-        model_config_allocator=lambda model_name, **kwargs: fallback_allocation,
-    )
-
-    result = await tool.invoke(
-        {
-            "member_name": "codex-pool-fallback",
-            "display_name": "Codex Pool Fallback",
-            "prompt": "writer",
-            "cli_agent": "codex",
-            "fallback_model_name": "pool-fallback",
-        }
-    )
-
-    assert result.success is True, result.error
-
-
-@pytest.mark.asyncio
-async def test_external_cli_native_mode_allows_null_without_compatible_fallback(db, message_bus, t):
-    """Null explicitly selects native mode when no compatible fallback exists."""
+async def test_external_cli_native_mode_allows_incompatible_fallback(db, message_bus, t):
+    """An unavailable fallback does not prevent a native CLI member from being created."""
     await db.team.create_team(
         team_name="ext_cli_native_team",
         display_name="Ext Native",
         leader_member_name="leader1",
     )
-    incompatible_entry = ModelPoolEntry(
-        model_name="openai-only-model",
-        api_key="secret",
-        api_base_url="https://openai.example/v1",
-        api_provider="OpenAI",
-    )
     team = TeamBackend(
         team_name="ext_cli_native_team",
         member_name="leader1",
         is_leader=True,
         db=db,
         messager=message_bus,
-        model_pool_provider=lambda: [incompatible_entry],
         external_cli_agents=[ExternalCliAgentSpec(cli_agent="claude")],
     )
     tool = SpawnExternalCliTool(
@@ -806,85 +651,13 @@ async def test_external_cli_native_mode_allows_null_without_compatible_fallback(
             "display_name": "Claude Native",
             "prompt": "reviewer",
             "cli_agent": "claude",
-            "fallback_model_name": None,
+            "fallback_model_name": "openai-only-model",
         }
     )
     assert result.success is True, result.error
     member = await team.get_member("claude-native")
     assert member is not None
     assert get_member_fallback_model_ref(member) is None
-
-
-@pytest.mark.asyncio
-async def test_external_cli_rejects_null_when_compatible_fallback_exists(db, message_bus, t):
-    """Null cannot bypass an available protocol-compatible fallback."""
-    await db.team.create_team(
-        team_name="ext_cli_required_fallback_team",
-        display_name="Ext Required Fallback",
-        leader_member_name="leader1",
-    )
-    compatible_entry = ModelPoolEntry(
-        model_name="claude-fallback",
-        api_key="secret",
-        api_base_url="https://anthropic.example/v1",
-        api_provider="Anthropic",
-    )
-    team = TeamBackend(
-        team_name="ext_cli_required_fallback_team",
-        member_name="leader1",
-        is_leader=True,
-        db=db,
-        messager=message_bus,
-        model_pool_provider=lambda: [compatible_entry],
-        external_cli_agents=[ExternalCliAgentSpec(cli_agent="claude")],
-    )
-    tool = SpawnExternalCliTool(team, t, model_config_allocator=lambda model_name, **kwargs: None)
-
-    result = await tool.invoke(
-        {
-            "member_name": "claude-required",
-            "display_name": "Claude Required",
-            "prompt": "reviewer",
-            "cli_agent": "claude",
-            "fallback_model_name": None,
-        }
-    )
-
-    assert result.success is False
-    assert "claude-fallback" in (result.error or "")
-
-
-@pytest.mark.asyncio
-async def test_external_cli_rejects_unavailable_fallback_name(db, message_bus, t):
-    """An invented fallback name fails instead of silently selecting native mode."""
-    await db.team.create_team(
-        team_name="ext_cli_invalid_fallback_team",
-        display_name="Ext Invalid Fallback",
-        leader_member_name="leader1",
-    )
-    team = TeamBackend(
-        team_name="ext_cli_invalid_fallback_team",
-        member_name="leader1",
-        is_leader=True,
-        db=db,
-        messager=message_bus,
-        model_pool_provider=lambda: [],
-        external_cli_agents=[ExternalCliAgentSpec(cli_agent="claude")],
-    )
-    tool = SpawnExternalCliTool(team, t, model_config_allocator=lambda model_name, **kwargs: None)
-
-    result = await tool.invoke(
-        {
-            "member_name": "claude-invalid",
-            "display_name": "Claude Invalid",
-            "prompt": "reviewer",
-            "cli_agent": "claude",
-            "fallback_model_name": "invented-model",
-        }
-    )
-
-    assert result.success is False
-    assert "use null" in (result.error or "")
 
 
 class TestSpawnToolCapabilityGate:
@@ -1236,7 +1009,7 @@ class TestListCheckpointsTool:
         assert by_name["refactor-done"]["message_count"] == 12
 
     @pytest.mark.level1
-    def test_render_for_llm_renders_rows(self, agent_team, t):
+    def test_map_result_renders_rows(self, agent_team, t):
         tool = ListCheckpointsTool(agent_team, t)
         out = ToolOutput(
             success=True,
@@ -1248,14 +1021,14 @@ class TestListCheckpointsTool:
                 "count": 2,
             },
         )
-        text = tool.render_for_llm(out)
+        text = tool.map_result(out)
         assert "code-ready" in text and "message_count=5" in text and "base done" in text
         assert "refactor-done" in text and "message_count=12" in text
 
     @pytest.mark.level1
-    def test_render_for_llm_empty(self, agent_team, t):
+    def test_map_result_empty(self, agent_team, t):
         tool = ListCheckpointsTool(agent_team, t)
-        text = tool.render_for_llm(ToolOutput(success=True, data={"checkpoints": [], "count": 0}))
+        text = tool.map_result(ToolOutput(success=True, data={"checkpoints": [], "count": 0}))
         assert text == "No checkpoints"
 
 
@@ -1818,12 +1591,24 @@ class TestClaimTaskTool:
 # ========== Result Mapping ==========
 
 
-class TestRenderForLlm:
-    """Test the model-facing text team tools render from their results"""
+class TestMappedToolOutput:
+    """Test MappedToolOutput and map_result integration"""
 
     @pytest.mark.level1
-    def test_claim_task_render_for_llm_completed_guidance(self, agent_team, t):
-        """ClaimTaskTool.render_for_llm injects behavior guidance on completion"""
+    def test_str_returns_mapped_content(self):
+        """MappedToolOutput.__str__ returns mapped content, not Pydantic repr"""
+        output = MappedToolOutput.from_output(
+            ToolOutput(success=True, data={"key": "value"}),
+            mapped_content="Custom text for LLM",
+        )
+        assert str(output) == "Custom text for LLM"
+        # underlying data still accessible
+        assert output.success is True
+        assert output.data == {"key": "value"}
+
+    @pytest.mark.level1
+    def test_claim_task_map_result_completed_guidance(self, agent_team, t):
+        """ClaimTaskTool.map_result injects behavior guidance on completion"""
         tool = ClaimTaskTool(agent_team.task_manager, t)
         output = ToolOutput(
             success=True,
@@ -1833,13 +1618,13 @@ class TestRenderForLlm:
                 "status_change": {"from": "claimed", "to": "completed"},
             },
         )
-        result = tool.render_for_llm(output)
+        result = tool.map_result(output)
         assert "Task #t1 claimed → completed" in result
         assert "view_task" in result
 
     @pytest.mark.level1
-    def test_claim_task_render_for_llm_claimed_no_guidance(self, agent_team, t):
-        """ClaimTaskTool.render_for_llm does NOT inject guidance on claim"""
+    def test_claim_task_map_result_claimed_no_guidance(self, agent_team, t):
+        """ClaimTaskTool.map_result does NOT inject guidance on claim"""
         tool = ClaimTaskTool(agent_team.task_manager, t)
         output = ToolOutput(
             success=True,
@@ -1849,13 +1634,13 @@ class TestRenderForLlm:
                 "status_change": {"from": "pending", "to": "claimed"},
             },
         )
-        result = tool.render_for_llm(output)
+        result = tool.map_result(output)
         assert "Task #t1 pending → claimed" in result
         assert "view_task" not in result
 
     @pytest.mark.level1
-    def test_view_task_render_for_llm_list(self, agent_team, t):
-        """ViewTaskToolV2.render_for_llm formats list view as compact lines"""
+    def test_view_task_map_result_list(self, agent_team, t):
+        """ViewTaskToolV2.map_result formats list view as compact lines"""
         tool = ViewTaskToolV2(agent_team.task_manager, t)
         output = ToolOutput(
             success=True,
@@ -1874,7 +1659,7 @@ class TestRenderForLlm:
                 "count": 2,
             },
         )
-        result = tool.render_for_llm(output)
+        result = tool.map_result(output)
         assert "#t1 [pending] Fix bug" in result
         assert "(dev-1)" in result
         assert "[blocked by #t1]" in result
@@ -1883,8 +1668,8 @@ class TestRenderForLlm:
         assert "2023-11-" in result
 
     @pytest.mark.level1
-    def test_view_task_render_for_llm_get(self, agent_team, t):
-        """ViewTaskToolV2.render_for_llm formats detail view with dependencies"""
+    def test_view_task_map_result_get(self, agent_team, t):
+        """ViewTaskToolV2.map_result formats detail view with dependencies"""
         tool = ViewTaskToolV2(agent_team.task_manager, t)
         output = ToolOutput(
             success=True,
@@ -1899,41 +1684,42 @@ class TestRenderForLlm:
                 "updated_at": 1_700_000_000_000,
             },
         )
-        result = tool.render_for_llm(output)
+        result = tool.map_result(output)
         assert "Task #t1: Fix bug" in result
         assert "Content: Fix the login bug" in result
         assert "Blocks: #t2, #t3" in result
         assert "Updated:" in result
 
     @pytest.mark.level1
-    def test_send_message_render_for_llm(self, agent_team, t):
-        """SendMessageTool.render_for_llm formats routing summary"""
+    def test_send_message_map_result(self, agent_team, t):
+        """SendMessageTool.map_result formats routing summary"""
         tool = SendMessageTool(agent_team.message_manager, t)
         output = ToolOutput(
             success=True,
             data={"type": "message", "from": "leader", "to": "dev-1", "summary": None},
         )
-        assert tool.render_for_llm(output) == "Message Already sent from leader to dev-1 Success"
+        assert tool.map_result(output) == "Message Already sent from leader to dev-1 Success"
 
     @pytest.mark.level1
-    def test_send_message_render_for_llm_broadcast(self, agent_team, t):
-        """SendMessageTool.render_for_llm formats broadcast summary"""
+    def test_send_message_map_result_broadcast(self, agent_team, t):
+        """SendMessageTool.map_result formats broadcast summary"""
         tool = SendMessageTool(agent_team.message_manager, t)
         output = ToolOutput(
             success=True,
             data={"type": "broadcast", "from": "leader", "summary": None},
         )
-        assert tool.render_for_llm(output) == "Broadcast Already sent from leader Success"
+        assert tool.map_result(output) == "Broadcast Already sent from leader Success"
 
     @pytest.mark.level1
-    def test_list_members_render_for_llm(self, agent_team, t):
-        """ListMembersTool.render_for_llm renders one row per member"""
+    def test_default_map_result_json(self, agent_team, t):
+        """TeamTool default map_result returns JSON for data"""
         tool = ListMembersTool(agent_team, t)
         output = ToolOutput(
             success=True,
             data={"members": [{"member_name": "m1", "display_name": "Dev", "status": "ready"}], "count": 1},
         )
-        result = tool.render_for_llm(output)
+        # ListMembersTool overrides map_result, so test directly
+        result = tool.map_result(output)
         assert "member_name=m1 display_name=Dev status=ready" in result
 
 
@@ -2280,8 +2066,8 @@ class TestSendMessageTool:
         assert result.data["to"] == "m1"
 
     @pytest.mark.level1
-    def test_send_message_render_for_llm_multicast_success(self, agent_team, t):
-        """render_for_llm renders multicast success with sender, delivered list and count"""
+    def test_send_message_map_result_multicast_success(self, agent_team, t):
+        """map_result renders multicast success with sender, delivered list and count"""
         tool = SendMessageTool(agent_team.message_manager, t)
         output = ToolOutput(
             success=True,
@@ -2293,14 +2079,14 @@ class TestSendMessageTool:
                 "summary": None,
             },
         )
-        text = tool.render_for_llm(output)
+        text = tool.map_result(output)
         assert "Multicast sent from leader" in text
         assert "m1, m2" in text
         assert "(2 delivered)" in text
 
     @pytest.mark.level1
-    def test_send_message_render_for_llm_multicast_partial(self, agent_team, t):
-        """render_for_llm on failure carries delivered + failed details"""
+    def test_send_message_map_result_multicast_partial(self, agent_team, t):
+        """map_result on failure carries delivered + failed details"""
         tool = SendMessageTool(agent_team.message_manager, t)
         output = ToolOutput(
             success=False,
@@ -2313,7 +2099,7 @@ class TestSendMessageTool:
                 "summary": None,
             },
         )
-        text = tool.render_for_llm(output)
+        text = tool.map_result(output)
         assert "partially failed" in text
         assert "delivered: m1" in text
         assert "m2 — Member 'm2' not found" in text

@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PersonalContextState = Literal["CREATED", "CONFIGURED", "STARTING", "RUNNING", "STOPPING", "STOPPED", "FAILED"]
 _FetchState = Literal["STOPPED", "STARTING", "RUNNING", "STOPPING", "FAILED"]
-_FETCH_RUN_STATES = {"idle", "running", "stopping", "succeeded", "failed", "cancelled"}
+_FETCH_RUN_STATES = {"idle", "running", "succeeded", "failed", "cancelled"}
 _FETCH_RUN_PROGRESS_FIELDS = {
     "service_id",
     "run_state",
@@ -108,17 +108,13 @@ class PersonalContextStatus(BaseModel):
             completed = numeric["completed_items"]
             if not 0 <= percent <= 100 or total < 0 or not 0 <= completed <= total:
                 raise ValueError("fetch run progress counts are out of range")
+            expected_percent = 0 if total == 0 else min(99, completed * 100 // total)
             if run_state == "succeeded":
                 if completed != total:
                     raise ValueError("succeeded fetch run progress requires all items completed")
-                if percent != 100:
-                    raise ValueError("succeeded fetch run progress must be 100 percent")
-            elif percent == 100:
-                raise ValueError("only succeeded fetch run progress may be 100 percent")
-            if run_state == "idle":
-                has_progress = percent != 0 or total != 0 or completed != 0
-                if has_progress:
-                    raise ValueError("idle fetch run progress must be empty")
+                expected_percent = 100
+            if percent != expected_percent:
+                raise ValueError("fetch run progress percent does not match its counts and state")
             last_error = progress["last_error"]
             if run_state == "failed":
                 if not isinstance(last_error, str) or not last_error.strip() or len(last_error) > 512:

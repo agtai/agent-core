@@ -15,6 +15,7 @@ from typing import Any, Optional
 from openjiuwen.agent_evolving.agent_rl.online.backends.sft.sample_builder import (
     assistant_text,
     build_direct_supervisor_sft_samples,
+    json_safe,
     normalize_assistant_message,
     normalize_message,
     normalize_messages,
@@ -24,8 +25,8 @@ from openjiuwen.agent_evolving.trajectory.model import Trajectory
 from openjiuwen.agent_evolving.trajectory.schema import (
     SESSION_ID,
     TRAJECTORY_ID,
-    TRAJECTORY_PROJECTION_VERSION,
-    TRAJECTORY_PROJECTION_VERSION_ATTR,
+    TRAJECTORY_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION_ATTR,
     TRAJECTORY_SOURCE,
 )
 from openjiuwen.agent_evolving.trajectory.spans import (
@@ -564,7 +565,7 @@ class SFTOnlineRail(BaseOnlineTrainingRail):
     ) -> Trajectory:
         resource_attrs = {
             TRAJECTORY_ID: str(uuid.uuid4()),
-            TRAJECTORY_PROJECTION_VERSION_ATTR: TRAJECTORY_PROJECTION_VERSION,
+            TRAJECTORY_SCHEMA_VERSION_ATTR: TRAJECTORY_SCHEMA_VERSION,
             TRAJECTORY_SOURCE: "sft_online",
             SESSION_ID: session_id or str(uuid.uuid4()),
             **metadata,
@@ -589,6 +590,7 @@ class SFTOnlineRail(BaseOnlineTrainingRail):
         attrs: dict[str, Any] = {
             semconv.GEN_AI_OPERATION_NAME: "chat",
             semconv.GEN_AI_REQUEST_MODEL: str(turn.get("model_id") or "unknown"),
+            "openjiuwen.legacy.step.meta": turn.get("meta") or {},
         }
         tools = normalize_tool_definitions(turn.get("tools"))
         if tools:
@@ -605,21 +607,16 @@ class SFTOnlineRail(BaseOnlineTrainingRail):
         elif not response.get("tool_calls"):
             completion["content"] = turn.get("llm_str") or ""
         attrs.update(write_llm_exchange(prompts, [completion]))
+        if response.get("tool_calls"):
+            attrs[semconv.GEN_AI_TOOL_CALLS] = response["tool_calls"]
         if turn.get("prompt_ids") is not None:
             attrs["prompt_ids"] = turn.get("prompt_ids")
         if turn.get("completion_token_ids") is not None:
             attrs["completion_token_ids"] = turn.get("completion_token_ids")
-        # The turn's own meta rides as plain span attributes, which the raw
-        # converter already reports as step meta; it never overrides a
-        # semantic attribute of the span.
-        turn_meta = turn.get("meta")
-        if isinstance(turn_meta, dict):
-            for key, value in turn_meta.items():
-                attrs.setdefault(str(key), value)
         return {
             "traceId": f"{uuid.uuid4().int & ((1 << 128) - 1):032x}",
             "spanId": f"{index + 1:016x}",
-            "name": f"chat {attrs[semconv.GEN_AI_REQUEST_MODEL]}",
+            "name": "llm.call",
             "startTimeUnixNano": str(index + 1),
             "endTimeUnixNano": str(index + 2),
             "attributes": attributes_from_map(attrs),

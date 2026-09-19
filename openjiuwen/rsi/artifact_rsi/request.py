@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from openjiuwen.core.foundation.llm import Model
 from openjiuwen.rsi.schema import (
     ArtifactValidationResult,
     RsiTaskCreateRequest,
@@ -16,20 +15,14 @@ from openjiuwen.rsi.schema import (
 
 @dataclass(frozen=True, slots=True)
 class ArtifactEngineRequest:
-    """Provider-facing request shared by program and paper optimizers.
-
-    ``model`` is a process-local, initialized ``Model`` service.  The public
-    task request carries only a model resource ID; AgentServer resolves that
-    ID before constructing this provider-facing request.
-    """
+    """Provider-facing request shared by program and paper optimizers."""
 
     task_id: str
     run_dir: str
     artifact_path: str | None
-    model: Model
+    model_config: str
     max_iterations: int
     optimization_instruction: str | None
-    web_proxy: str | None = None
 
 
 def _error(code: str, message: str) -> dict[str, str]:
@@ -62,13 +55,6 @@ def validate_artifact_task_request(request: RsiTaskCreateRequest) -> ArtifactVal
             _error(
                 "ARTIFACT_TYPE_REQUIRED",
                 'artifact optimization requests must set artifact_type to "program" or "paper"',
-            )
-        )
-    if request.web_proxy and request.artifact_type != "paper":
-        errors.append(
-            _error(
-                "WEB_PROXY_UNSUPPORTED",
-                "web_proxy is supported only for paper optimization",
             )
         )
     if not _non_empty(request.name):
@@ -132,15 +118,12 @@ def validate_artifact_task_request(request: RsiTaskCreateRequest) -> ArtifactVal
 def build_request(
     task: RsiTaskEnvelope,
     validation: ArtifactValidationResult,
-    *,
-    model: Model,
 ) -> ArtifactEngineRequest:
     """Build the provider-facing request after public/provider validation.
 
     The function performs no file reads and starts no provider work.  It is
     intended for the AgentServer integration layer; Provider implementations
-    must not implement or override it.  ``model`` must already be initialized
-    by AgentServer, typically through ``Runner.resource_mgr.get_model``.
+    must not implement or override it.
     """
 
     if not validation.valid:
@@ -155,22 +138,16 @@ def build_request(
         raise TypeError([_error("MAX_ITERATIONS_INVALID", "max_iterations must be an integer")])
     if task.config.max_iterations < 1:
         raise ValueError([_error("MAX_ITERATIONS_INVALID", "max_iterations must be at least 1")])
-    if model is None:
-        raise ValueError([_error("OPTIMIZER_MODEL_INSTANCE_REQUIRED", "an initialized Model instance is required")])
 
     config = task.config
+    model_config = config.model_refs["optimizer"]
     return ArtifactEngineRequest(
         task_id=task.task_id,
         run_dir=task.run_dir,
         artifact_path=config.artifact_path,
-        model=model,
+        model_config=model_config,
         max_iterations=config.max_iterations,
         optimization_instruction=(config.optimization_instruction if task.artifact_type == "paper" else None),
-        web_proxy=(
-            str(getattr(config, "web_proxy", "") or "").strip() or None
-            if task.artifact_type == "paper"
-            else None
-        ),
     )
 
 

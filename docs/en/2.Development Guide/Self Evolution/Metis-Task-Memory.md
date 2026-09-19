@@ -24,15 +24,12 @@ uv sync --extra observability
 ```python
 import asyncio
 
+from openjiuwen.agent_evolving.trajectory import TrajectorySpanProcessor
 from openjiuwen.core.runner import Runner
 from openjiuwen.extensions.observability.config import ObservabilityConfig
-from openjiuwen.extensions.observability.demand import get_trajectory_span_processor
-from openjiuwen.harness.observability import (
-    AgentObservabilityRail,
-    acquire_observability,
-    close_agent_run_span,
-    open_agent_run_span,
-    release_observability,
+from openjiuwen.extensions.observability.setup import (
+    init_observability,
+    shutdown_observability,
 )
 from openjiuwen.harness import create_deep_agent
 from openjiuwen.harness.rails import MetisContextEvolveRail
@@ -43,12 +40,15 @@ USER_ID = "your-stable-user-id"
 
 
 async def main():
-    acquire_observability(
+    processor = TrajectorySpanProcessor()
+    init_observability(
         ObservabilityConfig(
-            exporter="console", redact_prompts=True, redact_completions=True
-        )
+            exporter="console",
+            redact_prompts=True,
+            redact_completions=True,
+        ),
+        additional_span_processors=(processor,),
     )
-    processor = get_trajectory_span_processor()
 
     metis_rail = MetisContextEvolveRail(
         llm=model_client,
@@ -58,36 +58,28 @@ async def main():
     )
     agent = create_deep_agent(
         model=model_client,
-        rails=[AgentObservabilityRail(), metis_rail],
-        trajectory_span_processor=processor,
+        rails=[metis_rail],
     )
 
     await Runner.start()
     try:
-        session_id = "metis-demo-session"
-        root_span = open_agent_run_span(session_id=session_id, mode="metis")
-        try:
-            result = await Runner.run_agent(
-                agent,
-                {"query": "Analyze this project's test failures and propose fixes"},
-                session=session_id,
-            )
-        except BaseException as exc:
-            close_agent_run_span(root_span, session_id=session_id, exception=exc)
-            raise
-        close_agent_run_span(root_span, session_id=session_id, output=result)
+        result = await Runner.run_agent(
+            agent,
+            {"query": "Analyze this project's test failures and propose fixes"},
+            session="metis-demo-session",
+        )
         print(result)
     finally:
         # Evolution runs in the background by default. Wait for persistence.
         await metis_rail.cleanup_background_tasks()
         await Runner.stop()
-        release_observability()
+        shutdown_observability()
 
 
 asyncio.run(main())
 ```
 
-`get_trajectory_span_processor()` returns the process-wide processor registered by the observability demand coordinator. Reuse it for the Agent and every trajectory-consuming Rail; do not construct a second processor.
+The `TrajectorySpanProcessor` must be registered with the observability runtime that captures the Agent spans. If the host already registered one, reuse that same processor instead of creating another.
 
 ---
 

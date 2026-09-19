@@ -5,14 +5,10 @@
 
 import hashlib
 
+import pytest
+
 from openjiuwen.extensions.tracer_otel.config import OtelTracerConfig
-from openjiuwen.extensions.tracer_otel.redaction import (
-    _should_redact,
-    hash_value,
-    redact,
-    redact_system_prompt,
-    truncate,
-)
+from openjiuwen.extensions.tracer_otel.redaction import truncate, hash_value, redact, _should_redact
 
 
 class TestTruncate:
@@ -21,7 +17,7 @@ class TestTruncate:
 
     def test_long_value_truncated(self):
         result = truncate("abcdefghij", 5)
-        assert result == "abcde...<OTel attribute truncated: 5 chars omitted>"
+        assert result == "abcde...<truncated>"
 
     def test_exact_length_not_truncated(self):
         assert truncate("abcde", 5) == "abcde"
@@ -55,7 +51,7 @@ class TestRedact:
     def test_redaction_disabled_returns_truncated(self):
         config = OtelTracerConfig(redaction_enabled=False, max_attr_length=10)
         result = redact("hello world longer text", config)
-        assert result == "hello worl...<OTel attribute truncated: 13 chars omitted>"
+        assert result == "hello worl...<truncated>"
 
     def test_redact_none_returns_empty(self):
         config = OtelTracerConfig(redaction_enabled=True)
@@ -145,20 +141,3 @@ class TestRedactWithField:
         result = redact("data", config, field=None)
         assert not result.startswith("sha256:")
         assert result == "data"
-
-
-class TestRedactSystemPrompt:
-    def test_complete_value_bypasses_length_cap(self):
-        config = OtelTracerConfig(redaction_enabled=False, max_attr_length=5)
-        value = "complete-system-prompt"
-
-        assert redact_system_prompt(value, config) == value
-
-    def test_explicit_prompt_redaction_still_hashes(self):
-        config = OtelTracerConfig(
-            redaction_enabled=False,
-            redact_prompts=True,
-            max_attr_length=5,
-        )
-
-        assert redact_system_prompt("secret-system-prompt", config).startswith("sha256:")

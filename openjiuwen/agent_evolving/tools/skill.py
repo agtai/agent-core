@@ -266,12 +266,6 @@ class EvolveReviewTaskTool(BaseEvolutionTool):
         except Exception as exc:
             return self.failure(exc)
 
-    def render_for_llm(self, output: ToolOutput) -> str:
-        """Render the submitted review result carried as the task answer."""
-        if not output.success:
-            return super().render_for_llm(output)
-        return output.data["output"]
-
     @staticmethod
     def _build_task_description(args: dict[str, Any], ref: str) -> str:
         lines = [

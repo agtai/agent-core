@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from openjiuwen.core.foundation.llm import UserMessage
 from openjiuwen.core.context_engine.context.processor_state_recorder import (
     ContextProcessorStateRecorder,
 )
@@ -21,6 +19,7 @@ from openjiuwen.core.context_engine.schema.context_state import (
 from openjiuwen.extensions.observability.config import ObservabilityConfig
 from openjiuwen.extensions.observability.runtime import ObservabilityRuntime
 from openjiuwen.extensions.observability.semconv import (
+    GEN_AI_REQUEST_ID,
     OJ_AGENT_MODE,
     OJ_CONTEXT_OPERATION_ID,
     OJ_EXECUTION_SUBJECT_ID,
@@ -31,14 +30,19 @@ from openjiuwen.extensions.observability.semconv import (
     OJ_REQUEST_ID,
     OJ_REQUEST_PURPOSE,
     OJ_RUN_ID,
-    GEN_AI_CONVERSATION_ID,
+    OJ_SESSION_ID,
     OJ_STEP_ID,
     OJ_STEP_NUMBER,
+    OJ_TRACE_SCHEMA_VERSION,
     OJ_TRAJECTORY_EVENT_KIND,
     OJ_TRAJECTORY_PAYLOAD,
+    OJ_TRAJECTORY_REQUEST_ID,
     OJ_TRAJECTORY_SCHEMA_VERSION,
+    OJ_TRAJECTORY_SESSION_ID,
+    OJ_TRAJECTORY_STEP_ID,
     OJ_TRAJECTORY_SUBJECT_ID,
     OJ_TRAJECTORY_SUBJECT_SEQUENCE,
+    OJ_TRAJECTORY_TURN_ID,
     OJ_TURN_ID,
     OJ_TURN_NUMBER,
 )
@@ -92,7 +96,7 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
     try:
         tracer = runtime.get_tracer("context-compression-v2-test")
         parent_attributes = {
-            GEN_AI_CONVERSATION_ID: "root-session-1",
+            OJ_SESSION_ID: "root-session-1",
             OJ_REQUEST_ID: "request-1",
             OJ_RUN_ID: "run-1",
             OJ_TURN_ID: "turn-1",
@@ -109,7 +113,7 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
             with tracer.start_as_current_span(
                 "llm.call",
                 attributes={
-                    OJ_REQUEST_ID: "compaction-request-1",
+                    GEN_AI_REQUEST_ID: "compaction-request-1",
                     OJ_INFERENCE_ID: "compaction-inference-1",
                 },
             ) as llm_span:
@@ -136,15 +140,8 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
                     }],
                     request_purpose="assistant",
                 )
-            # What the context engine holds once the compaction has run.
-            compacted_context = SimpleNamespace(get_messages=lambda: [
-                UserMessage(
-                    content="durable compacted context",
-                    metadata={"context_message_id": "message-compacted"},
-                ),
-            ])
-            await recorder.emit(compacted_context, _state("started"))
-            await recorder.emit(compacted_context, _state("completed"))
+            await recorder.emit(object(), _state("started"))
+            await recorder.emit(object(), _state("completed"))
             with tracer.start_as_current_span(
                 "llm.call",
                 attributes=parent_attributes,
@@ -152,20 +149,11 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
                 emit_context_window_commit(
                     tracer=tracer,
                     llm_span=next_llm_span,
-                    messages=[
-                        {
-                            "message_id": "message-compacted",
-                            "role": "user",
-                            "content": "durable compacted context",
-                            "origin": "harness_internal",
-                            "metadata": {"context_message_id": "message-compacted"},
-                        },
-                        {
-                            "message_id": "message-after-compaction",
-                            "role": "user",
-                            "content": "continue",
-                        },
-                    ],
+                    messages=[{
+                        "message_id": "message-after-compaction",
+                        "role": "user",
+                        "content": "continue",
+                    }],
                     request_purpose="assistant",
                 )
             with tracer.start_as_current_span(
@@ -175,20 +163,11 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
                 emit_context_window_commit(
                     tracer=tracer,
                     llm_span=later_llm_span,
-                    messages=[
-                        {
-                            "message_id": "message-compacted",
-                            "role": "user",
-                            "content": "durable compacted context",
-                            "origin": "harness_internal",
-                            "metadata": {"context_message_id": "message-compacted"},
-                        },
-                        {
-                            "message_id": "message-after-compaction",
-                            "role": "user",
-                            "content": "continue",
-                        },
-                    ],
+                    messages=[{
+                        "message_id": "message-after-compaction",
+                        "role": "user",
+                        "content": "continue",
+                    }],
                     request_purpose="assistant",
                 )
 
@@ -197,15 +176,16 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
         assert len(events) == 1
         event = events[0]
         assert event.parent.span_id == parent.context.span_id
+        assert event.attributes[OJ_TRACE_SCHEMA_VERSION] == "2"
         assert event.attributes[OJ_TRAJECTORY_SCHEMA_VERSION] == "2"
         assert event.attributes[OJ_TRAJECTORY_EVENT_KIND] == "compaction.completed"
         assert event.attributes[OJ_TRAJECTORY_SUBJECT_ID] == "subagent:one"
         assert event.attributes[OJ_TRAJECTORY_SUBJECT_SEQUENCE] == 2
-        assert event.attributes[GEN_AI_CONVERSATION_ID] == "root-session-1"
-        assert event.attributes[OJ_TURN_ID] == "turn-1"
-        assert event.attributes[OJ_STEP_ID] == "step-1"
-        assert event.attributes[OJ_REQUEST_ID] == "request-1"
-        assert event.attributes[GEN_AI_CONVERSATION_ID] == "root-session-1"
+        assert event.attributes[OJ_TRAJECTORY_SESSION_ID] == "root-session-1"
+        assert event.attributes[OJ_TRAJECTORY_TURN_ID] == "turn-1"
+        assert event.attributes[OJ_TRAJECTORY_STEP_ID] == "step-1"
+        assert event.attributes[OJ_TRAJECTORY_REQUEST_ID] == "request-1"
+        assert event.attributes[OJ_SESSION_ID] == "root-session-1"
         assert event.attributes[OJ_TURN_NUMBER] == 7
         assert event.attributes[OJ_STEP_NUMBER] == 3
         assert event.attributes[OJ_EXECUTION_SUBJECT_SESSION_ID] == "sub-session-1"
@@ -221,48 +201,24 @@ async def test_real_recorder_completion_emits_correlated_native_v2_span(
             "request_id": "compaction-request-1",
             "inference_id": "compaction-inference-1",
         }]
-        # The compaction is a turn of its own: it commits the window it
-        # produced right after its event, parented to the live agent span,
-        # and names its model call through model_requests. The next model
-        # request then continues from that window with a plain delta.
         context_events = [span for span in spans if span.name == "context.window.commit"]
-        assert len(context_events) == 4
-        assert [span.attributes[OJ_TRAJECTORY_SUBJECT_SEQUENCE] for span in context_events] == [
-            1, 3, 4, 5,
-        ]
+        assert len(context_events) == 3
         baseline_payload = json.loads(
             context_events[0].attributes[OJ_TRAJECTORY_PAYLOAD]
         )
-        transition = context_events[1]
-        assert transition.parent.span_id == parent.context.span_id
-        transition_payload = json.loads(transition.attributes[OJ_TRAJECTORY_PAYLOAD])
+        transition_payload = json.loads(
+            context_events[1].attributes[OJ_TRAJECTORY_PAYLOAD]
+        )
         assert transition_payload["transition_kind"] == "compaction"
-        assert transition_payload["request_purpose"] == "compaction"
         assert transition_payload["caused_by_operation_id"] == "compression-operation-1"
         assert transition_payload["input_window_id"] == baseline_payload["window_id"]
         assert transition_payload["input_window_id"] == transition_payload["base_window_id"]
         assert transition_payload["output_window_id"] == transition_payload["window_id"]
-        assert transition_payload["model_requests"] == [{
-            "request_id": "compaction-request-1",
-            "inference_id": "compaction-inference-1",
-        }]
-        assert [(item["op"], item["message_id"]) for item in transition_payload["delta"]] == [
-            ("remove", "message-before-compaction"),
-            ("insert", "message-compacted"),
-        ]
-        next_payload = json.loads(context_events[2].attributes[OJ_TRAJECTORY_PAYLOAD])
-        assert next_payload["base_window_id"] == transition_payload["window_id"]
-        assert [(item["op"], item["message_id"]) for item in next_payload["delta"]] == [
-            ("insert", "message-after-compaction"),
-        ]
-        for payload_after in (
-            next_payload,
-            json.loads(context_events[3].attributes[OJ_TRAJECTORY_PAYLOAD]),
-        ):
-            assert "transition_kind" not in payload_after
-            assert "caused_by_operation_id" not in payload_after
-            assert "input_window_id" not in payload_after
-            assert "output_window_id" not in payload_after
+        later_payload = json.loads(context_events[2].attributes[OJ_TRAJECTORY_PAYLOAD])
+        assert "transition_kind" not in later_payload
+        assert "caused_by_operation_id" not in later_payload
+        assert "input_window_id" not in later_payload
+        assert "output_window_id" not in later_payload
     finally:
         runtime.shutdown()
         reset_state()

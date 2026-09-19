@@ -13,6 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Iterator
 
+from openjiuwen.agent_evolving.trajectory import legacy_semconv
 from openjiuwen.extensions.observability import semconv
 
 from openjiuwen.agent_evolving.trajectory.spans import (
@@ -44,20 +45,18 @@ def span_category(span: Mapping[str, Any]) -> str | None:
     """Classify a canonical span by its stable name/semantic attributes."""
 
     name = str(span.get("name") or "").strip().lower()
-    attrs = span_attributes(span)
-    record_kind = str(attrs.get(semconv.OJ_TRAJECTORY_RECORD_KIND) or "")
-    if record_kind == "reasoning" or name == "llm.reasoning" or name.startswith("llm.reasoning."):
+    if name == "llm.reasoning" or name.startswith("llm.reasoning."):
         return None
-    if record_kind == "event":
-        return "event"
     if name == "llm.call" or name.startswith("llm."):
         return "llm"
     if name.startswith("tool.") or name.startswith("execute_tool"):
         return "tool"
+    attrs = span_attributes(span)
     operation = str(attrs.get(semconv.GEN_AI_OPERATION_NAME) or "").lower()
-    if operation in {"chat", "text_completion", "generate_content"}:
+    explicit_kind = str(attrs.get(legacy_semconv.LEGACY_TRAJECTORY_STEP_KIND) or "").lower()
+    if operation in {"chat", "text_completion", "generate_content"} or explicit_kind == "llm":
         return "llm"
-    if operation == "execute_tool":
+    if operation == "execute_tool" or explicit_kind == "tool":
         return "tool"
     for category, prefixes in (
         ("team", ("team.",)),
@@ -74,7 +73,7 @@ def span_category(span: Mapping[str, Any]) -> str | None:
         return "event"
     if attrs.get(semconv.AT_TASK_ID) is not None:
         return "task"
-    if attrs.get(semconv.AT_MEMBER_NAME) is not None:
+    if attrs.get(semconv.AT_MEMBER_ID) is not None:
         return "member"
     return None
 
@@ -237,7 +236,7 @@ def flatten_forest(forest: Iterable[Mapping[str, Any]]) -> list[Span]:
 
 def _member_value(span: Mapping[str, Any]) -> str | None:
     attrs = span_attributes(span)
-    for key in (semconv.AT_MEMBER_NAME, semconv.AT_AGENT_ID, semconv.AT_MEMBER_NAME):
+    for key in (semconv.AT_MEMBER_ID, semconv.AT_AGENT_ID, semconv.AT_MEMBER_NAME):
         value = attrs.get(key)
         if value is not None and str(value) != "":
             return str(value)

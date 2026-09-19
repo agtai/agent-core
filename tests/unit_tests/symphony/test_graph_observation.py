@@ -7,20 +7,22 @@ from pathlib import Path
 import pytest
 
 from openjiuwen.symphony.observation import (
+    CapabilityEvidence,
     EvidenceStrength,
-    EvolutionEdgeMetadata,
     EvolutionGraph,
     EvolutionGraphEdge,
+    EvolutionEdgeMetadata,
     FailureDomain,
     GraphEvolutionInput,
     GraphSnapshotRef,
+    PortMapping,
     TaskEvidence,
     TaskOutcome,
     TaskOutcomeLabel,
     TraceEvidence,
 )
-from openjiuwen.symphony.observation.identity import POINT_EDGE_IDENTITY_SCHEMA
 from openjiuwen.symphony.observation.service import GraphObservationService, _runtime_adjustment
+from openjiuwen.symphony.observation.identity import stable_hash
 from openjiuwen.symphony.orchestration.artifacts import GraphArtifacts, GraphArtifactStore, load_graph_artifacts
 from openjiuwen.symphony.orchestration.planning.fast import FastOneShotPlanner
 from openjiuwen.symphony.orchestration.planning.plan_builder import edge_plan_item
@@ -57,7 +59,7 @@ def test_verified_success_is_idempotent_and_weak_evidence_is_audit_only(tmp_path
     service.close()
 
 
-def test_runtime_only_point_edge_is_accepted(tmp_path: Path) -> None:
+def test_runtime_only_edge_with_explicit_runtime_mapping_is_accepted(tmp_path: Path) -> None:
     _publish_static(tmp_path, "static-v1", include_edge=False)
     service = GraphObservationService(tmp_path)
 
@@ -72,9 +74,10 @@ def test_runtime_only_point_edge_is_accepted(tmp_path: Path) -> None:
 
 def test_sdd_canonical_json_contract_is_accepted_without_persisting_query(tmp_path: Path) -> None:
     _publish_static(tmp_path, "static-v1", include_edge=True)
+    mapping_hash = stable_hash(({"source_output": "text", "target_input": "text"},))
     value = GraphEvolutionInput.model_validate(
         {
-            "schema_version": "symphony.graph_evolution_input.v2",
+            "schema_version": "symphony.graph_evolution_input.v1",
             "evidence_id": "canonical-1",
             "graph_scope_id": "workspace:test",
             "observed_at": "2026-08-25T01:02:03Z",
@@ -93,11 +96,16 @@ def test_sdd_canonical_json_contract_is_accepted_without_persisting_query(tmp_pa
                 "outcome": {
                     "label": "verified_success",
                     "evidence_strength": "strong",
+                    "evidence_refs": ["evaluator://task/1"],
                 },
             },
             "graph_snapshot": {
                 "static_revision": "static-v1",
                 "observation_revision": "observation-v0",
+            },
+            "capabilities": {
+                "extract": {"type": "skill", "version": "1", "content_hash": "content-extract-v1"},
+                "summarize": {"type": "skill", "version": "1", "content_hash": "content-summarize-v1"},
             },
             "planned_graph": None,
             "execution_graph": {
@@ -110,7 +118,11 @@ def test_sdd_canonical_json_contract_is_accepted_without_persisting_query(tmp_pa
                         "source": "extract",
                         "target": "summarize",
                         "relation": "can_feed",
-                        "metadata": {"success": True},
+                        "metadata": {
+                            "success": True,
+                            "port_mapping_hash": f"sha256:{mapping_hash}",
+                            "evidence_refs": ["otlp://trace-1/span-1"],
+                        },
                     }
                 ],
             },
@@ -129,8 +141,8 @@ def test_sdd_canonical_json_contract_is_accepted_without_persisting_query(tmp_pa
     persisted = json.dumps(persisted_rows[0][2], ensure_ascii=False)
     assert "private user request" not in persisted
     assert "session-1" not in persisted
-    assert "evidence_refs" not in persisted
-    assert "port_mapping" not in persisted
+    assert "otlp://trace-1/span-1" in persisted
+    assert "evaluator://task/1" in persisted
     service.close()
 
 
@@ -147,6 +159,7 @@ def test_only_explicit_orchestration_failure_changes_edge_weight(tmp_path: Path)
             task_failure_domain=FailureDomain.EXTERNAL_SERVICE,
             edge_success=False,
             edge_failure_domain=FailureDomain.EXTERNAL_SERVICE,
+            edge_evidence_refs=("span:external",),
         )
     )
     explicit = service.submit(
@@ -158,6 +171,7 @@ def test_only_explicit_orchestration_failure_changes_edge_weight(tmp_path: Path)
             task_failure_domain=FailureDomain.ORCHESTRATION,
             edge_success=False,
             edge_failure_domain=FailureDomain.ORCHESTRATION,
+            edge_evidence_refs=("evaluator:edge-order",),
         )
     )
     service.flush()
@@ -180,7 +194,7 @@ def test_runtime_adjustment_is_symmetric_and_bounded() -> None:
     assert _runtime_adjustment({"success_count": 0, "failure_count": 100}) == pytest.approx(-1.0)
 
 
-def test_successful_task_ignores_failed_edge_without_rejecting_other_edges(tmp_path: Path) -> None:
+def test_successful_task_with_failed_edge_is_audit_only(tmp_path: Path) -> None:
     _publish_static(tmp_path, "static-v1", include_edge=True)
     service = GraphObservationService(tmp_path)
 
@@ -191,43 +205,14 @@ def test_successful_task_ignores_failed_edge_without_rejecting_other_edges(tmp_p
             static_revision="static-v1",
             edge_success=False,
             edge_failure_domain=FailureDomain.ORCHESTRATION,
+            edge_evidence_refs=("evaluator:edge",),
         )
     )
     service.flush()
 
     assert receipt.status == "audit_only"
-    assert receipt.reason == "no_qualified_edge_outcome"
+    assert "task_edge_outcome_conflict" in receipt.reason
     assert not (service.get_snapshot().overlay.get("edges") or {})
-    service.close()
-
-
-def test_successful_task_aggregates_success_edge_when_another_edge_failed(tmp_path: Path) -> None:
-    _publish_static(tmp_path, "static-v1", include_edge=True)
-    service = GraphObservationService(tmp_path)
-    value = _evidence("mixed-outcome", "session-1", static_revision="static-v1")
-    failed = EvolutionGraphEdge(
-        source="extract",
-        target="summarize",
-        metadata=EvolutionEdgeMetadata(
-            success=False,
-            failure_domain=FailureDomain.ORCHESTRATION,
-        ),
-    )
-    value = value.model_copy(
-        update={
-            "execution_graph": value.execution_graph.model_copy(
-                update={"edges": (*value.execution_graph.edges, failed)}
-            )
-        }
-    )
-
-    receipt = service.submit(value)
-    service.flush()
-
-    assert receipt.status == "accepted"
-    stats = _only_edge(service.get_snapshot().overlay)
-    assert stats["success_count"] == 1
-    assert stats["failure_count"] == 0
     service.close()
 
 
@@ -330,7 +315,7 @@ def test_runtime_only_edge_requires_two_current_revision_sessions(tmp_path: Path
     service.close()
 
 
-def test_runtime_weight_applies_to_all_static_edges_for_the_observed_relation(tmp_path: Path) -> None:
+def test_runtime_weight_only_applies_to_the_observed_port_mapping(tmp_path: Path) -> None:
     _publish_static(tmp_path, "static-v1", include_edge=True, include_alternate_mapping=True)
     service = GraphObservationService(tmp_path)
     service.submit(_evidence("text-mapping", "session-1", static_revision="static-v1"))
@@ -351,7 +336,7 @@ def test_runtime_weight_applies_to_all_static_edges_for_the_observed_relation(tm
     }
 
     assert by_mapping[(("text", "text"),)]["runtime_weight"] == pytest.approx(1.05)
-    assert by_mapping[(("title", "title"),)]["runtime_weight"] == pytest.approx(1.05)
+    assert "runtime_weight" not in by_mapping[(("title", "title"),)]
     plan_edge = edge_plan_item(by_mapping[(("text", "text"),)])
     assert plan_edge["planner_weight"] == pytest.approx(0.84)
     assert "effective_score" not in plan_edge
@@ -388,10 +373,10 @@ def test_dynamic_candidates_preserve_the_static_candidate_subgraph(tmp_path: Pat
     overlay = {
         "edges": {
             "runtime-neighbor": {
-                "identity_schema": POINT_EDGE_IDENTITY_SCHEMA,
                 "source_id": "runtime-neighbor",
                 "target_id": "seed",
                 "relation_type": "can_feed",
+                "port_mappings": [{"source_output": "text", "target_input": "text"}],
                 "binding_status": "active_static",
                 "runtime_weight": 2.0,
                 "success_count": 20,
@@ -425,34 +410,6 @@ def test_dynamic_candidates_preserve_the_static_candidate_subgraph(tmp_path: Pat
         ("static-neighbor", "seed"),
         ("runtime-neighbor", "seed"),
     }
-
-
-def test_legacy_port_identity_overlay_is_not_consumed(tmp_path: Path) -> None:
-    _publish_static(tmp_path, "static-v1", include_edge=False)
-    artifacts = load_graph_artifacts(tmp_path)
-    legacy_overlay = {
-        "edges": {
-            "legacy": {
-                "source_id": "extract",
-                "target_id": "summarize",
-                "relation_type": "can_feed",
-                "binding_status": "active_runtime_only",
-                "port_mappings": [{"source_output": "text", "target_input": "text"}],
-                "success_count": 2,
-                "failure_count": 0,
-                "attempt_count": 2,
-            }
-        }
-    }
-
-    resolved = RuntimeEdgeResolver(
-        artifacts,
-        min_edge_confidence=0.5,
-        candidate_skill_ids=("extract",),
-        dynamic_overlay=legacy_overlay,
-    ).resolve()
-
-    assert resolved == []
 
 
 def test_removed_static_edge_is_quarantined_until_fresh_revalidation(tmp_path: Path) -> None:
@@ -570,22 +527,6 @@ def test_observed_at_requires_an_explicit_timezone() -> None:
         GraphEvolutionInput.model_validate(payload)
 
 
-@pytest.mark.parametrize("legacy_field", ["capabilities", "edge_evidence", "task_evidence", "node_metadata"])
-def test_deleted_observation_fields_are_rejected(legacy_field: str) -> None:
-    payload = _evidence("legacy-field", "session-1", static_revision="static-v1").model_dump(mode="json")
-    if legacy_field == "capabilities":
-        payload["capabilities"] = {"extract": {"content_hash": "legacy"}}
-    elif legacy_field == "edge_evidence":
-        payload["execution_graph"]["edges"][0]["metadata"]["evidence_refs"] = ["legacy"]
-    elif legacy_field == "task_evidence":
-        payload["task"]["outcome"]["evidence_refs"] = ["legacy"]
-    else:
-        payload["execution_graph"]["nodes"]["extract"]["metadata"] = {"version": "legacy"}
-
-    with pytest.raises(ValueError):
-        GraphEvolutionInput.model_validate(payload)
-
-
 def _publish_static(
     root: Path,
     version: str,
@@ -679,6 +620,7 @@ def _evidence(
     task_failure_domain: FailureDomain | None = None,
     edge_success: bool | None = True,
     edge_failure_domain: FailureDomain | None = None,
+    edge_evidence_refs: tuple[str, ...] = ("otlp://trace/span-edge",),
 ) -> GraphEvolutionInput:
     return GraphEvolutionInput(
         evidence_id=evidence_id,
@@ -698,19 +640,29 @@ def _evidence(
                 label=task_outcome,
                 evidence_strength=strength,
                 failure_domain=task_failure_domain,
+                evidence_refs=("evaluator:task",),
             ),
         ),
+        capabilities={
+            "extract": CapabilityEvidence(
+                content_hash="content-extract-v1",
+            ),
+            "summarize": CapabilityEvidence(
+                content_hash="content-summarize-v1",
+            ),
+        },
         execution_graph=EvolutionGraph(
             id=f"execution-{evidence_id}",
             type="execution_graph",
-            nodes={"extract": {"label": "skill"}, "summarize": {"label": "skill"}},
             edges=(
                 EvolutionGraphEdge(
                     source="extract",
                     target="summarize",
                     metadata=EvolutionEdgeMetadata(
+                        port_mappings=(PortMapping(source_output="text", target_input="text"),),
                         success=edge_success,
                         failure_domain=edge_failure_domain,
+                        evidence_refs=edge_evidence_refs,
                     ),
                 ),
             ),

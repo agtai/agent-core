@@ -2,9 +2,9 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 import asyncio
 import contextvars
-import functools
 import inspect
 from typing import Any
+import functools
 
 from openjiuwen.core.session.checkpointer import Checkpointer
 from openjiuwen.core.session.config.base import (
@@ -36,17 +36,24 @@ from openjiuwen.core.session.internal.wrapper import (
     RouterSession,
     WrappedSession,
 )
-from openjiuwen.core.session.session import BaseSession, ProxySession, Session
+from openjiuwen.core.session.session import (
+    BaseSession,
+    ProxySession
+)
 from openjiuwen.core.session.state.base import Transformer
 from openjiuwen.core.session.state.workflow_state import CommitState
 from openjiuwen.core.session.utils import (
-    NESTED_PATH_SPLIT,
     EndFrame,
     extract_origin_key,
     get_by_schema,
     get_value_by_nested_path,
     is_ref_path,
+    NESTED_PATH_SPLIT,
 )
+
+
+
+from openjiuwen.core.session.session import Session
 
 deprecated = ["Session"]
 
@@ -55,31 +62,6 @@ _current_session = contextvars.ContextVar("current_session", default=None)
 
 def get_current_session():
     return _current_session.get()
-
-
-def _reset_current_session(
-    token: contextvars.Token,
-    previous: Any,
-    target_session: Any,
-) -> None:
-    """Restore ``current_session`` after ``with_session``.
-
-    ``ContextVar.reset(token)`` raises ``ValueError`` when the token was
-    created in another Context (common for async generators closed from a
-    different task, e.g. ReAct ``create_task(stream_process)`` + yield).
-
-    Cross-Context cleanup cannot clear the *producer* Context (tokens are
-    Context-bound), so that value may remain until that Context ends. On any
-    path we only restore when the *active* Context still holds
-    ``target_session``: unconditional ``reset`` / ``set(previous)`` would
-    otherwise clobber a nested closer that already bound a different session.
-    """
-    if _current_session.get() is not target_session:
-        return
-    try:
-        _current_session.reset(token)
-    except ValueError:
-        _current_session.set(previous)
 
 
 def with_session_for_class(cls):
@@ -119,13 +101,12 @@ def with_session(session: Any = None):
             @functools.wraps(func)
             async def async_gen_wrapper(*args, **kwargs):
                 target_session = get_target_session(args, kwargs)
-                previous = _current_session.get()
                 token = _current_session.set(target_session)
                 try:
                     async for value in func(*args, **kwargs):
                         yield value
                 finally:
-                    _reset_current_session(token, previous, target_session)
+                    _current_session.reset(token)
 
             return async_gen_wrapper
 
@@ -133,13 +114,12 @@ def with_session(session: Any = None):
             @functools.wraps(func)
             def sync_gen_wrapper(*args, **kwargs):
                 target_session = get_target_session(args, kwargs)
-                previous = _current_session.get()
                 token = _current_session.set(target_session)
                 try:
                     for value in func(*args, **kwargs):
                         yield value
                 finally:
-                    _reset_current_session(token, previous, target_session)
+                    _current_session.reset(token)
 
             return sync_gen_wrapper
 
@@ -148,24 +128,22 @@ def with_session(session: Any = None):
                 @functools.wraps(func)
                 async def async_wrapper(*args, **kwargs):
                     target_session = get_target_session(args, kwargs)
-                    previous = _current_session.get()
                     token = _current_session.set(target_session)
                     try:
                         return await func(*args, **kwargs)
                     finally:
-                        _reset_current_session(token, previous, target_session)
+                        _current_session.reset(token)
 
                 return async_wrapper
             else:
                 @functools.wraps(func)
                 def sync_wrapper(*args, **kwargs):
                     target_session = get_target_session(args, kwargs)
-                    previous = _current_session.get()
                     token = _current_session.set(target_session)
                     try:
                         return func(*args, **kwargs)
                     finally:
-                        _reset_current_session(token, previous, target_session)
+                        _current_session.reset(token)
 
                 return sync_wrapper
 
@@ -175,7 +153,6 @@ def with_session(session: Any = None):
 __all__ = [
     # session
     "BaseSession",
-    "Session",
     "WrappedSession",
     "ProxySession",
 

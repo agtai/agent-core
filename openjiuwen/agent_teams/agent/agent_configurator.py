@@ -9,7 +9,6 @@ import os
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
     Callable,
     Optional,
 )
@@ -40,10 +39,8 @@ from openjiuwen.agent_teams.skill.rail_spec import (
     build_team_skill_rail_spec,
     complete_declared_team_skill_rails,
 )
-from openjiuwen.agent_teams.tools.tool_group_chat import group_chat_prompt
 from openjiuwen.agent_teams.tools.team import TeamBackend
 from openjiuwen.core.common.logging import team_logger
-from openjiuwen.core.foundation.llm import ProviderType
 from openjiuwen.core.runner.spawn.agent_config import (
     SpawnAgentConfig,
 )
@@ -68,14 +65,13 @@ _TEAM_WORKTREE_BASH_DENY_PATTERNS = [
 def _resolve_team_mode(spec: TeamAgentSpec) -> str:
     if spec.team_mode is not None:
         return spec.team_mode
-    # HUMAN_AGENT / PASSIVE_HUMAN predefined members are HITT roster
-    # declarations, and BRIDGE_AGENT entries are bridge-to-remote
-    # declarations — none is a signal to flip the team away from
-    # "default". A roster of ordinary predefined teammates derives
-    # "hybrid": the leader keeps its spawn_* tools so the roster can
-    # still grow at runtime. Lock it down by setting an explicit
-    # "predefined" team_mode.
-    avatar_roles = {TeamRole.HUMAN_AGENT, TeamRole.PASSIVE_HUMAN, TeamRole.BRIDGE_AGENT}
+    # HUMAN_AGENT predefined members are HITT roster declarations, and
+    # BRIDGE_AGENT entries are bridge-to-remote declarations — neither
+    # is a signal to flip the team away from "default". A roster of
+    # ordinary predefined teammates derives "hybrid": the leader keeps
+    # its spawn_* tools so the roster can still grow at runtime.
+    # Lock it down by setting an explicit "predefined" team_mode.
+    avatar_roles = {TeamRole.HUMAN_AGENT, TeamRole.BRIDGE_AGENT}
     non_avatar_predefined = [m for m in spec.predefined_members if m.role_type not in avatar_roles]
     return "hybrid" if non_avatar_predefined else "default"
 
@@ -253,12 +249,10 @@ class AgentConfigurator:
         spec: TeamAgentSpec,
         ctx: TeamRuntimeContext,
         *,
-        on_teammate_created: Callable[[str], Awaitable[None]] | None = None,
-        on_teammate_restarted: Callable[[str], Awaitable[bool]] | None = None,
-        on_teammate_stopped: Callable[[str], Awaitable[None]] | None = None,
-        on_before_team_cleaned: Callable[[], Awaitable[None]] | None = None,
-        on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
-        on_team_built: Callable[[], Awaitable[None]] | None = None,
+        on_teammate_created=None,
+        on_before_team_cleaned=None,
+        on_team_cleaned=None,
+        on_team_built=None,
     ) -> None:
         """Phase 1: set spec/context, create messager, workspace manager, prepare team backend."""
         agent_spec = self.resolve_agent_spec(spec, ctx.role, ctx.member_name)
@@ -303,8 +297,6 @@ class AgentConfigurator:
             on_before_team_cleaned=on_before_team_cleaned,
             on_team_cleaned=on_team_cleaned,
             on_team_built=on_team_built,
-            on_member_restarted=on_teammate_restarted,
-            on_member_stopped=on_teammate_stopped,
         )
 
         if ctx.role == TeamRole.LEADER and spec.worktree and spec.worktree.enabled:
@@ -627,7 +619,7 @@ class AgentConfigurator:
             RailSpec(
                 type=TEAM_POLICY,
                 params={
-                    "prompt": (ctx.prompt or "") + group_chat_prompt(spec),
+                    "prompt": ctx.prompt or "",
                     "display_name": ctx.display_name or "",
                     "member_workspace_path": workspace_root_path,
                     "lifecycle": spec.lifecycle,
@@ -961,11 +953,9 @@ class AgentConfigurator:
         ctx: TeamRuntimeContext,
         messager: Messager,
         *,
-        on_before_team_cleaned: Callable[[], Awaitable[None]] | None = None,
-        on_team_cleaned: Callable[[], Awaitable[None]] | None = None,
-        on_team_built: Callable[[], Awaitable[None]] | None = None,
-        on_member_restarted: Callable[[str], Awaitable[bool]] | None = None,
-        on_member_stopped: Callable[[str], Awaitable[None]] | None = None,
+        on_before_team_cleaned=None,
+        on_team_cleaned=None,
+        on_team_built=None,
     ) -> TeamBackend:
         """Construct the TeamBackend and register cleanup paths.
 
@@ -985,10 +975,6 @@ class AgentConfigurator:
             on_team_built: Optional async callback threaded into the
                 ``TeamBackend`` so the hosting ``TeamAgent`` can persist
                 DB lifecycle state after ``build_team`` succeeds.
-            on_member_restarted: Optional async callback used to rebuild a
-                member runtime after ERROR is claimed for recovery.
-            on_member_stopped: Optional async callback used to clean a stale
-                runtime handle when an ERROR member is shut down directly.
         """
         from openjiuwen.agent_teams.schema.status import MemberMode
         from openjiuwen.agent_teams.spawn.shared_resources import get_shared_db
@@ -998,16 +984,6 @@ class AgentConfigurator:
 
         is_leader = ctx.role == TeamRole.LEADER
         current_member_name = ctx.member_name or (ctx.team_spec.leader_member_name if ctx.team_spec else "")
-        current_agent_spec = self.resolve_agent_spec(spec, ctx.role, ctx.member_name)
-        current_model_config = ctx.member_model or current_agent_spec.model
-        current_model_name = None
-        current_model_provider = None
-        if current_model_config is not None:
-            request_config = current_model_config.model_request_config
-            if request_config is not None:
-                current_model_name = request_config.model_name
-            provider = current_model_config.model_client_config.client_provider
-            current_model_provider = provider.value if isinstance(provider, ProviderType) else provider
         agent_team = TeamBackend(
             team_name=team_name,
             member_name=current_member_name,
@@ -1018,9 +994,6 @@ class AgentConfigurator:
             predefined_members=spec.predefined_members or None,
             model_config_allocator=self.model_allocator.allocate if self.model_allocator else None,
             leader_allocation=self.leader_allocation if is_leader else None,
-            model_pool_provider=lambda: list(ctx.team_spec.model_pool) if ctx.team_spec is not None else [],
-            current_model_name=current_model_name,
-            current_model_provider=current_model_provider,
             leader_prompt=ctx.prompt if is_leader else "",
             enable_hitt=spec.enable_hitt,
             enable_bridge=spec.enable_bridge,
@@ -1034,8 +1007,6 @@ class AgentConfigurator:
             on_team_cleaned=on_team_cleaned,
             on_team_built=on_team_built,
             on_member_started=self._on_teammate_created,
-            on_member_restarted=on_member_restarted,
-            on_member_stopped=on_member_stopped,
             leader_member_name=ctx.team_spec.leader_member_name if ctx.team_spec else None,
         )
 
@@ -1047,7 +1018,6 @@ class AgentConfigurator:
                     return len(native.get_current_context())
             return 0
 
-        agent_team.group_chat_spec = spec
         agent_team.set_snapshot_length(_snapshot_length)
 
         self.team_backend = agent_team
