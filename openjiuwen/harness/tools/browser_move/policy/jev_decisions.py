@@ -11,6 +11,7 @@ the head matching the chosen operation is used.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -251,9 +252,15 @@ class JevDecisionsClient:
             if response.is_error:
                 raise build_error(
                     StatusCode.MODEL_CALL_FAILED,
-                    error_msg=f"decisions endpoint returned HTTP {response.status_code}: {response.text[:300]}",
+                    error_msg=f"decisions endpoint returned HTTP {response.status_code}",
                 )
-            return response.json(), round((time.perf_counter() - started) * 1000)
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise build_error(
+                    StatusCode.MODEL_CALL_FAILED, cause=exc, error_msg="decisions endpoint returned a malformed body"
+                ) from exc
+            return payload, round((time.perf_counter() - started) * 1000)
         raise build_error(StatusCode.MODEL_CALL_FAILED, error_msg="decisions endpoint unavailable")
 
     async def close(self) -> None:

@@ -66,7 +66,7 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
         fallback, language="en", client=None, goal_value_cache=args.goal_value_cache, value_model=value_model
     )
     print(f"value model: {_first_env('JEV_VALUE_MODEL') or 'chat fallback'}")
-    print(f"decisions: {decider._client.model} via {decider._client.url}")
+    print(f"decisions: {decider._decisions.model} via {decider._decisions.url}")
 
     agent = create_browser_agent(decider, language="en")
     conversation_id = f"jiuwen-jev-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:6]}"
