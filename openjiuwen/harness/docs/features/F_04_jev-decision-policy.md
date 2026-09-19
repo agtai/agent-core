@@ -6,8 +6,8 @@
 |---|---|
 | 类型 | feature |
 | 日期 | 2026-09-19 |
-| 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`openjiuwen/harness/schema/decision_policy.py`（新增，review 修订）、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`tests/unit_tests/harness/tools/browser_move/` |
-| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10）；WAIT 就地稳定优化后 **770 passed, 26 xfailed**（另增 9 个用例，覆盖决策 11-12） |
+| 范围 | `openjiuwen/harness/tools/browser_move/policy/`（新增）、`.../runtime/runtime.py`（`probe_for_policy` / `activate_page`）、`openjiuwen/harness/subagents/browser_agent.py`、`openjiuwen/harness/schema/decision_policy.py`（新增，review 修订）、`.../backends/browser_use/sidecar/session_adapter.py`（`type_text` 清空目标）、`.../lab/run_jiuwen_jev.py`、`.../lab/profiler.py`（新增）、`.../policy/prompts.py`（决策 15）、`.../policy/jev_decision_model.py`（决策 14、16）、`.../policy/jev_decisions.py`（决策 18、19）、`.../backends/browser_use/sidecar/session_adapter.py`（决策 17）、`tests/unit_tests/harness/tools/browser_move/` |
+| 测试基线 | `pytest tests/unit_tests/harness/tools/browser_move -q` → 改动后 **748 passed, 26 xfailed, 3 warnings in 3.04s**（含本文新增 8 个用例）；`fix/jev-policy-review` 审查修复后 **761 passed, 26 xfailed**（另增 14 个用例，覆盖 B1-B6，见下方决策 8-10）；WAIT 就地稳定优化后 **770 passed, 26 xfailed**（另增 9 个用例，覆盖决策 11-12）；决策 14-15 后 **774 passed, 26 xfailed**（`TestJevActionSettle` 新增 3 个用例、改写 1 个；`test_lab_profiler.py` 另有 2 个）；决策 16 后 **776 passed, 26 xfailed**（`TestJevPrefetchSwitch` 新增 2 个，跨文档隔离用例改写）；决策 18-19 后 **780 passed, 26 xfailed**（`TestJevDecisionsClientTransportRetry` 新增 3 个，请求形状用例增补 click head 断言，profiler 用例增补 1 个） |
 | 关联 feature | [[F_02_browser-semantic-neutrality]]（同一子系统；本文不改语义中立判定） |
 | 关联 spec | [[S_18_subagents-and-lifecycle]]（不变量 6 增补：策略模型直通） |
 
@@ -188,6 +188,75 @@ prefetch 失败路径行为一致。
 
 两处都是 B4/B5 已关闭功能内部的完成度补丁，不是新范围；改动各一行，随 WAIT 优化一起被发现。
 
+### 14. 动作之后先就地稳定，再问分类器
+
+动作后的首次探测常在效果显现之前返回：Google Flights 的日期对话框在点击 "Done" 后约 300～700 ms
+才关闭，60 ms 的 DOM 静默窗口早已触发，快照里仍是 52 个日历格、没有 Search 按钮。旧流程把这张
+"动作前"的页面交给分类器，换来一次 WAIT 判决（约 0.5 s 的决策请求），然后才由决策 11 的就地稳定
+看到对话框关闭。`_probe` 现在在 `page_key` 与动作前相同时先调用 `_settle_action`：从
+`ACTION_SETTLE_START_MS`（250 ms）起步、逐次加倍的**墙钟等待**（`quiet_ms` 等于 `settle_ms`，静默的
+DOM 不会提前结束等待）反复探测，直到 `page_key` 变化或 `ACTION_SETTLE_BUDGET_MS`（1000 ms）用尽。
+花掉的时间计入 `run.settle_spent_ms`，与 WAIT 连击共用决策 12 的 3 s 预算，一步的页内等待总量不变。
+`page_changed` 因此反映稳定之后的探测结果（原单测
+`test_page_changed_reflects_the_first_post_action_probe_not_a_later_settle_discovery` 改写进
+`TestJevActionSettle`）。实跑：13 次决策 / 2 次 WAIT 降为 12 次 / 1 次；剩下那次 WAIT 出现在按下
+Search 之后，页面已经变化、结果仍在加载，分类器答 WAIT 是正当的。
+
+### 15. 补回两条规则：填好的字段不等于已提交；Search/Submit 可见即按下
+
+`refactor(harness): rewrite the Jev policy text and probe in the project's own words` 用本项目措辞重写
+`policy/prompts.py` 时，上游 `NEXT_ACTION` 里的 "a populated field alone is not an applied search" 与
+"If Search/Submit is visible and the required fields are ready, CLICK it immediately" 没有对应句子。
+实跑 3/3 次：点击 "Done" 后对话框尚未关闭的快照上，分类器答 DONE（置信度 0.19～0.22），任务在没有
+按 Search 的首页结束；`run_jiuwen_jev` 报 DONE，但最终 URL 不是 `/travel/flights/search`。换回上游
+规则文本，2/2 次在同一状态答 WAIT 并完成；以本项目措辞补回这两条后（决策 14 之前）2/2 次完成。
+该重写提交信息里的 "DONE in 8.9 s with 9 interactions, 10 Jev requests and 0 waits" 就是这条提前
+DONE 的路径，不是更快的完成。
+
+### 16. 取值预取是显式开关，按"文档 + 字段"键控，不按 `page_key`
+
+预取的含义：只要探测看到可编辑字段，就为每个字段在后台向聊天模型要一次"该填什么"，不管 Jev 后来
+会不会在那里打字。这是用调用次数换关键路径上的等待——一个只点击不输入的任务，每个文档上有几个
+可编辑字段就白付几次调用。`JevDecisionModel(prefetch_values=...)` 因此是必填参数，没有默认值；
+`run_jiuwen_jev` 以 `--prefetch on|off`（必填）暴露它，关时取值在 Jev 选定 `TYPE_TEXT` 后同步生成
+（`value_source="llm"`，与上游 jev-ultrafast 的做法相同）。
+
+键控同批修正：原 `_field_key` 把 `page_key` 并进键里（决策 9），而 `page_key` 含每个输入的值、可见
+控件的 id 列表与控件计数，几乎每个动作之后都会变。`_prefetch_values` 开头会取消所有不以当前
+`page_key` 开头的任务，于是每一步都把上一步发出的、快要完成的调用取消重发；`TYPE_TEXT` 到来时
+等的是本回合刚发出的那次，实测每个字段仍等 200～620 ms，一跑 22～28 次调用只用到 2～3 个值。
+现在的键是 `URL 主机+路径 | stamp id | label`（`_document_key` / `_field_key`）：stamp id 在节点留在
+文档内期间不变，值在页面逐步填写的过程中一直可用；换文档（路径变化）才取消上一文档的任务。
+实跑：开 → `value_wait` 0 ms、每跑 9～12 次调用；关 → `value_wait` 2.0～2.4 s、每跑 3 次调用。
+
+### 17. 被驱动的标签页在 sidecar 连接时打开焦点仿真
+
+后台标签页把定时器节流到约 1 Hz，`requestAnimationFrame` 完全不跑：实测一个 60 ms 的 `setTimeout` 在
+被另一个标签页遮住时用了 347 ms，两帧 rAF 3 s 内没有回来。探测脚本全靠定时器，一次探测因此拖到
+1.2～2.6 s，之后才由决策 4 的 `activate_page` 前置标签页重探；一次实跑里这种情况出现三次，共约 7 s。
+`session_adapter.connect()` 现在在拿到 CDP 会话后调用 `Emulation.setFocusEmulationEnabled(true)`
+（jev-ultrafast 的 `Browser.__init__` 同样如此）：同一实验里定时器回到 61 ms、rAF 11 ms，
+`document.visibilityState` 报告 visible、`hasFocus()` 为 true；经真实 sidecar 把被驱动标签页压到另一
+标签页之后再测，60 ms 定时器 62 ms。调用是尽力而为（失败只记录、不阻断连接），决策 4 的前置路径
+保留为兜底。sidecar 在独立 venv 中运行，没有单测（遗留 6），验证靠上述实测。
+
+### 18. click head 把可编辑字段标为 "Open <label>"
+
+一次决策请求里，`click_target` 与 `type_text_target` 两个问题原本对同一个可编辑字段给出相同的行
+`[18] Departure`，operation 问题只能靠规则判断"日期框是点还是打字"。9 次实跑中 4 次分类器对
+Departure 答 TYPE_TEXT（置信度 0.39～0.46），取值模型再对标签 "Departure" 生成 "Zurich" 并打进日期
+框（日期选择器随后仍被打开、日期点击修正了它，但在别的站点这会留下非法表单值）。jev-ultrafast 的
+快照为可编辑元素单独生成点击候选 `Open <label>`，其 click head 因此显示 `[18] Open Departure`，两次
+OpenRouter 实跑都在该行选了 CLICK。`jev_decisions._head_label` 现在对 CLICK head 的可编辑项加 "Open "
+前缀；元素表与 type_text head 不变。
+
+### 19. 决策请求 5 s 超时，传输层失败重试一次
+
+`JevDecisionsClient` 原来只对 429/503/529 重试，连接错误或读超时直接失败；超时 25 s。一次实跑在第
+10 次决策遇到 OpenRouter 连接挂死，等满 25 s 后整个任务以 BLOCKED 收场。Jev 经代理的实测延迟是
+0.4～1.3 s，`DECISIONS_TIMEOUT_S` 因此定为 5 s，`httpx.TransportError`（连接错误、读写超时）重试一次
+再失败，一次挂死最多损失约 10 s 而不是 25 s。
+
 ## 拒绝的方案
 
 1. **`browser_jev_run` 运行时工具**：LLM 仍决定何时委托，每次委托多一回合 LLM。
@@ -230,6 +299,42 @@ prefetch 失败路径行为一致。
 
 总时长含约 2.6 s 的导航与页面加载；每步约 0.69 s = Jev 0.48 s + 探测 0.15 s + 循环与动作 0.06 s。
 
+
+### 同一时钟下与 jev-ultrafast 的对比（2026-09-19）
+
+jev-ultrafast 的计时从**首次决策请求**起到最终 DONE 止，不含导航、加载与首次观察；上表的"总时长"
+含这些。`lab/profiler.py` 按同一定义给出"窗口"，下表两边都用它，两边都跑在 `BROWSER_CDP_URL`
+的同一台 Chrome 上，都经 OpenRouter（jev-ultrafast 的 `openrouter` 分支只把 decisions URL 改为读
+`TYPESAFE_API_URL`）。"校验"对本文是"分类器答 DONE 且最终 URL 路径为 `/travel/flights/search`"，
+对 jev-ultrafast 是其 `examples/flights.py:verify`。
+
+| 运行 | 窗口 | Jev 请求（丢弃） | 交互 | 等待 | Jev 中位 | 校验 |
+|---|---|---|---|---|---|---|
+| jev-ultrafast `openrouter` 分支 ×2 | 11.8 s / 11.9 s | 19 (9) / 18 (8) | 10 | 0 | 446 / 473 ms | 通过 ×2 |
+| 本文，重写后的规则文本 ×3 | 8.1 / 7.6 / 8.8 s | 10 (0) | 9 | 0 | 469～507 ms | 未通过 ×3（提前 DONE） |
+| 本文 + 决策 15 ×2 | 10.3 / 9.3 s | 13 (0) | 10 | 2 | 456 / 457 ms | 通过 ×2 |
+| 本文 + 决策 14 + 15 ×2 | 10.4 / 10.1 s | 12 (0) | 10 | 1 | 501 / 480 ms | 通过 ×2 |
+| 本文 + 决策 14-16，`--prefetch on` ×2 | 9.0 / 13.9 s | 12 (0) | 10 | 1 | 503 / 493 ms | 通过 ×2（第二次含后台标签页节流约 4 s） |
+| 本文 + 决策 14-16，`--prefetch off` ×2 | 13.3 / 11.3 s | 12 (0) | 10 | 1 | 453 / 508 ms | 通过 ×2（第一次含后台标签页节流约 2 s） |
+| 本文 + 决策 14-19，`--prefetch on` ×3 | 9.7 / 9.0 / 10.7 s | 12 (0) | 10 | 1 | 487 / 512 / 466 ms | 通过 ×3 |
+| 本文 + 决策 14-19，`--prefetch off` ×3 | 11.3 / 16.5 / 12.3 s | 12 (0) | 10 | 1 | 479 / 483 / 559 ms | 通过 ×3（第二次一个请求 5,995 ms：5 s 超时 + 重试一次，决策 19） |
+| jev-ultrafast 文档（TypeSafe 直连） | 7.1 s | 17 (6) | 11 | 1 | 178 ms | 通过 |
+
+决策 17-19 之后的六次实跑（三次一臂交替，browser-harness 守护进程已停）没有再出现后台标签页节流（`activate_page` 零次）；两臂的窗口中位数为 9.7 s 与 12.3 s，`value_wait` 为 0 与 2.2～2.6 s。
+
+预取开关两臂之间稳定的差异在 `value_wait`（关键路径上等待取值的时间）与取值调用数：开为 0 ms、9～12 次，关为 2.0～2.4 s、3 次；窗口总时长另受两种噪声影响——Jev 中位在 450～510 ms 间漂移，以及 sidecar 留下的标签页增多后被驱动的标签页偶尔转入后台（探测报告 hidden，`activate_page` 前置后重探，一次约 2～4 s）。另有一次 `--prefetch on` 实跑在第 10 次决策处遇到 OpenRouter 连接超时（25 s）而 BLOCKED，是端点噪声，不计入表中。
+
+窗口的分相（本文 + 决策 14 + 15，10.1 s 那次）：Jev 5.9 s、探测 2.3 s（12 次，全部在 sidecar
+`evaluate` 内）、等待取值 1.5 s、工具 0.34 s（10 次，每次约 30 ms）、框架间隙 0.06 s、模型侧
+Python 0.01 s。jev-ultrafast 在 OpenRouter 上的 11.9 s：Jev 8.9 s（每次观察后立即决策、页面变了就
+丢弃，8～9 次丢弃约 4 s）、取值 1.4 s（在关键路径上）、CDP 1.5 s。两边经代理时每次决策约比直连
+多 0.3 s；本文 12 次决策在代理上花 5.9 s，其文档里 17 次直连花 3.0 s，所以 7 s 只能靠直连达到。
+
+profiler：`lab/profiler.py` 的 `JevProfiler().attach()` 在 7 个接缝打点（模型回合、`probe_for_policy`、
+`activate_page`、`JevDecisionsClient.decide`、取值生成、`AbilityManager.execute`、
+`SidecarTransport.request`），`report()` 用上述时钟，`render()` 打印分相与逐步表；`run_jiuwen_jev`
+默认挂载，`--profile-out` 写 JSON，含每次决策看到的元素标签、可选操作与各 head 的答案。
+
 ## 已知遗留
 
 审查关闭（`fix/jev-policy-review`）：每任务状态复用（B1）、决策客户端覆盖 `Model._client`
@@ -243,12 +348,11 @@ prefetch 失败路径行为一致。
 2. 声明式路径（`SubAgentConfig` / `TaskTool` 派生的 browser_agent）没有 `decision_backend`，仍用父模型。
 3. 决策客户端直接用 `httpx.AsyncClient`，未走 `core/common/clients` 的连接池。
 4. 每次 sidecar `connect()` 在 Chrome 里留下额外标签页。
-5. OpenRouter 转发使每次 Jev 约 0.45 s，是当前下限；TypeSafe 直连需邀请。
+5. OpenRouter 转发使每次 Jev 约 0.45～0.5 s（实测中位 456～507 ms，直连文档值 178 ms），是当前下限；TypeSafe 直连需邀请。
 6. sidecar `type_text` 清空目标的改动无单测（sidecar 在独立 venv 中运行）。
-7. WAIT 就地稳定优化未做实跑 A/B：`TYPESAFE_API_KEY` 在本地存在，但决策端点对当前凭据返回
-   401，判断是基础设施/凭据问题而非代码缺陷，不在本轮范围内排查。上表的 pending 行只由单测
-   验证过（`TestJevWaitCollapsesIntoInPageSettling` 断言探测调用次数多于决策调用次数），实际
-   墙钟收益需要凭据可用后补测，不得用现有行数做算术推出。
+7. 已关闭（2026-09-19）：用 `OPENROUTER_API_KEY` 请求 `https://openrouter.ai/api/alpha/decisions`
+   返回 200，之前记录的 401 未复现。WAIT 就地稳定与决策 14/15 的实跑结果见"同一时钟下与
+   jev-ultrafast 的对比"一表。
 8. `_decide_message` 循环体后仍留着一条 `return self._final(run, "BLOCKED", snapshot, "waited
    without progress")`（紧跟 `for` 循环之后）。这段代码不可达：循环唯一的非 `return` 出口是
    `WAIT` 分支的 `continue`，而该分支自身已经在 `run.consecutive_waits > MAX_CONSECUTIVE_WAITS`
@@ -258,3 +362,8 @@ prefetch 失败路径行为一致。
    `page_key` 未变的快照 + 未变的历史只会换来同一个 `WAIT`；若实跑中观察到分类器对逐字相同的
    输入给出不同判决（采样温度、服务端版本漂移），这个假设就不成立，届时应把终态改回"再问一
    次，仅当第二次仍是 `WAIT` 才 BLOCKED"。当前无凭据可实测（同遗留 7），故按确定性假设实现。
+10. 已关闭（决策 16）：预取改按文档 + stamp id + label 键控并成为显式开关；开时 `value_wait` 为 0、
+    每跑 9～12 次调用。
+11. 取值模型对标签为 "Departure" 的日期字段生成 "Zurich"（多次实跑），分类器对该字段有
+    0.39～0.46 的概率选 TYPE_TEXT 而非 CLICK。决策 18 给 click head 加了 "Open <label>" 前缀；
+    取值模型本身对日期字段的取值仍未改。
