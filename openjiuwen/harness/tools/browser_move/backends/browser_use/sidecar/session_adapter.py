@@ -155,6 +155,13 @@ class SessionAdapter:
         await self._session.start()
         self._cdp_session = await self._session.get_or_create_cdp_session()
         await self._ensure_dialog_listener()
+        # A backgrounded tab throttles timers to ~1 Hz and never runs rAF; focus emulation keeps it rendering.
+        try:
+            await self._cdp_session.cdp_client.send.Emulation.setFocusEmulationEnabled(
+                params={"enabled": True}, session_id=self._cdp_session.session_id
+            )
+        except Exception:  # noqa: BLE001 - best-effort; runtime.activate_page still covers a hidden tab
+            pass
 
         version_info: dict[str, Any] = {}
         try:

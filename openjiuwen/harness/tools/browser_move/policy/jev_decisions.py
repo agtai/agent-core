@@ -39,6 +39,8 @@ _OPERATION_LABELS = {
     "BLOCKED": "None of the offered operations can move the task forward.",
 }
 _RETRY_STATUSES = frozenset({429, 503, 529})
+DECISIONS_TIMEOUT_S = 5.0  # Jev answers in 0.4 to 1.3 s through the proxy; a dead connection must not stall a step
+_TRANSPORT_RETRIES = 1
 _HISTORY_KEYS = ("action", "kind", "text", "page_changed")
 
 
@@ -114,6 +116,12 @@ def build_action_space(snapshot: dict[str, Any]) -> ActionSpace:
     return space
 
 
+def _head_label(operation: str, item: dict[str, Any]) -> str:
+    """The click head names an editable field "Open <label>": clicking it opens its picker or suggestion list."""
+    label = str(item.get("label", ""))
+    return f"Open {label}" if operation == "CLICK" and item.get("editable") else label
+
+
 def build_request(
     space: ActionSpace,
     snapshot: dict[str, Any],
@@ -138,7 +146,7 @@ def build_request(
             "type": "choice",
             "criteria": {
                 key: {
-                    "element": f"[{key}] {candidate.item.get('label', '')}",
+                    "element": f"[{key}] {_head_label(operation, candidate.item)}",
                     "current_value": candidate.item.get("value") or "",
                     **({"option": candidate.option_label} if candidate.option_label else {}),
                     **{
@@ -242,6 +250,12 @@ class JevDecisionsClient:
         for attempt in range(3):
             try:
                 response = await self._client.post(self.url, json=body)
+            except httpx.TransportError as exc:
+                if attempt < _TRANSPORT_RETRIES:
+                    continue
+                raise build_error(
+                    StatusCode.MODEL_CALL_FAILED, cause=exc, error_msg="decisions connection failed"
+                ) from exc
             except httpx.HTTPError as exc:
                 raise build_error(
                     StatusCode.MODEL_CALL_FAILED, cause=exc, error_msg="decisions connection failed"

@@ -18,6 +18,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import BaseError, build_error
@@ -26,6 +27,7 @@ from openjiuwen.core.foundation.llm import AssistantMessage, AssistantMessageChu
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.harness.tools.browser_move.policy import prompts
 from openjiuwen.harness.tools.browser_move.policy.jev_decisions import (
+    DECISIONS_TIMEOUT_S,
     DEFAULT_DECISIONS_URL,
     DEFAULT_MODEL,
     NONE_VALUE,
@@ -42,6 +44,9 @@ MAX_CONSECUTIVE_WAITS = 5
 MAX_NO_CHANGE_STEPS = 3
 MAX_PREFETCHED_FIELDS = 8
 PROBE_SETTLE_MS = 500  # must equal probe_js.py's JS default so an un-escalated probe's timing is unchanged
+PROBE_QUIET_MS = 60  # must equal probe_js.py's JS default DOM-quiet window
+ACTION_SETTLE_START_MS = 250  # first in-page wait for an action whose effect has not shown yet
+ACTION_SETTLE_BUDGET_MS = 1000  # total in-page wait one action gets before the classifier sees an unchanged page
 MAX_PROBE_SETTLE_MS = 1500  # keeps load(3s)+settle+1s JS lastResort >=1s under the 30s transport request timeout
 WAIT_SETTLE_BUDGET_MS = 3000  # total in-page settle time one WAIT streak may spend before the step gives up
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
@@ -79,20 +84,24 @@ class JevDecisionModel(Model):
         language: str,
         client: JevDecisionsClient | None,
         goal_value_cache: bool,
+        prefetch_values: bool,
         value_model: Model | None,
     ) -> None:
         """``goal_value_cache`` offers goal-extracted values to Jev as a choice head; off means every typed
-        value comes from the chat model given the field and page context, prefetched in the background."""
+        value comes from the chat model given the field and page context. ``prefetch_values`` makes that
+        chat-model call for every editable field as soon as a probe shows it, one per field per document,
+        whether or not Jev ever types there; off makes it only when TYPE_TEXT is chosen."""
         super().__init__(fallback.model_client_config, fallback.model_config)
         self._fallback = fallback
         self._value_model = value_model or fallback  # typed values want a fast small model; chat turns do not
         self._goal_value_cache = goal_value_cache
+        self._prefetch_enabled = prefetch_values
         self._language = language if language in prompts.OPERATION_RULES else "en"
         self._decisions = client or JevDecisionsClient(
             api_key=os.getenv("TYPESAFE_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "",
             url=os.getenv("TYPESAFE_API_URL") or DEFAULT_DECISIONS_URL,
             model=os.getenv("TYPESAFE_MODEL") or DEFAULT_MODEL,
-            timeout_s=25.0,
+            timeout_s=DECISIONS_TIMEOUT_S,
         )
         self._runtime: Any = None
         self._run: _Run | None = None
@@ -197,6 +206,8 @@ class JevDecisionModel(Model):
                 "probe_ms": probe_ms,
                 "settle_probes": settle_probes,
                 "settle_ms": settle_ms,
+                "action_settle_probes": snapshot.get("action_settle_probes", 0),
+                "action_settle_ms": snapshot.get("action_settle_ms", 0),
                 "jev_ms": jev_ms,
                 "operation": decision.operation,
                 "target": decision.candidate.item.get("label") if decision.candidate else None,
@@ -257,27 +268,63 @@ class JevDecisionModel(Model):
 
     async def _probe(self, run: _Run, *, settle_ms: int = PROBE_SETTLE_MS) -> tuple[dict[str, Any], int]:
         started = time.perf_counter()
-        after = None
-        if run.pending is not None:
-            after = {"kind": run.pending["kind"], "node": run.pending["node"]}
-        params = {"stamp_attribute": STAMP_ATTRIBUTE, "after": after, "max_items": 250, "settle_ms": settle_ms}
+        pending, run.pending = run.pending, None
+        after = {"kind": pending["kind"], "node": pending["node"]} if pending is not None else None
+        snapshot = await self._raw_probe(settle_ms=settle_ms, quiet_ms=PROBE_QUIET_MS, after=after)
+        if pending is not None:
+            changed = snapshot.get("page_key") != pending["page_key"]
+            if not changed:
+                snapshot, changed = await self._settle_action(run, snapshot, pending["page_key"])
+            pending["entry"]["page_changed"] = changed
+            recent = run.history[-MAX_NO_CHANGE_STEPS:]
+            if len(recent) == MAX_NO_CHANGE_STEPS and all(
+                h["page_changed"] is False and h["kind"] != "wait" for h in recent
+            ):
+                snapshot["stalled"] = True
+        self._prefetch_values(run, snapshot)
+        return snapshot, round((time.perf_counter() - started) * 1000)
+
+    async def _raw_probe(self, *, settle_ms: int, quiet_ms: int, after: dict[str, Any] | None) -> dict[str, Any]:
+        params = {
+            "stamp_attribute": STAMP_ATTRIBUTE,
+            "after": after,
+            "max_items": 250,
+            "settle_ms": settle_ms,
+            "quiet_ms": quiet_ms,
+        }
         snapshot = await self._runtime.probe_for_policy(POLICY_PROBE_JS, params)
         if snapshot.get("error"):
             logger.warning("[JevDecisionModel] policy probe reported %s", snapshot["error"])
         if snapshot.get("visibility") == "hidden" and await self._runtime.activate_page(str(snapshot.get("url") or "")):
             logger.info("[JevDecisionModel] activated hidden tab %s", snapshot.get("url"))
             snapshot = await self._runtime.probe_for_policy(POLICY_PROBE_JS, params)
-        self._prefetch_values(run, snapshot)
-        if run.pending is not None:
-            changed = snapshot.get("page_key") != run.pending["page_key"]
-            run.pending["entry"]["page_changed"] = changed
-            run.pending = None
-            recent = run.history[-MAX_NO_CHANGE_STEPS:]
-            if len(recent) == MAX_NO_CHANGE_STEPS and all(
-                h["page_changed"] is False and h["kind"] != "wait" for h in recent
-            ):
-                snapshot["stalled"] = True
-        return snapshot, round((time.perf_counter() - started) * 1000)
+        return snapshot
+
+    async def _settle_action(
+        self, run: _Run, snapshot: dict[str, Any], before_key: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Wait in-page for an action's delayed effect (a closing dialog, a late re-render) before deciding.
+
+        A probe right after the action can return before the effect shows; the classifier would then be
+        asked about the page it already acted on and answer WAIT at full request cost. The waits double
+        from ``ACTION_SETTLE_START_MS`` and are wall-clock waits (``quiet_ms`` equals the window, so a quiet
+        DOM does not cut them short). ``ACTION_SETTLE_BUDGET_MS`` bounds the penalty for an action that
+        truly did nothing, and the time counts against the WAIT streak budget so one step never settles
+        longer than ``WAIT_SETTLE_BUDGET_MS`` in total.
+        """
+        wait_ms, spent, probes = ACTION_SETTLE_START_MS, 0, 0
+        while spent < ACTION_SETTLE_BUDGET_MS:
+            requested = min(wait_ms, ACTION_SETTLE_BUDGET_MS - spent)
+            snapshot = await self._raw_probe(settle_ms=requested, quiet_ms=requested, after=None)
+            probes += 1
+            spent += requested
+            run.settle_spent_ms += requested
+            if snapshot.get("page_key") != before_key:
+                break
+            wait_ms = min(wait_ms * 2, MAX_PROBE_SETTLE_MS)
+        snapshot["action_settle_probes"] = probes
+        snapshot["action_settle_ms"] = spent
+        return snapshot, snapshot.get("page_key") != before_key
 
     async def _act(
         self, run: _Run, decision: Decision, snapshot: dict[str, Any], record: dict[str, Any]
@@ -333,23 +380,31 @@ class JevDecisionModel(Model):
         return self._tool_message(run, name, args, label=label)
 
     @staticmethod
-    def _field_key(item: dict[str, Any], page_key: str) -> str:
-        return f"{page_key}|{item.get('label', '')}|{item.get('region', '')}"
+    def _document_key(snapshot: dict[str, Any]) -> str:
+        url = urlparse(str(snapshot.get("url") or ""))
+        return f"{url.netloc}{url.path}"
+
+    @classmethod
+    def _field_key(cls, item: dict[str, Any], snapshot: dict[str, Any]) -> str:
+        return f"{cls._document_key(snapshot)}|{item.get('node')}|{item.get('label', '')}"
 
     def _prefetch_values(self, run: _Run, snapshot: dict[str, Any]) -> None:
-        """Start value generation for editable fields now, so a later TYPE_TEXT does not wait for it.
+        """Start value generation for every editable field now, so a later TYPE_TEXT does not wait for it.
 
-        Prefilled fields are included: a wrong default (the site's guessed origin) is replaced as often as an empty
-        field is filled. Entries are keyed by page as well as field, so a navigation cancels the previous page's
-        outstanding prefetches instead of letting a later TYPE_TEXT type a value generated for the wrong page.
+        One call per field per document: the key is the stamp id plus label under the URL path, so a value
+        generated on the first probe stays usable while the page fills in, and a navigation cancels the previous
+        document's outstanding calls. Prefilled fields are included: a wrong default (the site's guessed origin)
+        is replaced as often as an empty field is filled.
         """
-        page_key = str(snapshot.get("page_key") or "")
-        for key in [key for key in run.prefetched if not key.startswith(f"{page_key}|")]:
+        if not self._prefetch_enabled:
+            return
+        scope = self._document_key(snapshot) + "|"
+        for key in [key for key in run.prefetched if not key.startswith(scope)]:
             run.prefetched.pop(key).cancel()
         for item in snapshot.get("elements") or []:
             if not item.get("editable") or not item.get("target_id"):
                 continue
-            key = self._field_key(item, page_key)
+            key = self._field_key(item, snapshot)
             if key not in run.prefetched and len(run.prefetched) < MAX_PREFETCHED_FIELDS:
                 run.prefetched[key] = asyncio.create_task(self._generate_value(run, item, snapshot))
 
@@ -358,8 +413,7 @@ class JevDecisionModel(Model):
         if decision.value_choice and decision.value_choice != NONE_VALUE:
             return decision.value_choice, "cache", round((time.perf_counter() - started) * 1000)
         field_item = decision.candidate.item if decision.candidate else {}
-        page_key = str(snapshot.get("page_key") or "")
-        task = run.prefetched.pop(self._field_key(field_item, page_key), None)
+        task = run.prefetched.pop(self._field_key(field_item, snapshot), None)
         if task is not None:
             try:
                 value = await task
