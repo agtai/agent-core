@@ -2176,6 +2176,64 @@ class BrowserAgentRuntime:
             "audit": raw_audit,
         }
 
+    async def probe_for_policy(self, source: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a policy-owned page function and register its elements as PageState targets.
+
+        ``source`` is a ``(params) => ...`` page function whose result holds ``elements`` with
+        validated ``selector_hint`` values; each element gains a ``target_id`` and the result gains
+        the current ``generation_id`` so the caller can issue catalog tool calls against it.
+        """
+        await self.ensure_runtime_ready()
+        if self._code_executor is None:
+            return self._policy_probe_failure("browser_code_executor_not_ready")
+        js_code = f"async (page) => await page.evaluate({source}, {json.dumps(params, ensure_ascii=False)})"
+        try:
+            parsed, _audit, _retries = await self._execute_probe_json(js_code, artifact_kind="policy_probe")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[BrowserAgentRuntime] policy probe failed: %s", exc, exc_info=True)
+            return self._policy_probe_failure(f"policy probe failed: {exc}")
+        if not parsed or parsed.get("ok") is False:
+            return self._policy_probe_failure(str(parsed.get("error") or "policy probe returned no result"))
+        parsed.setdefault("ok", True)
+        parsed.setdefault("elements", [])
+        self._observe_page_url(parsed.get("url"))
+        self._annotate_probe_generation(parsed)
+        self._ensure_page_state().register_interactives(parsed)
+        parsed["generation_id"] = self.generation_id
+        return parsed
+
+    def _policy_probe_failure(self, error: str) -> Dict[str, Any]:
+        return {"ok": False, "error": error, "elements": [], "page_state": self.export_page_state()}
+
+    async def activate_page(self, url: str) -> bool:
+        """Bring the driven page to the foreground so its timers run and its menus render.
+
+        A background tab throttles timers to about one second and never renders dropdown menus,
+        which stalls any policy that decides on a fresh probe. ``url`` selects a sibling page of
+        the same context; otherwise the current page is fronted.
+        """
+        await self.ensure_runtime_ready()
+        if self._code_executor is None:
+            return False
+        js_code = (
+            "async (page) => {\n"
+            f"  const wanted = {json.dumps(str(url or ''))};\n"
+            "  const target = page.context().pages().find((candidate) => candidate.url() === wanted) || page;\n"
+            "  await target.bringToFront();\n"
+            "  return { ok: true, url: target.url() };\n"
+            "}"
+        )
+        try:
+            parsed, _audit, _retries = await self._execute_probe_json(js_code, artifact_kind="policy_activate_page")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[BrowserAgentRuntime] activate_page failed: %s", exc, exc_info=True)
+            return False
+        return bool(parsed.get("ok"))
+
     async def list_actions(self) -> Dict[str, Any]:
         return {
             "ok": True,
