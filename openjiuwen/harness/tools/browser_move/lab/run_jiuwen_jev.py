@@ -18,6 +18,11 @@ from openjiuwen.core.runner import Runner
 from openjiuwen.harness.subagents import create_browser_agent
 from openjiuwen.harness.tools.browser_move.lab.profiler import JevProfiler, render
 from openjiuwen.harness.tools.browser_move.policy.jev_decision_model import JevDecisionModel
+from openjiuwen.harness.tools.browser_move.policy.jev_decisions import (
+    DECISIONS_BACKENDS,
+    DECISIONS_TIMEOUT_S,
+    client_from_env,
+)
 from openjiuwen.harness.tools.browser_move.shared.env import load_repo_dotenv
 
 DEFAULT_QUERY = (
@@ -41,6 +46,12 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--goal-value-cache", action="store_true", help="Offer goal-extracted values to Jev.")
     parser.add_argument("--profile-out", default="", help="Write the profiler report as JSON to this path.")
     parser.add_argument(
+        "--decisions",
+        choices=DECISIONS_BACKENDS,
+        required=True,
+        help="Who answers Jev: TypeSafe directly (TYPESAFE_API_KEY) or the OpenRouter proxy (OPENROUTER_API_KEY).",
+    )
+    parser.add_argument(
         "--prefetch",
         choices=("on", "off"),
         required=True,
@@ -49,10 +60,9 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(sys.argv[1:] if argv is None else list(argv))
 
     api_key = _first_env("OPENJIUWEN_API_KEY", "API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
-    if not api_key or not _first_env("TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
-        raise SystemExit(
-            "Missing API keys: set OPENROUTER_API_KEY (chat fallback) and TYPESAFE_API_KEY (decisions) in .env"
-        )
+    if not api_key:
+        raise SystemExit("Missing API key for the chat fallback: set OPENROUTER_API_KEY in .env")
+    decisions = client_from_env(args.decisions, timeout_s=DECISIONS_TIMEOUT_S)
     fallback = init_model(
         provider=_first_env("OPENJIUWEN_PROVIDER", "MODEL_PROVIDER") or "openrouter",
         model_name=_first_env("OPENJIUWEN_MODEL", "MODEL_NAME") or "google/gemini-2.5-flash",
@@ -74,7 +84,7 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
     decider = JevDecisionModel(
         fallback,
         language="en",
-        client=None,
+        client=decisions,
         goal_value_cache=args.goal_value_cache,
         prefetch_values=args.prefetch == "on",
         value_model=value_model,

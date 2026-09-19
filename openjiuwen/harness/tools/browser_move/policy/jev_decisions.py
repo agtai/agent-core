@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,6 +26,9 @@ from openjiuwen.harness.tools.browser_move.policy import prompts
 
 DEFAULT_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_MODEL = "typesafe/jev-1.13"
+TYPESAFE_DECISIONS_URL = "https://api.typesafe.ai/v1/systemone"
+TYPESAFE_DEFAULT_MODEL = "jev-latest"
+DECISIONS_BACKENDS = ("typesafe", "openrouter")
 NONE_VALUE = "none"
 _OPERATION_LABELS = {
     "CLICK": (
@@ -116,12 +120,6 @@ def build_action_space(snapshot: dict[str, Any]) -> ActionSpace:
     return space
 
 
-def _head_label(operation: str, item: dict[str, Any]) -> str:
-    """The click head names an editable field "Open <label>": clicking it opens its picker or suggestion list."""
-    label = str(item.get("label", ""))
-    return f"Open {label}" if operation == "CLICK" and item.get("editable") else label
-
-
 def build_request(
     space: ActionSpace,
     snapshot: dict[str, Any],
@@ -146,7 +144,7 @@ def build_request(
             "type": "choice",
             "criteria": {
                 key: {
-                    "element": f"[{key}] {_head_label(operation, candidate.item)}",
+                    "element": f"[{key}] {candidate.item.get('label', '')}",
                     "current_value": candidate.item.get("value") or "",
                     **({"option": candidate.option_label} if candidate.option_label else {}),
                     **{
@@ -226,6 +224,39 @@ def interpret(result: dict[str, Any], space: ActionSpace, body: dict[str, Any], 
         usage=dict(result.get("usage") or {}),
         model=str(result.get("model") or body["model"]),
     )
+
+
+def decisions_backend_from_env() -> str:
+    """``typesafe`` when a TypeSafe key is set and no proxy URL overrides it; otherwise the OpenRouter proxy."""
+    return "typesafe" if os.getenv("TYPESAFE_API_KEY") and not os.getenv("TYPESAFE_API_URL") else "openrouter"
+
+
+def client_from_env(backend: str, *, timeout_s: float) -> "JevDecisionsClient":
+    """Build the decisions client for one backend from the environment.
+
+    ``typesafe`` talks to TypeSafe directly with ``TYPESAFE_API_KEY`` and its own model names;
+    ``openrouter`` talks to the proxy with ``OPENROUTER_API_KEY`` (``TYPESAFE_API_URL`` / ``TYPESAFE_MODEL``
+    override the proxy URL and model, as the repo dotenv has always used them).
+    """
+    match backend:
+        case "typesafe":
+            return JevDecisionsClient(
+                api_key=os.getenv("TYPESAFE_API_KEY") or "",
+                url=TYPESAFE_DECISIONS_URL,
+                model=TYPESAFE_DEFAULT_MODEL,
+                timeout_s=timeout_s,
+            )
+        case "openrouter":
+            return JevDecisionsClient(
+                api_key=os.getenv("OPENROUTER_API_KEY") or "",
+                url=os.getenv("TYPESAFE_API_URL") or DEFAULT_DECISIONS_URL,
+                model=os.getenv("TYPESAFE_MODEL") or DEFAULT_MODEL,
+                timeout_s=timeout_s,
+            )
+        case _:
+            raise build_error(
+                StatusCode.MODEL_SERVICE_CONFIG_ERROR, error_msg=f"unknown decisions backend {backend!r}"
+            )
 
 
 class JevDecisionsClient:

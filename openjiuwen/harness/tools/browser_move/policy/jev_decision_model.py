@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import statistics
 import time
@@ -28,13 +27,13 @@ from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.harness.tools.browser_move.policy import prompts
 from openjiuwen.harness.tools.browser_move.policy.jev_decisions import (
     DECISIONS_TIMEOUT_S,
-    DEFAULT_DECISIONS_URL,
-    DEFAULT_MODEL,
     NONE_VALUE,
     Decision,
     JevDecisionsClient,
     build_action_space,
     build_request,
+    client_from_env,
+    decisions_backend_from_env,
     interpret,
 )
 from openjiuwen.harness.tools.browser_move.policy.probe_js import POLICY_PROBE_JS, STAMP_ATTRIBUTE
@@ -97,12 +96,7 @@ class JevDecisionModel(Model):
         self._goal_value_cache = goal_value_cache
         self._prefetch_enabled = prefetch_values
         self._language = language if language in prompts.OPERATION_RULES else "en"
-        self._decisions = client or JevDecisionsClient(
-            api_key=os.getenv("TYPESAFE_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "",
-            url=os.getenv("TYPESAFE_API_URL") or DEFAULT_DECISIONS_URL,
-            model=os.getenv("TYPESAFE_MODEL") or DEFAULT_MODEL,
-            timeout_s=DECISIONS_TIMEOUT_S,
-        )
+        self._decisions = client or client_from_env(decisions_backend_from_env(), timeout_s=DECISIONS_TIMEOUT_S)
         self._runtime: Any = None
         self._run: _Run | None = None
 
