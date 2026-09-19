@@ -7,7 +7,7 @@
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/rails/`（61 文件，7 个子目录） |
 | 最近一次修订日期 | 2026-09-07 |
-| 关联 feature | `F_01_ask-user-otel-events.md` |
+| 关联 feature | `F_01_ask-user-otel-events.md`、`F_02_genai-semconv-tool-spans.md` |
 
 ## 范围 / 边界
 
@@ -46,7 +46,11 @@
    `tests/unit_tests/harness/test_deep_agent_rail_event_routing.py` 强制三个集合完全覆盖
    `set(AgentCallbackEvent)` 且互不相交。
 3. **priority 数值越大越先**；排序稳定，同 priority 保持注册顺序。`register_callback`
-   默认 priority 是 **100**。同一个数决定 init 顺序和回调链顺序。
+   默认 priority 是 **100**。同一个数决定 init 顺序和回调链顺序。唯一的例外入口是
+   `AgentRail.callback_priority(event)`：默认返回 `priority`，rail 可只为某一个 hook 换位置
+   而不改变 init 顺序。当前仅 `EvolutionRail` 用它：其 `after_tool_call` 以
+   `priority - 1_000_000` 注册，排在该链所有回调之后——它读取的 tool span 由观测 rail（10）
+   在同一链中结束，且记录的是其它回调可能改写后的结果。
 4. **priority 梯队是契约**（当前梯队，改它必须先 grep 是否有别的 rail 在注释里点名）：
    `100 SysOperationRail` → `95 McpRail / SkillUseRail / SubagentRail` →
    `90 TaskPlanningRail / ProgressiveToolRail / BaseInterruptRail / PermissionInterruptRail /
@@ -87,6 +91,11 @@
     `AbilityExecutionError`。若 target 工具在包装层内中断，中断请求保留 target call ID，
     但恢复执行必须从原 outer wrapper tool call 重新进入，以保持授权链和模型上下文中的
     tool-call ID 配对；不得把 target 当作新的 deferred 工具直调，也不得放宽普通直调限制。
+
+12. **观测 rail 不定义第二套 GenAI 字段**：工具 span 只写共享 semconv 中的
+    `gen_ai.tool.call.id/arguments/result` 与 `gen_ai.tool.name`，资源标识放入
+    `openjiuwen.tool.resource_id`。Evolution rail 只清洗这套标准字段；历史输入兼容属于
+    trajectory 读取边界，不属于 rail producer。
 
 ## 接口契约
 

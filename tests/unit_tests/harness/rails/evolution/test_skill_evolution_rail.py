@@ -261,25 +261,24 @@ def _trajectory_from_steps(
                 tool_calls = getattr(message, "tool_calls", None) if not isinstance(message, dict) else message.get("tool_calls")
                 if tool_calls:
                     all_tool_calls.extend(tool_calls)
-            attrs.update(write_llm_exchange(prompts, completions))
             if all_tool_calls:
-                normalized_tool_calls = []
-                for call in all_tool_calls:
-                    item = dict(call) if isinstance(call, dict) else {"arguments": str(call)}
-                    normalized_tool_calls.append(item)
-                attrs[semconv.GEN_AI_TOOL_CALLS] = json.dumps(
-                    normalized_tool_calls, ensure_ascii=False, default=str
-                )
+                if not completions:
+                    completions.append({"role": "assistant"})
+                completions[0]["tool_calls"] = [
+                    dict(call) if isinstance(call, dict) else {"arguments": str(call)} for call in all_tool_calls
+                ]
+            attrs.update(write_llm_exchange(prompts, completions))
+            attrs[semconv.GEN_AI_OPERATION_NAME] = "chat"
             name = "llm.call"
         else:
             detail = step.detail
             attrs[semconv.GEN_AI_TOOL_NAME] = detail.tool_name
             if detail.call_args is not None:
-                attrs[semconv.GEN_AI_TOOL_INPUT] = json.dumps(detail.call_args, ensure_ascii=False, default=str)
+                attrs[semconv.GEN_AI_TOOL_CALL_ARGUMENTS] = json.dumps(detail.call_args, ensure_ascii=False, default=str)
             if detail.call_result is not None:
-                attrs[semconv.GEN_AI_TOOL_OUTPUT] = json.dumps(detail.call_result, ensure_ascii=False, default=str)
+                attrs[semconv.GEN_AI_TOOL_CALL_RESULT] = json.dumps(detail.call_result, ensure_ascii=False, default=str)
             if detail.tool_call_id is not None:
-                attrs[semconv.GEN_AI_TOOL_ID] = detail.tool_call_id
+                attrs[semconv.GEN_AI_TOOL_CALL_ID] = detail.tool_call_id
             name = f"tool.{detail.tool_name}"
         span: dict[str, Any] = {
             "name": name,
